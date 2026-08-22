@@ -16,18 +16,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
-STOCK_CONCEPT_INFO = {
-    "2330": {"concept": "晶圓代工 / AI晶片 / CoWoS", "season": "10月~隔年2月 (Q4~Q1 科技旺季)"},
-    "2610": {"concept": "航空客運 / 觀光暑假 / 客貨運", "season": "6月~8月 (暑假客運) / 11月~12月 (年底貨運旺季)"},
-    "2618": {"concept": "航空客運 / 貨運雙雄", "season": "6月~8月 (暑假旅遊) / 11月~12月 (年底貨運旺季)"},
-    "2317": {"concept": "鴻海家族 / AI伺服器 / 電動車", "season": "10月~12月 (iPhone發布與Q4出貨旺季)"},
-    "2454": {"concept": "IC設計 / 手機晶片 / 邊緣AI", "season": "11月~3月 (新機拉貨與展覽題材)"},
-    "6770": {"concept": "成熟製程 / 車用半導體", "season": "3月~7月 (半導體復甦與股東會題材)"},
-    "2059": {"concept": "伺服器導軌 / AI伺服器 / 高價股", "season": "11月~3月 (伺服器新平台拉貨旺季)"},
-    "3231": {"concept": "AI伺服器代工 / 緯創", "season": "11月~2月 (集團作帳與AI出貨旺季)"},
-    "2382": {"concept": "AI伺服器代工 / 廣達", "season": "11月~2月 (AI浪潮與歲末行情)"}
-}
-
 def update_stock_name_map():
     global STOCK_NAME_MAP
     try:
@@ -133,15 +121,15 @@ def get_tw_revenue(stock_id):
                 yoy_str = f"{yoy:+.2f}%" if yoy is not None else "資料計算中"
 
                 if yoy is not None and yoy > 10:
-                    status = "🔥 優於預期 (年增雙位數成長)"
+                    status = "🔥 優於預期 (年增雙位數)"
                 elif yoy is not None and yoy >= 0:
-                    status = "🟢 符合預期 (穩健正成長)"
+                    status = "🟢 符合預期 (穩健成長)"
                 elif yoy is not None:
-                    status = "🟡 稍低於預期 (年增放緩/衰退)"
+                    status = "🟡 稍低於預期 (衰退/放緩)"
                 else:
-                    status = "🟢 營收動能持平"
+                    status = "🟢 動能持平"
 
-                return f"{month_str} | 年增(YoY): {yoy_str} | 月增(MoM): {mom_str}\n   表現評價: {status}"
+                return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}"
     except Exception:
         pass
     return "無即時營收數據"
@@ -165,7 +153,6 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def get_us_stock_data(symbol):
-    """採用 Yahoo Finance API 穩定抓取美股 (包含 ETF，如 VT, QQQ, NVDA)"""
     symbol = symbol.upper().strip()
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=6m&interval=1d"
     headers = {
@@ -186,30 +173,20 @@ def get_us_stock_data(symbol):
         df = df.dropna().sort_index()
         if len(df) >= 20:
             return df, symbol
-    except Exception as e:
-        print(f"Yahoo fetch error for {symbol}: {e}")
-
+    except Exception:
+        pass
     return None, symbol
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
         foreign_net = None
-        revenue_info = "美股ETF/股票，無台股營收"
-        concept_text = "美股標的 / 全球ETF"
-        season_text = "11月~隔年4月 (美股歷史最佳表現月份)"
+        revenue_info = "美股/ETF 無台股營收"
 
         if stock_code.isdigit():
             df, target_symbol = get_tw_stock_data(stock_code)
             foreign_net = get_tw_foreign_investor(stock_code)
             revenue_info = get_tw_revenue(stock_code)
-
-            if stock_code in STOCK_CONCEPT_INFO:
-                concept_text = STOCK_CONCEPT_INFO[stock_code]["concept"]
-                season_text = STOCK_CONCEPT_INFO[stock_code]["season"]
-            else:
-                concept_text = "上市櫃一般產業股"
-                season_text = "11月~3月 (歷史作帳與財報空窗期行情)"
         else:
             df, target_symbol = get_us_stock_data(stock_code)
 
@@ -228,26 +205,38 @@ def analyze_stock(user_input):
         prev = df.iloc[-2]
         
         close = float(latest['Close'])
+        prev_close = float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+        prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
+
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
-
-        prev_close = float(prev['Close'])
-        prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
 
         diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
 
         vol_today = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
         
-        if vol_today >= vol_ma5 * 1.5:
-            vol_status = "🔥 顯著放量 (大於5日均量50%)"
-        elif vol_today >= vol_ma5 * 1.2:
-            vol_status = "📈 溫和放量 (大於5日均量20%)"
-        elif vol_today <= vol_ma5 * 0.8:
-            vol_status = "📉 明顯量縮 (低於5日均量20%)"
+        # 價格漲跌判定
+        price_change_pct = ((close - prev_close) / prev_close) * 100
+        is_price_up = price_change_pct > 0
+        is_price_down = price_change_pct < 0
+
+        # 量能增減判定 (以 5 日均量為基準)
+        is_vol_expand = vol_today >= vol_ma5 * 1.15  # 放量 (大於均量15%)
+        is_vol_shrink = vol_today <= vol_ma5 * 0.85  # 量縮 (小於均量15%)
+
+        # 細化量價結構 (見頂/見底訊號)
+        if is_price_up and is_vol_expand:
+            vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
+        elif is_price_down and is_vol_expand:
+            vol_status = f"📉 下跌放量 ({price_change_pct:.1f}%)\n   👉 恐慌盤湧出/大戶拋售，注意續跌風險"
+        elif is_price_up and is_vol_shrink:
+            vol_status = f"⚠️ 上漲量縮 (+{price_change_pct:.1f}%)\n   👉 量價背離！買盤停滯，需防範【見頂回落】"
+        elif is_price_down and is_vol_shrink:
+            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反彈】"
         else:
-            vol_status = "➡️ 量能平穩 (與5日均量相當)"
+            vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)\n   👉 量能無明顯變化"
 
         if foreign_net is not None:
             if foreign_net > 0:
@@ -265,25 +254,25 @@ def analyze_stock(user_input):
         if is_break_3pct or is_two_days_below:
             reasons = []
             if is_break_3pct:
-                reasons.append(f"跌破月線 {abs(diff_pct):.2f}%（超 3%）")
+                reasons.append(f"跌破月線 {abs(diff_pct):.2f}%")
             if is_two_days_below:
-                reasons.append("連 2 日低於月線")
-            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，趨勢轉弱，防範持續下探！"
+                reasons.append("連2日低於月線")
+            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，趨勢轉弱！"
 
         elif close < ma20:
-            signal = "🟡【警戒觀望】股價微幅低於月線，趨勢偏弱，建議先觀望或適度減碼。"
+            signal = "🟡【警戒觀望】微幅低於月線，趨勢偏弱，建議先觀望。"
 
         elif hist_today > 0 and hist_today >= hist_yesterday:
-            signal = "🔥【多頭續抱/加碼】強勢站穩月線且 MACD 紅柱擴大，多方控盤可持續持有或逢低加碼！"
+            signal = "🔥【多頭續抱/加碼】強勢站穩月線且 MACD 紅柱擴大，多方控盤！"
 
         elif hist_today > 0 and hist_today < hist_yesterday:
-            signal = "🟢【偏多持有】站穩月線上，但多頭力道稍緩，建議續抱並關注月線支撐。"
+            signal = "🟢【偏多持有】站穩月線上，但多頭力道稍緩，建議續抱。"
 
         elif hist_today < 0 and abs(hist_today) < abs(hist_yesterday):
-            signal = "🟢【試買建倉】股價在月線上，且空方力道開始減弱，可考慮建立分批試買單。"
+            signal = "🟢【試買建倉】站穩月線且空方力道減弱，可考慮建立分批試買單。"
 
         else:
-            signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立再操作。"
+            signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立。"
 
         pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"跌破月線 {abs(diff_pct):.2f}%"
         title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
@@ -293,13 +282,11 @@ def analyze_stock(user_input):
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
-            f"成交量狀態: {vol_status}\n"
-            f"外資籌碼動向: {foreign_text}\n"
+            f"量價結構:\n   {vol_status}\n"
+            f"外資籌碼: {foreign_text}\n"
             f"-------------------\n"
             f"📈 基本面與營收：\n"
             f"   {revenue_info}\n"
-            f"🏷️ 概念題材: {concept_text}\n"
-            f"🗓️ 歷史旺季行情: {season_text}\n"
             f"-------------------\n"
             f"💡 操作建議：\n{signal}"
         )
@@ -308,3 +295,4 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
+     
