@@ -17,19 +17,39 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_NAME_MAP = {}
 
 def update_stock_name_map():
+    """同時抓取上市與上櫃股票清單，整合中文名稱與代碼對照表"""
     global STOCK_NAME_MAP
+    new_map = {}
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    # 1. 抓取上市股票清單
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url, timeout=10)
+        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res = requests.get(url_twse, headers=headers, timeout=10)
         if res.status_code == 200:
-            data = res.json()
-            for item in data:
+            for item in res.json():
                 s_id = item.get("Code")
                 s_name = item.get("Name")
                 if s_id and s_name:
-                    STOCK_NAME_MAP[s_name.strip()] = s_id.strip()
+                    new_map[s_name.strip()] = s_id.strip()
     except Exception as e:
-        print(f"Update stock map error: {e}")
+        print(f"Update TWSE stock map error: {e}")
+
+    # 2. 抓取上櫃股票清單 (補足寶雅、鈊象等上櫃標的)
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
+        res = requests.get(url_tpex, headers=headers, timeout=10)
+        if res.status_code == 200:
+            for item in res.json():
+                s_id = item.get("SecuritiesCompanyCode")
+                s_name = item.get("CompanyName")
+                if s_id and s_name:
+                    new_map[s_name.strip()] = s_id.strip()
+    except Exception as e:
+        print(f"Update TPEx stock map error: {e}")
+
+    if new_map:
+        STOCK_NAME_MAP = new_map
 
 update_stock_name_map()
 
@@ -59,6 +79,7 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").strip()
     
+    # 直接輸入數字代碼時
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
@@ -67,9 +88,11 @@ def resolve_stock_symbol(user_input):
     if not STOCK_NAME_MAP:
         update_stock_name_map()
 
+    # 精確比對中文名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
+    # 模糊比對中文名稱
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
@@ -156,9 +179,8 @@ def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
-        # 判斷是否為數字代碼或常見台股名稱，若非台股則擋下
         if not stock_code.isdigit():
-            return f"⚠️ 目前系統僅支援台股（上市/上櫃）查詢。\n請輸入台股代碼（如 2330）或中文名稱（如 台積電、華航）。"
+            return f"⚠️ 目前系統僅支援台股（上市/上櫃）查詢。\n請輸入台股代碼（如 5904）或中文名稱（如 寶雅、富邦金）。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
@@ -191,16 +213,13 @@ def analyze_stock(user_input):
         vol_today = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
         
-        # 價格漲跌判定
         price_change_pct = ((close - prev_close) / prev_close) * 100
         is_price_up = price_change_pct > 0
         is_price_down = price_change_pct < 0
 
-        # 量能增減判定
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
 
-        # 細化量價結構
         if is_price_up and is_vol_expand:
             vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
         elif is_price_down and is_vol_expand:
@@ -208,7 +227,7 @@ def analyze_stock(user_input):
         elif is_price_up and is_vol_shrink:
             vol_status = f"⚠️ 上漲量縮 (+{price_change_pct:.1f}%)\n   👉 量價背離！買盤停滯，需防範【見頂回落】"
         elif is_price_down and is_vol_shrink:
-            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反反彈】"
+            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反彈】"
         else:
             vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)\n   👉 量能無明顯變化"
 
