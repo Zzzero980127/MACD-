@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import yfinance as yf
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -14,6 +15,12 @@ ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', 'USVKF1GK6PIWA0C
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# 設定 Requests 請求 Header（避開國外伺服器擋 IP 限制）
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+})
 
 @app.route("/", methods=['GET'])
 def index():
@@ -39,47 +46,16 @@ def handle_message(event):
     )
 
 def get_tw_stock_data(stock_id):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
-    # 1. 優先存取：證交所 (TWSE) 上市個股日收盤 API
-    twse_url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo={stock_id}&response=json"
-    try:
-        res = requests.get(twse_url, headers=headers, timeout=10)
-        data = res.json()
-        if data.get('stat') == 'OK' and 'data' in data:
-            raw_data = data['data']
-            records = []
-            for row in raw_data:
-                # 清除千分位逗號與非數字字元
-                close_str = row[6].replace(',', '').strip()
-                if close_str and close_str != '--':
-                    records.append(float(close_str))
-            
-            if len(records) >= 26:
-                df = pd.DataFrame({'Close': records})
-                return df, f"{stock_id}.TW"
-    except Exception:
-        pass
-
-    # 2. 備用存取：櫃買中心 (TPEx) 上櫃個股 API
-    tpex_url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&stkno={stock_id}"
-    try:
-        res = requests.get(tpex_url, headers=headers, timeout=10)
-        data = res.json()
-        if 'aaData' in data and len(data['aaData']) > 0:
-            raw_data = data['aaData']
-            records = []
-            for row in raw_data:
-                close_str = row[6].replace(',', '').strip()
-                if close_str and close_str != '--':
-                    records.append(float(close_str))
-            
-            if len(records) >= 26:
-                df = pd.DataFrame({'Close': records})
-                return df, f"{stock_id}.TWO"
-    except Exception:
-        pass
-
+    # 自動嘗試 上市 (.TW) 與 上櫃 (.TWO)
+    for ext in ['.TW', '.TWO']:
+        target_symbol = f"{stock_id}{ext}"
+        try:
+            ticker = yf.Ticker(target_symbol, session=session)
+            df = ticker.history(period="6m")
+            if not df.empty and len(df) >= 26:
+                return df, target_symbol
+        except Exception:
+            continue
     return None, stock_id
 
 def get_us_stock_data(symbol):
@@ -130,7 +106,7 @@ def analyze_stock(user_input):
 
         diff_pct = ((close - ma20) / ma20) * 100
 
-        # 防洗盤與出場條件
+        # 訊號判斷
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
 
