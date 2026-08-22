@@ -14,42 +14,46 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-STOCK_NAME_MAP = {}
+# 熱門標的硬編碼備援庫（防止政府 API 連線逾時導致空字典）
+BACKUP_STOCK_MAP = {
+    "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
+    "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
+    "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
+    "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443"
+}
+
+STOCK_NAME_MAP = dict(BACKUP_STOCK_MAP)
 
 def update_stock_name_map():
-    """同時抓取上市與上櫃股票清單，整合中文名稱與代碼對照表"""
+    """從上市與上櫃開放資料自動更新名稱對照表"""
     global STOCK_NAME_MAP
-    new_map = {}
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 1. 抓取上市股票清單
+    # 上市股票清單
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=10)
+        res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 s_id = item.get("Code")
                 s_name = item.get("Name")
                 if s_id and s_name:
-                    new_map[s_name.strip()] = s_id.strip()
+                    STOCK_NAME_MAP[s_name.strip()] = s_id.strip()
     except Exception as e:
-        print(f"Update TWSE stock map error: {e}")
+        print(f"TWSE Fetch Error: {e}")
 
-    # 2. 抓取上櫃股票清單 (補足寶雅、鈊象等上櫃標的)
+    # 上櫃股票清單
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-        res = requests.get(url_tpex, headers=headers, timeout=10)
+        res = requests.get(url_tpex, headers=headers, timeout=5)
         if res.status_code == 200:
             for item in res.json():
                 s_id = item.get("SecuritiesCompanyCode")
                 s_name = item.get("CompanyName")
                 if s_id and s_name:
-                    new_map[s_name.strip()] = s_id.strip()
+                    STOCK_NAME_MAP[s_name.strip()] = s_id.strip()
     except Exception as e:
-        print(f"Update TPEx stock map error: {e}")
-
-    if new_map:
-        STOCK_NAME_MAP = new_map
+        print(f"TPEx Fetch Error: {e}")
 
 update_stock_name_map()
 
@@ -79,20 +83,26 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").strip()
     
-    # 直接輸入數字代碼時
+    # 1. 直接輸入數字代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
-    if not STOCK_NAME_MAP:
-        update_stock_name_map()
-
-    # 精確比對中文名稱
+    # 2. 精確比對中文名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
-    # 模糊比對中文名稱
+    # 3. 模糊比對中文名稱
+    for name, code in STOCK_NAME_MAP.items():
+        if user_input in name or name in user_input:
+            return code, name
+
+    # 4. 查無資料時，嘗試重新從線上更新字典再查一次
+    update_stock_name_map()
+    if user_input in STOCK_NAME_MAP:
+        return STOCK_NAME_MAP[user_input], user_input
+
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
@@ -180,11 +190,11 @@ def analyze_stock(user_input):
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 目前系統僅支援台股（上市/上櫃）查詢。\n請輸入台股代碼（如 5904）或中文名稱（如 寶雅、富邦金）。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 5904 寶雅、5274 信驊）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
-            return f"找不到 [{user_input}] 的台股資料，請確認代碼或名稱是否正確。"
+            return f"找不到代碼 [{stock_code}] 的台股價格數據，請確認代碼是否正確。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info = get_tw_revenue(stock_code)
