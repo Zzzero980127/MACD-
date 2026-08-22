@@ -17,17 +17,17 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
-# 常見重點概念股與旺季季節性對照庫 (預設擴充)
+# 產業與旺季庫
 STOCK_CONCEPT_INFO = {
-    "2330": {"concept": "晶圓代工 / AI晶片 / 先進封裝(CoWoS)", "season": "10月~隔年2月 (Q4~Q1 科技旺季/法說會題材)"},
+    "2330": {"concept": "晶圓代工 / AI晶片 / CoWoS", "season": "10月~隔年2月 (Q4~Q1 科技旺季)"},
+    "2610": {"concept": "航空客運 / 觀光暑假 / 客貨運", "season": "6月~8月 (暑假客運) / 11月~12月 (年底貨運旺季)"},
+    "2618": {"concept": "航空客運 / 貨運雙雄", "season": "6月~8月 (暑假旅遊) / 11月~12月 (年底貨運旺季)"},
     "2317": {"concept": "鴻海家族 / AI伺服器 / 電動車", "season": "10月~12月 (iPhone發布與Q4出貨旺季)"},
-    "2454": {"concept": "IC設計 / 手機晶片 / 邊緣AI", "season": "11月~3月 (展覽題材與新機拉貨潮)"},
-    "6770": {"concept": "成熟製程 / 晶圓代工 / 車用半導體", "season": "3月~7月 (半導體復甦與股東會題材)"},
-    "2059": {"concept": "伺服器導軌 / AI伺服器概念 / 高價千金股", "season": "11月~3月 (伺服器新平台拉貨旺季)"},
-    "3231": {"concept": "AI伺服器代工 / 筆電代工 / 伺服器", "season": "11月~2月 (年底集團作帳與AI出貨旺季)"},
-    "2382": {"concept": "AI伺服器代工 / 雲端運算", "season": "11月~2月 (AI浪潮與歲末集團行情)"},
-    "3017": {"concept": "散熱模組 / 水冷散熱 / AI伺服器", "season": "8月~11月 (電子旺季與新散熱方案拉貨)"},
-    "2303": {"concept": "成熟製程 / 高股息概念 / 晶圓代工", "season": "3月~6月 (高殖利率與除權息行情)"}
+    "2454": {"concept": "IC設計 / 手機晶片 / 邊緣AI", "season": "11月~3月 (新機拉貨與展覽題材)"},
+    "6770": {"concept": "成熟製程 / 車用半導體", "season": "3月~7月 (半導體復甦與股東會題材)"},
+    "2059": {"concept": "伺服器導軌 / AI伺服器 / 高價股", "season": "11月~3月 (伺服器新平台拉貨旺季)"},
+    "3231": {"concept": "AI伺服器代工 / 緯創", "season": "11月~2月 (集團作帳與AI出貨旺季)"},
+    "2382": {"concept": "AI伺服器代工 / 廣達", "season": "11月~2月 (AI浪潮與歲末行情)"}
 }
 
 def update_stock_name_map():
@@ -107,7 +107,7 @@ def get_tw_stock_data(stock_id):
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """抓取最新月營收與 MoM/YoY"""
+    """抓取並精準計算台股營收 MoM / YoY"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -115,28 +115,41 @@ def get_tw_revenue(stock_id):
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
-            if not df.empty:
+            if len(df) >= 2:
                 latest = df.iloc[-1]
-                revenue_month = latest.get('revenue_month', '')
-                revenue_year = latest.get('revenue_year', '')
-                mom = latest.get('mom', None)
-                yoy = latest.get('yoy', None)
+                prev = df.iloc[-2]
                 
-                # 判斷是否符合預期 (YoY > 0 且 MoM > 0 視為強勢表現)
-                yoy_str = f"{yoy:.2f}%" if yoy is not None else "N/A"
-                mom_str = f"{mom:.2f}%" if mom is not None else "N/A"
+                rev_now = float(latest.get('revenue', 0))
+                rev_prev = float(prev.get('revenue', 0))
                 
-                if yoy is not None and yoy > 15:
-                    status = "🔥 優於預期 (YoY強勁成長)"
-                elif yoy is not None and yoy > 0:
-                    status = "🟢 符合預期 (穩健年增)"
-                else:
-                    status = "🟡 稍低於預期 (年增衰退/放緩)"
+                # 計算 MoM
+                mom = ((rev_now - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0
+                
+                # 計算 YoY (若有去年同月數據)
+                yoy = None
+                if len(df) >= 13:
+                    last_year = df.iloc[-13]
+                    rev_ly = float(last_year.get('revenue', 0))
+                    if rev_ly > 0:
+                        yoy = (rev_now - rev_ly) / rev_ly * 100
 
-                return f"{revenue_year}/{revenue_month}月 | 年增(YoY): {yoy_str} | 月增(MoM): {mom_str}\n   歷史表現: {status}"
+                month_str = f"{latest.get('revenue_year')}/{latest.get('revenue_month')}月"
+                mom_str = f"{mom:+.2f}%"
+                yoy_str = f"{yoy:+.2f}%" if yoy is not None else "資料計算中"
+
+                if yoy is not None and yoy > 10:
+                    status = "🔥 優於預期 (年增雙位數成長)"
+                elif yoy is not None and yoy >= 0:
+                    status = "🟢 符合預期 (穩健正成長)"
+                elif yoy is not None:
+                    status = "🟡 稍低於預期 (年增放緩/衰退)"
+                else:
+                    status = "🟢 營收動能持平"
+
+                return f"{month_str} | 年增(YoY): {yoy_str} | 月增(MoM): {mom_str}\n   表現評價: {status}"
     except Exception:
         pass
-    return "尚無最新營收數據"
+    return "無即時營收數據"
 
 def get_tw_foreign_investor(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
@@ -156,20 +169,49 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
+def get_us_stock_data(symbol):
+    """美股抓取備援機制"""
+    # 方案 1: Alpha Vantage
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if "Time Series (Daily)" in data:
+            ts = data["Time Series (Daily)"]
+            df = pd.DataFrame.from_dict(ts, orient='index')
+            df = df.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}).astype(float)
+            df = df.sort_index()
+            return df, symbol
+    except Exception:
+        pass
+
+    # 方案 2: Stooq / Yahoo 備援
+    try:
+        stooq_url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
+        df = pd.read_csv(stooq_url)
+        if not df.empty and 'Close' in df.columns:
+            df = df.sort_values(by='Date').reset_index(drop=True)
+            df['Close'] = df['Close'].astype(float)
+            df['Volume'] = df['Volume'].astype(float)
+            return df, symbol
+    except Exception:
+        pass
+
+    return None, symbol
+
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
         foreign_net = None
-        revenue_info = "非台股，無營收數據"
-        concept_text = "普通電子/製造類股"
-        season_text = "第四季至第一季 (一般產業旺季)"
+        revenue_info = "美股ETF/股票，無台股營收"
+        concept_text = "海外股票 / ETF"
+        season_text = "11月~隔年4月 (美股歷史最佳表現月份)"
 
         if stock_code.isdigit():
             df, target_symbol = get_tw_stock_data(stock_code)
             foreign_net = get_tw_foreign_investor(stock_code)
             revenue_info = get_tw_revenue(stock_code)
 
-            # 匹配概念股與旺季
             if stock_code in STOCK_CONCEPT_INFO:
                 concept_text = STOCK_CONCEPT_INFO[stock_code]["concept"]
                 season_text = STOCK_CONCEPT_INFO[stock_code]["season"]
@@ -223,7 +265,7 @@ def analyze_stock(user_input):
             else:
                 foreign_text = "買賣超 0 張"
         else:
-            foreign_text = "查無即時外資籌碼"
+            foreign_text = "無數據 (美股/海外標的)"
 
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
