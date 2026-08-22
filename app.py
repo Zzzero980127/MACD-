@@ -35,7 +35,7 @@ update_stock_name_map()
 
 @app.route("/", methods=['GET'])
 def index():
-    return 'Stock Bot is running alive!'
+    return 'TW Stock Bot is running alive!'
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -57,7 +57,7 @@ def handle_message(event):
     )
 
 def resolve_stock_symbol(user_input):
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "")
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").strip()
     
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
@@ -152,46 +152,20 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
-def get_us_stock_data(symbol):
-    symbol = symbol.upper().strip()
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=6m&interval=1d"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-    }
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        data = res.json()
-        result = data['chart']['result'][0]
-        timestamps = result['timestamp']
-        quote = result['indicators']['quote'][0]
-        
-        df = pd.DataFrame({
-            'Close': quote['close'],
-            'Volume': quote['volume']
-        }, index=pd.to_datetime(timestamps, unit='s'))
-        
-        df = df.dropna().sort_index()
-        if len(df) >= 20:
-            return df, symbol
-    except Exception:
-        pass
-    return None, symbol
-
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
-        foreign_net = None
-        revenue_info = "美股/ETF 無台股營收"
 
-        if stock_code.isdigit():
-            df, target_symbol = get_tw_stock_data(stock_code)
-            foreign_net = get_tw_foreign_investor(stock_code)
-            revenue_info = get_tw_revenue(stock_code)
-        else:
-            df, target_symbol = get_us_stock_data(stock_code)
+        # 判斷是否為數字代碼或常見台股名稱，若非台股則擋下
+        if not stock_code.isdigit():
+            return f"⚠️ 目前系統僅支援台股（上市/上櫃）查詢。\n請輸入台股代碼（如 2330）或中文名稱（如 台積電、華航）。"
 
+        df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
-            return f"找不到 [{user_input}] 的股票資料，請確認名稱或代碼是否正確。"
+            return f"找不到 [{user_input}] 的台股資料，請確認代碼或名稱是否正確。"
+
+        foreign_net = get_tw_foreign_investor(stock_code)
+        revenue_info = get_tw_revenue(stock_code)
 
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -222,11 +196,11 @@ def analyze_stock(user_input):
         is_price_up = price_change_pct > 0
         is_price_down = price_change_pct < 0
 
-        # 量能增減判定 (以 5 日均量為基準)
-        is_vol_expand = vol_today >= vol_ma5 * 1.15  # 放量 (大於均量15%)
-        is_vol_shrink = vol_today <= vol_ma5 * 0.85  # 量縮 (小於均量15%)
+        # 量能增減判定
+        is_vol_expand = vol_today >= vol_ma5 * 1.15
+        is_vol_shrink = vol_today <= vol_ma5 * 0.85
 
-        # 細化量價結構 (見頂/見底訊號)
+        # 細化量價結構
         if is_price_up and is_vol_expand:
             vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
         elif is_price_down and is_vol_expand:
@@ -234,7 +208,7 @@ def analyze_stock(user_input):
         elif is_price_up and is_vol_shrink:
             vol_status = f"⚠️ 上漲量縮 (+{price_change_pct:.1f}%)\n   👉 量價背離！買盤停滯，需防範【見頂回落】"
         elif is_price_down and is_vol_shrink:
-            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反彈】"
+            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反反彈】"
         else:
             vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)\n   👉 量能無明顯變化"
 
@@ -246,7 +220,7 @@ def analyze_stock(user_input):
             else:
                 foreign_text = "買賣超 0 張"
         else:
-            foreign_text = "無數據 (美股/海外標的)"
+            foreign_text = "查無即時外資數據"
 
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
@@ -278,7 +252,7 @@ def analyze_stock(user_input):
         title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
 
         return (
-            f"📊 {title_display} 全方位分析：\n"
+            f"📊 {title_display} 技術與籌碼分析：\n"
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
@@ -295,4 +269,3 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
-     
