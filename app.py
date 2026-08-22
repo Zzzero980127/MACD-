@@ -10,14 +10,12 @@ app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'oG8A/4QoXPau72qWtFOcV4Hq/Ca+EgcQoJgSMHUjbNPVjtgyGkBeTwdmqfBiEjqBbZLzUn0F70JNtdTgICSrgr T+4NysH5ayUtXj4B+06J6I2DW7BT3ruJHndDuag4zjys1CO836Jwy4fR0oDq6e7wdB04t89/1O/w1cDnyilFU=')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a332382036072d72899c94d5b')
-ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', 'USVKF1GK6PIWA0CZ')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
-# 產業與旺季庫
 STOCK_CONCEPT_INFO = {
     "2330": {"concept": "晶圓代工 / AI晶片 / CoWoS", "season": "10月~隔年2月 (Q4~Q1 科技旺季)"},
     "2610": {"concept": "航空客運 / 觀光暑假 / 客貨運", "season": "6月~8月 (暑假客運) / 11月~12月 (年底貨運旺季)"},
@@ -107,7 +105,6 @@ def get_tw_stock_data(stock_id):
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """抓取並精準計算台股營收 MoM / YoY"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -122,10 +119,8 @@ def get_tw_revenue(stock_id):
                 rev_now = float(latest.get('revenue', 0))
                 rev_prev = float(prev.get('revenue', 0))
                 
-                # 計算 MoM
                 mom = ((rev_now - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0
                 
-                # 計算 YoY (若有去年同月數據)
                 yoy = None
                 if len(df) >= 13:
                     last_year = df.iloc[-13]
@@ -170,32 +165,29 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def get_us_stock_data(symbol):
-    """美股抓取備援機制"""
-    # 方案 1: Alpha Vantage
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+    """採用 Yahoo Finance API 穩定抓取美股 (包含 ETF，如 VT, QQQ, NVDA)"""
+    symbol = symbol.upper().strip()
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=6m&interval=1d"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=headers, timeout=10)
         data = res.json()
-        if "Time Series (Daily)" in data:
-            ts = data["Time Series (Daily)"]
-            df = pd.DataFrame.from_dict(ts, orient='index')
-            df = df.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}).astype(float)
-            df = df.sort_index()
+        result = data['chart']['result'][0]
+        timestamps = result['timestamp']
+        quote = result['indicators']['quote'][0]
+        
+        df = pd.DataFrame({
+            'Close': quote['close'],
+            'Volume': quote['volume']
+        }, index=pd.to_datetime(timestamps, unit='s'))
+        
+        df = df.dropna().sort_index()
+        if len(df) >= 20:
             return df, symbol
-    except Exception:
-        pass
-
-    # 方案 2: Stooq / Yahoo 備援
-    try:
-        stooq_url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
-        df = pd.read_csv(stooq_url)
-        if not df.empty and 'Close' in df.columns:
-            df = df.sort_values(by='Date').reset_index(drop=True)
-            df['Close'] = df['Close'].astype(float)
-            df['Volume'] = df['Volume'].astype(float)
-            return df, symbol
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Yahoo fetch error for {symbol}: {e}")
 
     return None, symbol
 
@@ -204,7 +196,7 @@ def analyze_stock(user_input):
         stock_code, display_name = resolve_stock_symbol(user_input)
         foreign_net = None
         revenue_info = "美股ETF/股票，無台股營收"
-        concept_text = "海外股票 / ETF"
+        concept_text = "美股標的 / 全球ETF"
         season_text = "11月~隔年4月 (美股歷史最佳表現月份)"
 
         if stock_code.isdigit():
