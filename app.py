@@ -1,7 +1,6 @@
 import os
-import pandas as pd
-import yfinance as yf
 import requests
+import pandas as pd
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -40,31 +39,47 @@ def handle_message(event):
     )
 
 def get_tw_stock_data(stock_id):
-    # 先用 yfinance (上市 .TW -> 上櫃 .TWO)
-    for ext in ['.TW', '.TWO']:
-        try:
-            ticker = yf.Ticker(f"{stock_id}{ext}")
-            df = ticker.history(period="6m")
-            if not df.empty and len(df) >= 26:
-                return df, f"{stock_id}{ext}"
-        except Exception:
-            continue
-
-    # 備用方案：FinMind API (修復日期格式)
-    token = 'EyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk'
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01&token={token}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    # 1. 優先存取：證交所 (TWSE) 上市個股日收盤 API
+    twse_url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo={stock_id}&response=json"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(twse_url, headers=headers, timeout=10)
         data = res.json()
-        if data.get("status") == 200 and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            df = df.rename(columns={'close': 'Close'})
-            df['Close'] = df['Close'].astype(float)
-            if len(df) >= 26:
+        if data.get('stat') == 'OK' and 'data' in data:
+            raw_data = data['data']
+            records = []
+            for row in raw_data:
+                # 清除千分位逗號與非數字字元
+                close_str = row[6].replace(',', '').strip()
+                if close_str and close_str != '--':
+                    records.append(float(close_str))
+            
+            if len(records) >= 26:
+                df = pd.DataFrame({'Close': records})
                 return df, f"{stock_id}.TW"
     except Exception:
         pass
-        
+
+    # 2. 備用存取：櫃買中心 (TPEx) 上櫃個股 API
+    tpex_url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&stkno={stock_id}"
+    try:
+        res = requests.get(tpex_url, headers=headers, timeout=10)
+        data = res.json()
+        if 'aaData' in data and len(data['aaData']) > 0:
+            raw_data = data['aaData']
+            records = []
+            for row in raw_data:
+                close_str = row[6].replace(',', '').strip()
+                if close_str and close_str != '--':
+                    records.append(float(close_str))
+            
+            if len(records) >= 26:
+                df = pd.DataFrame({'Close': records})
+                return df, f"{stock_id}.TWO"
+    except Exception:
+        pass
+
     return None, stock_id
 
 def get_us_stock_data(symbol):
