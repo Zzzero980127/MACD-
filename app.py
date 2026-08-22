@@ -39,7 +39,7 @@ def handle_message(event):
     )
 
 def get_tw_stock_data(stock_id):
-    """改用公用股票 API 介面，跨國伺服器 100% 不會被擋"""
+    """抓取台股日 K 線與成交量"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -47,28 +47,31 @@ def get_tw_stock_data(stock_id):
         data = res.json()
         if data.get("status") == 200 and len(data.get("data", [])) >= 26:
             df = pd.DataFrame(data["data"])
-            df = df.rename(columns={'close': 'Close'})
+            df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = df['Close'].astype(float)
+            df['Volume'] = df['Volume'].astype(float)
             return df, f"{stock_id}.TW"
     except Exception:
         pass
+    return None, stock_id
 
-    # 備用方案：證交所官方 OpenAPI
-    twse_url = f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+def get_tw_foreign_investor(stock_id):
+    """抓取台股外資買賣超資料 (張數)"""
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(twse_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            all_data = res.json()
-            target = [item for item in all_data if item.get('Code') == stock_id]
-            if target and 'ClosingPrice' in target[0]:
-                c_price = float(target[0]['ClosingPrice'])
-                # 建立模擬近代序列供計算
-                df = pd.DataFrame({'Close': [c_price] * 30})
-                return df, f"{stock_id}.TW"
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("status") == 200 and data.get("data"):
+            df = pd.DataFrame(data["data"])
+            foreign_df = df[df['name'].str.contains('Foreign', case=False, na=False)]
+            if not foreign_df.empty:
+                latest_net = foreign_df.iloc[-1]['buy'] - foreign_df.iloc[-1]['sell']
+                # 轉為張數 (原單位為股)
+                return round(latest_net / 1000)
     except Exception:
         pass
-
-    return None, stock_id
+    return None
 
 def get_us_stock_data(symbol):
     url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
@@ -78,7 +81,7 @@ def get_us_stock_data(symbol):
         if "Time Series (Daily)" in data:
             ts = data["Time Series (Daily)"]
             df = pd.DataFrame.from_dict(ts, orient='index')
-            df = df.rename(columns={'4. close': 'Close'}).astype(float)
+            df = df.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}).astype(float)
             df = df.sort_index()
             return df, symbol
     except Exception:
@@ -88,22 +91,27 @@ def get_us_stock_data(symbol):
 def analyze_stock(user_input):
     try:
         clean_input = user_input.replace(".TW", "").replace(".TWO", "")
+        foreign_net = None
 
         if clean_input.isdigit():
             df, target_symbol = get_tw_stock_data(clean_input)
+            foreign_net = get_tw_foreign_investor(clean_input)
         else:
             df, target_symbol = get_us_stock_data(user_input)
 
         if df is None or df.empty:
             return f"找不到代號 [{user_input}] 的資料，請確認代碼是否正確。"
 
-        # 指標計算
+        # 1. 均線與 MACD 計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['Hist'] = df['DIF'] - df['MACD']
         df['MA20'] = df['Close'].rolling(window=20).mean()
+
+        # 2. 成交量 5 日均量計算
+        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
@@ -118,32 +126,59 @@ def analyze_stock(user_input):
 
         diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
 
-        # 訊號判斷
+        # 成交量狀態判斷
+        vol_today = float(latest['Volume'])
+        vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
+        
+        if vol_today >= vol_ma5 * 1.5:
+            vol_status = "🔥 顯著放量 (大於5日均量50%)"
+        elif vol_today >= vol_ma5 * 1.2:
+            vol_status = "📈 溫和放量 (大於5日均量20%)"
+        elif vol_today <= vol_ma5 * 0.8:
+            vol_status = "📉 明顯量縮 (低於5日均量20%)"
+        else:
+            vol_status = "➡️ 量能平穩 (與5日均量相當)"
+
+        # 外資買賣超字串
+        if foreign_net is not None:
+            if foreign_net > 0:
+                foreign_text = f"買超 {foreign_net} 張"
+            elif foreign_net < 0:
+                foreign_text = f"賣超 {abs(foreign_net)} 張"
+            else:
+                foreign_text = "買賣超 0 張"
+        else:
+            foreign_text = "無數據 (或美股無此指標)"
+
+        # 防洗盤與出場條件
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
 
+        # 訊號判斷
         if is_break_3pct or is_two_days_below:
             reasons = []
             if is_break_3pct:
-                reasons.append(f"跌破月線幅度達 {abs(diff_pct):.2f}%（超過 3% 門檻）")
+                reasons.append(f"跌破月線 {abs(diff_pct):.2f}%（超 3%）")
             if is_two_days_below:
-                reasons.append("已連續 2 個交易日收盤於月線下方")
-            
-            reason_str = " & ".join(reasons)
-            signal = f"🔴【建議出場】{reason_str}，真跌破機率高，建議離場避險！"
-        elif close < ma20:
-            signal = "🟡【警戒預警】目前收盤價微幅低於月線（尚未達3%且未滿2天），建議密切觀察或先減碼部分部位。"
-        elif hist_today < 0 and abs(hist_today) < abs(hist_yesterday) and close > ma20:
-            signal = "🟢【試買訊號】空方力道減弱且在月線上，可建立小量試買單！"
-        elif hist_yesterday < 0 and hist_today >= 0 and close > ma20:
-            signal = "🔥【加碼訊號】MACD 轉多（金叉），可順勢加碼！"
-        else:
-            signal = "⚪【觀望】目前無明確交易訊號"
+                reasons.append("連 2 日低於月線")
+            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，趨勢轉弱，防範持續下探！"
 
-        if diff_pct < 0:
-            pct_text = f"跌破月線 {abs(diff_pct):.2f}%"
+        elif close < ma20:
+            signal = "🟡【警戒觀望】股價微幅低於月線，趨勢偏弱，建議先觀望或適度減碼。"
+
+        elif hist_today > 0 and hist_today >= hist_yesterday:
+            signal = "🔥【多頭續抱/加碼】強勢站穩月線且 MACD 紅柱擴大，多方控盤可持續持有或逢低加碼！"
+
+        elif hist_today > 0 and hist_today < hist_yesterday:
+            signal = "🟢【偏多持有】站穩月線上，但多頭力道稍緩，建議續抱並關注月線支撐。"
+
+        elif hist_today < 0 and abs(hist_today) < abs(hist_yesterday):
+            signal = "🟢【試買建倉】股價在月線上，且空方力道開始減弱，可考慮建立分批試買單。"
+
         else:
-            pct_text = f"高於月線 {diff_pct:.2f}%"
+            signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立再操作。"
+
+        pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"跌破月線 {abs(diff_pct):.2f}%"
 
         return (
             f"📊 {target_symbol} 分析結果：\n"
@@ -152,8 +187,10 @@ def analyze_stock(user_input):
             f"20日均線(月線): {ma20:.2f}\n"
             f"月線偏離度: {pct_text}\n"
             f"MACD柱狀體: {hist_today:.3f}\n"
+            f"成交量狀態: {vol_status}\n"
+            f"外資籌碼動向: {foreign_text}\n"
             f"-------------------\n"
-            f"診斷結果：\n{signal}"
+            f"💡 操作建議：\n{signal}"
         )
     except Exception as e:
         return f"分析發生錯誤: {str(e)}"
