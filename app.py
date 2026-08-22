@@ -17,6 +17,19 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
+# 常見重點概念股與旺季季節性對照庫 (預設擴充)
+STOCK_CONCEPT_INFO = {
+    "2330": {"concept": "晶圓代工 / AI晶片 / 先進封裝(CoWoS)", "season": "10月~隔年2月 (Q4~Q1 科技旺季/法說會題材)"},
+    "2317": {"concept": "鴻海家族 / AI伺服器 / 電動車", "season": "10月~12月 (iPhone發布與Q4出貨旺季)"},
+    "2454": {"concept": "IC設計 / 手機晶片 / 邊緣AI", "season": "11月~3月 (展覽題材與新機拉貨潮)"},
+    "6770": {"concept": "成熟製程 / 晶圓代工 / 車用半導體", "season": "3月~7月 (半導體復甦與股東會題材)"},
+    "2059": {"concept": "伺服器導軌 / AI伺服器概念 / 高價千金股", "season": "11月~3月 (伺服器新平台拉貨旺季)"},
+    "3231": {"concept": "AI伺服器代工 / 筆電代工 / 伺服器", "season": "11月~2月 (年底集團作帳與AI出貨旺季)"},
+    "2382": {"concept": "AI伺服器代工 / 雲端運算", "season": "11月~2月 (AI浪潮與歲末集團行情)"},
+    "3017": {"concept": "散熱模組 / 水冷散熱 / AI伺服器", "season": "8月~11月 (電子旺季與新散熱方案拉貨)"},
+    "2303": {"concept": "成熟製程 / 高股息概念 / 晶圓代工", "season": "3月~6月 (高殖利率與除權息行情)"}
+}
+
 def update_stock_name_map():
     global STOCK_NAME_MAP
     try:
@@ -78,7 +91,6 @@ def resolve_stock_symbol(user_input):
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
-    """取得台股正確歷史 K 線數據"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -94,8 +106,39 @@ def get_tw_stock_data(stock_id):
         pass
     return None, stock_id
 
+def get_tw_revenue(stock_id):
+    """抓取最新月營收與 MoM/YoY"""
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("status") == 200 and data.get("data"):
+            df = pd.DataFrame(data["data"])
+            if not df.empty:
+                latest = df.iloc[-1]
+                revenue_month = latest.get('revenue_month', '')
+                revenue_year = latest.get('revenue_year', '')
+                mom = latest.get('mom', None)
+                yoy = latest.get('yoy', None)
+                
+                # 判斷是否符合預期 (YoY > 0 且 MoM > 0 視為強勢表現)
+                yoy_str = f"{yoy:.2f}%" if yoy is not None else "N/A"
+                mom_str = f"{mom:.2f}%" if mom is not None else "N/A"
+                
+                if yoy is not None and yoy > 15:
+                    status = "🔥 優於預期 (YoY強勁成長)"
+                elif yoy is not None and yoy > 0:
+                    status = "🟢 符合預期 (穩健年增)"
+                else:
+                    status = "🟡 稍低於預期 (年增衰退/放緩)"
+
+                return f"{revenue_year}/{revenue_month}月 | 年增(YoY): {yoy_str} | 月增(MoM): {mom_str}\n   歷史表現: {status}"
+    except Exception:
+        pass
+    return "尚無最新營收數據"
+
 def get_tw_foreign_investor(stock_id):
-    """精準抓取外資買賣超張數（兼容中文名稱匹配）"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -103,41 +146,36 @@ def get_tw_foreign_investor(stock_id):
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
-            # 支援 Foreign_Investor、Foreign_Merchant、外陸資投資人 等多元欄位名
             foreign_df = df[df['name'].str.contains('Foreign|外資|外陸資', case=False, na=False)]
             if not foreign_df.empty:
-                # 取得最新一日的所有外資買賣合計
                 latest_date = foreign_df.iloc[-1]['date']
                 day_data = foreign_df[foreign_df['date'] == latest_date]
                 net_shares = day_data['buy'].sum() - day_data['sell'].sum()
-                return round(net_shares / 1000) # 轉張數
+                return round(net_shares / 1000)
     except Exception:
         pass
     return None
-
-def get_us_stock_data(symbol):
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
-    try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        if "Time Series (Daily)" in data:
-            ts = data["Time Series (Daily)"]
-            df = pd.DataFrame.from_dict(ts, orient='index')
-            df = df.rename(columns={'4. close': 'Close', '5. volume': 'Volume'}).astype(float)
-            df = df.sort_index()
-            return df, symbol
-    except Exception:
-        pass
-    return None, symbol
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
         foreign_net = None
+        revenue_info = "非台股，無營收數據"
+        concept_text = "普通電子/製造類股"
+        season_text = "第四季至第一季 (一般產業旺季)"
 
         if stock_code.isdigit():
             df, target_symbol = get_tw_stock_data(stock_code)
             foreign_net = get_tw_foreign_investor(stock_code)
+            revenue_info = get_tw_revenue(stock_code)
+
+            # 匹配概念股與旺季
+            if stock_code in STOCK_CONCEPT_INFO:
+                concept_text = STOCK_CONCEPT_INFO[stock_code]["concept"]
+                season_text = STOCK_CONCEPT_INFO[stock_code]["season"]
+            else:
+                concept_text = "上市櫃一般產業股"
+                season_text = "11月~3月 (歷史作帳與財報空窗期行情)"
         else:
             df, target_symbol = get_us_stock_data(stock_code)
 
@@ -217,14 +255,17 @@ def analyze_stock(user_input):
         title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
 
         return (
-            f"📊 {title_display} 分析結果：\n"
+            f"📊 {title_display} 全方位分析：\n"
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
-            f"20日均線(月線): {ma20:.2f}\n"
-            f"月線偏離度: {pct_text}\n"
-            f"MACD柱狀體: {hist_today:.3f}\n"
+            f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
             f"成交量狀態: {vol_status}\n"
             f"外資籌碼動向: {foreign_text}\n"
+            f"-------------------\n"
+            f"📈 基本面與營收：\n"
+            f"   {revenue_info}\n"
+            f"🏷️ 概念題材: {concept_text}\n"
+            f"🗓️ 歷史旺季行情: {season_text}\n"
             f"-------------------\n"
             f"💡 操作建議：\n{signal}"
         )
