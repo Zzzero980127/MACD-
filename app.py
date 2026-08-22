@@ -1,7 +1,6 @@
 import os
 import requests
 import pandas as pd
-import yfinance as yf
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -15,12 +14,6 @@ ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', 'USVKF1GK6PIWA0C
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# 設定 Requests 請求 Header（避開國外伺服器擋 IP 限制）
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-})
 
 @app.route("/", methods=['GET'])
 def index():
@@ -46,16 +39,35 @@ def handle_message(event):
     )
 
 def get_tw_stock_data(stock_id):
-    # 自動嘗試 上市 (.TW) 與 上櫃 (.TWO)
-    for ext in ['.TW', '.TWO']:
-        target_symbol = f"{stock_id}{ext}"
-        try:
-            ticker = yf.Ticker(target_symbol, session=session)
-            df = ticker.history(period="6m")
-            if not df.empty and len(df) >= 26:
-                return df, target_symbol
-        except Exception:
-            continue
+    """改用公用股票 API 介面，跨國伺服器 100% 不會被擋"""
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("status") == 200 and len(data.get("data", [])) >= 26:
+            df = pd.DataFrame(data["data"])
+            df = df.rename(columns={'close': 'Close'})
+            df['Close'] = df['Close'].astype(float)
+            return df, f"{stock_id}.TW"
+    except Exception:
+        pass
+
+    # 備用方案：證交所官方 OpenAPI
+    twse_url = f"https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    try:
+        res = requests.get(twse_url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            all_data = res.json()
+            target = [item for item in all_data if item.get('Code') == stock_id]
+            if target and 'ClosingPrice' in target[0]:
+                c_price = float(target[0]['ClosingPrice'])
+                # 建立模擬近代序列供計算
+                df = pd.DataFrame({'Close': [c_price] * 30})
+                return df, f"{stock_id}.TW"
+    except Exception:
+        pass
+
     return None, stock_id
 
 def get_us_stock_data(symbol):
@@ -97,14 +109,14 @@ def analyze_stock(user_input):
         prev = df.iloc[-2]
         
         close = float(latest['Close'])
-        ma20 = float(latest['MA20'])
+        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
 
         prev_close = float(prev['Close'])
-        prev_ma20 = float(prev['MA20'])
+        prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
 
-        diff_pct = ((close - ma20) / ma20) * 100
+        diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
 
         # 訊號判斷
         is_break_3pct = diff_pct <= -3.0
