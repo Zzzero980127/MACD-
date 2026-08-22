@@ -14,7 +14,7 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 熱門標的硬編碼備援庫（防止政府 API 連線逾時導致空字典）
+# 熱門標的硬編碼備援庫
 BACKUP_STOCK_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
@@ -25,11 +25,10 @@ BACKUP_STOCK_MAP = {
 STOCK_NAME_MAP = dict(BACKUP_STOCK_MAP)
 
 def update_stock_name_map():
-    """從上市與上櫃開放資料自動更新名稱對照表"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 上市股票清單
+    # 上市股票
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -42,7 +41,7 @@ def update_stock_name_map():
     except Exception as e:
         print(f"TWSE Fetch Error: {e}")
 
-    # 上櫃股票清單
+    # 上櫃股票
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
@@ -83,22 +82,18 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").strip()
     
-    # 1. 直接輸入數字代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
-    # 2. 精確比對中文名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
-    # 3. 模糊比對中文名稱
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
-    # 4. 查無資料時，嘗試重新從線上更新字典再查一次
     update_stock_name_map()
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
@@ -199,13 +194,20 @@ def analyze_stock(user_input):
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info = get_tw_revenue(stock_code)
 
+        # MACD 技術指標
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['Hist'] = df['DIF'] - df['MACD']
+
+        # 均線與均量
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
+
+        # 布林通道 (Bollinger Bands: MA20 ± 2倍標準差)
+        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
@@ -214,6 +216,7 @@ def analyze_stock(user_input):
         prev_close = float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
         prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
+        bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
 
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
@@ -230,7 +233,12 @@ def analyze_stock(user_input):
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
 
-        if is_price_up and is_vol_expand:
+        # 判斷是否突破或觸及布林上軌
+        is_touch_bb_upper = close >= bb_upper
+
+        if is_touch_bb_upper:
+            vol_status = f"🚨 股價觸及/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線極端過熱，極易引發獲利賣壓，【切勿追高】！"
+        elif is_price_up and is_vol_expand:
             vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
         elif is_price_down and is_vol_expand:
             vol_status = f"📉 下跌放量 ({price_change_pct:.1f}%)\n   👉 恐慌盤湧出/大戶拋售，注意續跌風險"
@@ -254,6 +262,7 @@ def analyze_stock(user_input):
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
 
+        # 操作建議邏輯（融入布林上軌防追高機制）
         if is_break_3pct or is_two_days_below:
             reasons = []
             if is_break_3pct:
@@ -261,6 +270,9 @@ def analyze_stock(user_input):
             if is_two_days_below:
                 reasons.append("連2日低於月線")
             signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，趨勢轉弱！"
+
+        elif is_touch_bb_upper:
+            signal = "⚠️【嚴防追高 / 可擇優減碼】股價已推升至布林上軌極限，短線隨時有回檔拉回風險！"
 
         elif close < ma20:
             signal = "🟡【警戒觀望】微幅低於月線，趨勢偏弱，建議先觀望。"
@@ -285,7 +297,8 @@ def analyze_stock(user_input):
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
-            f"量價結構:\n   {vol_status}\n"
+            f"布林通道上軌: {bb_upper:.2f}\n"
+            f"量價與通道結構:\n   {vol_status}\n"
             f"外資籌碼: {foreign_text}\n"
             f"-------------------\n"
             f"📈 基本面與營收：\n"
