@@ -2,4 +2,5 @@ flask
 line-bot-sdk
 requests
 pandas
+yfinance
 gunicorn
