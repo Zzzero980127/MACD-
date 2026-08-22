@@ -15,6 +15,28 @@ ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', 'USVKF1GK6PIWA0C
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# 全域變數：快取全台股中文對照表
+STOCK_NAME_MAP = {}
+
+def update_stock_name_map():
+    """向 FinMind / 證交所 抓取全台股中文名稱與代號對照"""
+    global STOCK_NAME_MAP
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if data.get("status") == 200:
+            for item in data.get("data", []):
+                s_id = item.get("stock_id")
+                s_name = item.get("stock_name")
+                if s_id and s_name:
+                    STOCK_NAME_MAP[s_name] = s_id
+    except Exception as e:
+        print(f"Update stock map error: {e}")
+
+# 初始化載入一次對照表
+update_stock_name_map()
+
 @app.route("/", methods=['GET'])
 def index():
     return 'Stock Bot is running alive!'
@@ -31,12 +53,39 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    symbol = event.message.text.strip().upper()
+    symbol = event.message.text.strip()
     reply_text = analyze_stock(symbol)
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
+
+def resolve_stock_symbol(user_input):
+    """判斷輸入是代號還是中文，並轉換為股票代號與顯示名稱"""
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "")
+    
+    # 若輸入純數字，直接作為代碼
+    if clean_input.isdigit():
+        # 嘗試從對照表反查中文名
+        name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
+        stock_name = name[0] if name else clean_input
+        return clean_input, stock_name
+
+    # 若對照表為空，再更新一次
+    if not STOCK_NAME_MAP:
+        update_stock_name_map()
+
+    # 精確比對中文名稱
+    if user_input in STOCK_NAME_MAP:
+        return STOCK_NAME_MAP[user_input], user_input
+
+    # 模糊比對（例如輸入「台積」匹配「台積電」）
+    for name, code in STOCK_NAME_MAP.items():
+        if user_input in name or name in user_input:
+            return code, name
+
+    # 美股代號或無法識別的字詞，原樣傳回
+    return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
     """抓取台股日 K 線與成交量"""
@@ -67,7 +116,6 @@ def get_tw_foreign_investor(stock_id):
             foreign_df = df[df['name'].str.contains('Foreign', case=False, na=False)]
             if not foreign_df.empty:
                 latest_net = foreign_df.iloc[-1]['buy'] - foreign_df.iloc[-1]['sell']
-                # 轉為張數 (原單位為股)
                 return round(latest_net / 1000)
     except Exception:
         pass
@@ -90,17 +138,17 @@ def get_us_stock_data(symbol):
 
 def analyze_stock(user_input):
     try:
-        clean_input = user_input.replace(".TW", "").replace(".TWO", "")
+        stock_code, display_name = resolve_stock_symbol(user_input)
         foreign_net = None
 
-        if clean_input.isdigit():
-            df, target_symbol = get_tw_stock_data(clean_input)
-            foreign_net = get_tw_foreign_investor(clean_input)
+        if stock_code.isdigit():
+            df, target_symbol = get_tw_stock_data(stock_code)
+            foreign_net = get_tw_foreign_investor(stock_code)
         else:
-            df, target_symbol = get_us_stock_data(user_input)
+            df, target_symbol = get_us_stock_data(stock_code)
 
         if df is None or df.empty:
-            return f"找不到代號 [{user_input}] 的資料，請確認代碼是否正確。"
+            return f"找不到 [{user_input}] 的股票資料，請確認名稱或代碼是否正確。"
 
         # 1. 均線與 MACD 計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -179,9 +227,10 @@ def analyze_stock(user_input):
             signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立再操作。"
 
         pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"跌破月線 {abs(diff_pct):.2f}%"
+        title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
 
         return (
-            f"📊 {target_symbol} 分析結果：\n"
+            f"📊 {title_display} 分析結果：\n"
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f}\n"
@@ -197,3 +246,4 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
+    
