@@ -1,6 +1,7 @@
 import os
-import requests
 import pandas as pd
+import yfinance as yf
+import requests
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -39,7 +40,17 @@ def handle_message(event):
     )
 
 def get_tw_stock_data(stock_id):
-    """透過 FinMind 免費 API 抓取台股資料 (已有 Token 授權)"""
+    # 先用 yfinance (上市 .TW -> 上櫃 .TWO)
+    for ext in ['.TW', '.TWO']:
+        try:
+            ticker = yf.Ticker(f"{stock_id}{ext}")
+            df = ticker.history(period="6m")
+            if not df.empty and len(df) >= 26:
+                return df, f"{stock_id}{ext}"
+        except Exception:
+            continue
+
+    # 備用方案：FinMind API (修復日期格式)
     token = 'EyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk'
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01&token={token}"
     try:
@@ -53,10 +64,10 @@ def get_tw_stock_data(stock_id):
                 return df, f"{stock_id}.TW"
     except Exception:
         pass
+        
     return None, stock_id
 
 def get_us_stock_data(symbol):
-    """美股使用 Alpha Vantage API"""
     url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
     try:
         res = requests.get(url, timeout=10)
@@ -146,4 +157,3 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
-  
