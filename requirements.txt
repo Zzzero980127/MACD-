@@ -3,3 +3,4 @@ line-bot-sdk
 requests
 pandas
 APScheduler
+gunicorn
