@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import requests
 import pandas as pd
 import datetime
@@ -19,17 +20,59 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+DB_FILE = 'stock_history.db'
 STOCK_NAME_MAP = {}
 LEADERBOARD_CACHE = {}
 CACHE_LOCK = Lock()
 
-# 掃描狀態統計
 TOTAL_SCANNED = 0
 CURRENT_INDEX = 0
 
+# ----------------------------------------------------
+# 1. SQLite 資料庫初始化與讀寫
+# ----------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            date TEXT PRIMARY KEY,
+            content TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_history_to_db(date_str, content_str):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO history (date, content) VALUES (?, ?)', (date_str, content_str))
+        conn.commit()
+        conn.close()
+    except Exception: pass
+
+def get_history_from_db(date_str):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT content FROM history WHERE date = ?', (date_str,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+init_db()
+
+# ----------------------------------------------------
+# 2. 上市 (TWSE) + 上櫃 (TPEx) 股票名稱與代碼對照庫
+# ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    # 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=3)
@@ -41,6 +84,7 @@ def load_all_taiwan_stocks():
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception: pass
 
+    # 上櫃股票 (TPEx)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=3)
@@ -54,6 +98,9 @@ def load_all_taiwan_stocks():
 
 load_all_taiwan_stocks()
 
+# ----------------------------------------------------
+# 3. FinMind 技術面與籌碼數據抓取
+# ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
@@ -90,7 +137,9 @@ def get_tw_foreign_investor(stock_id):
     except Exception: pass
     return 0
 
-# 🔄 背景慢速排程：每 30 秒只處理 1 檔股票（一小時 120 次，絕對不爆額度）
+# ----------------------------------------------------
+# 4. 背景慢速輪播 (30秒/檔，安全防爆，自動寫入 SQLite)
+# ----------------------------------------------------
 def background_stock_scanner():
     global CURRENT_INDEX, TOTAL_SCANNED, LEADERBOARD_CACHE
     if len(STOCK_NAME_MAP) < 300:
@@ -132,7 +181,6 @@ def background_stock_scanner():
     gain_5d = ((close - close_5d) / close_5d) * 100
     bias_pct = ((close - ma20) / ma20) * 100
 
-    # 滿足條件加入計分
     if (10 <= close <= 600) and (gain_5d <= 12.0) and (-8.0 <= bias_pct <= 8.0) and (hist_today > hist_yesterday):
         foreign_val = get_tw_foreign_investor(code)
         score = (foreign_val * 0.6) + ((8.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
@@ -152,15 +200,21 @@ def background_stock_scanner():
 
         with CACHE_LOCK:
             LEADERBOARD_CACHE[code] = item
-            # 隨時保留全場分數最高的 Top 5
             sorted_all = sorted(LEADERBOARD_CACHE.values(), key=lambda x: x['score'], reverse=True)
             LEADERBOARD_CACHE = {x['code']: x for x in sorted_all[:5]}
 
-# 每 30 秒觸發一次
+            # 自動發布並保存當天歷史報告
+            report = format_ai_report(list(LEADERBOARD_CACHE.values()))
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            save_history_to_db(today_str, report)
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=background_stock_scanner, trigger="interval", seconds=30)
 scheduler.start()
 
+# ----------------------------------------------------
+# 5. LINE Bot 訊息處理邏輯
+# ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
     return 'TW Stock Bot Active!'
@@ -180,7 +234,17 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    if "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
+    # 檢查是否為 8 碼日期查詢 (例如: 20260823)
+    date_match = re.search(r'^(20\d{6})$', clean_keyword)
+
+    if date_match:
+        target_date = date_match.group(1)
+        history_report = get_history_from_db(target_date)
+        if history_report:
+            reply_text = f"📜 【調閱 {target_date} 歷史 AI 選股紀錄】:\n\n" + history_report
+        else:
+            reply_text = f"⚠️ 找不到 {target_date} 的歷史紀錄，請確認日期是否正確。"
+    elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
         reply_text = get_ai_selected_stocks()
     else:
         reply_text = analyze_stock(user_input)
@@ -190,26 +254,8 @@ def handle_message(event):
         TextSendMessage(text=reply_text)
     )
 
-def get_ai_selected_stocks():
-    global TOTAL_SCANNED
-    total_stocks = len(STOCK_NAME_MAP) if len(STOCK_NAME_MAP) > 0 else 1700
-
-    with CACHE_LOCK:
-        top_stocks = list(LEADERBOARD_CACHE.values())
-
-    # 如果剛開機、掃描總數量未滿 10 檔，回報暖機進度
-    if TOTAL_SCANNED < 10 and not top_stocks:
-        pct = (TOTAL_SCANNED / 30) * 100
-        return (
-            f"⏳ 【AI 後台數據庫暖機中】\n"
-            f"-------------------\n"
-            f"• 當前進度: 已掃描 {TOTAL_SCANNED} / 30 檔基本庫 ({pct:.0f}%)\n"
-            f"• 安全機制: 30秒/檔 穩定運算中 (避免API封鎖)\n\n"
-            f"💡 請再等待約 2~3 分鐘後重新點選「AI選股」，即可取得首份完整的精選報告！"
-        )
-
+def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
-
     results = []
     for item in top_stocks[:3]:
         card = (
@@ -221,28 +267,51 @@ def get_ai_selected_stocks():
             f"   • 籌碼觀察: 🎯 外資 {item['foreign_net']} 張"
         )
         results.append(card)
+    return "\n\n".join(results)
+
+def get_ai_selected_stocks():
+    global TOTAL_SCANNED
+    with CACHE_LOCK:
+        top_stocks = list(LEADERBOARD_CACHE.values())
+
+    if TOTAL_SCANNED < 10 and not top_stocks:
+        pct = (TOTAL_SCANNED / 30) * 100
+        return (
+            f"⏳ 【AI 後台數據庫暖機中】\n"
+            f"-------------------\n"
+            f"• 當前進度: 已掃描 {TOTAL_SCANNED} / 30 檔基本庫 ({pct:.0f}%)\n"
+            f"• 安全機制: 30秒/檔 穩定運算中\n\n"
+            f"💡 請再等待約 2~3 分鐘後重新點選「AI選股」！"
+        )
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計掃描 {TOTAL_SCANNED} 檔標的)"
+    report_content = format_ai_report(top_stocks)
 
-    if not results:
-        return f"🎯 【{today_str} AI 選股報告】:\n{scanned_info}\n目前掃描區域暫無符合「低位階+MACD轉強」標的，背景持續輪播中！"
+    if not report_content:
+        return f"🎯 【{today_str} AI 選股報告】:\n{scanned_info}\n目前掃描區域暫無符合標的，背景持續輪播中！"
 
-    return f"🎯 【{today_str} AI 全台股背景掃描 Top {len(results)}】\n{scanned_info}:\n\n" + "\n\n".join(results)
+    return f"🎯 【{today_str} AI 全台股背景掃描 Top 3】\n{scanned_info}:\n\n" + report_content
 
+# ----------------------------------------------------
+# 6. 中文 / 代碼 智慧解析 (支援模糊搜尋與上市上櫃)
+# ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
         load_all_taiwan_stocks()
 
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
 
+    # 4 位數代碼
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         return clean_input, name[0] if name else clean_input
 
+    # 精確中文名稱匹配
     if clean_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[clean_input], clean_input
 
+    # 模糊中文名稱匹配 (例如輸入 "力積" 可對應到 "力積電")
     for name, code in STOCK_NAME_MAP.items():
         if clean_input in name or name in clean_input:
             return code, name
@@ -254,7 +323,7 @@ def analyze_stock(user_input):
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit() or len(stock_code) != 4:
-            return f"⚠️ 找不到「{user_input}」的台股資料。"
+            return f"⚠️ 找不到「{user_input}」的台股上市或上櫃資料。"
 
         df = get_tw_stock_data_finmind(stock_code)
         if df is None or df.empty:
