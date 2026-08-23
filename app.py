@@ -71,10 +71,11 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_input = event.message.text.strip()
-    upper_input = user_input.upper()
+    # 自動清除中間所有空白，並轉為大寫
+    clean_keyword = user_input.upper().replace(" ", "")
     
-    if upper_input in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
-        reply_text = screen_hidden_gems_fast()
+    if clean_keyword in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
+        reply_text = screen_penny_stocks_fast()
     else:
         reply_text = analyze_stock(user_input)
         
@@ -84,7 +85,7 @@ def handle_message(event):
     )
 
 def resolve_stock_symbol(user_input):
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").strip()
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
     
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
@@ -112,7 +113,7 @@ def get_tw_stock_data(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=4)
         data = res.json()
         if data.get("status") == 200 and len(data.get("data", [])) >= 26:
             df = pd.DataFrame(data["data"])
@@ -128,7 +129,7 @@ def get_tw_revenue(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=4)
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -170,7 +171,7 @@ def get_tw_foreign_investor(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=4)
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -184,20 +185,18 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
-def screen_hidden_gems_fast():
-    """多產業廣泛掃描池（涵蓋電子、半導體、AI、網通、軍工航航、金融傳產等關鍵標的）"""
-    expanded_pool = [
-        "2330", "2317", "2454", "2382", "3231", "3017", "3324", "6187", "6274", "3034",
-        "2308", "2345", "3711", "2379", "3035", "3661", "3443", "5274", "3293", "5904",
-        "4916", "2603", "2609", "2615", "2610", "2618", "2881", "2882", "2886", "2891",
-        "1513", "1514", "1519", "1605", "2376", "2301", "2356", "2449", "3702", "3037",
-        "8046", "3189", "6415", "3653", "2002", "1101", "1216", "9910", "1476", "9904"
+def screen_penny_stocks_fast():
+    """精選優質銅板股與百元股池 (股價約 15 ~ 130 元之間的高CP值標的)"""
+    penny_pool = [
+        "4916", "2610", "2618", "2002", "1605", "1514", "2356", "2376",
+        "2449", "3702", "8046", "3189", "2301", "1301", "1303", "2886",
+        "2891", "2881", "2882", "2603", "2609", "2615", "1101", "1216"
     ]
     
     selected = []
 
-    for code in expanded_pool:
-        if len(selected) >= 5:  # 精選最多 5 檔
+    for code in penny_pool:
+        if len(selected) >= 5:
             break
 
         try:
@@ -206,14 +205,19 @@ def screen_hidden_gems_fast():
                 continue
 
             close = float(df.iloc[-1]['Close'])
+            
+            # 限制價格範圍：只選 10 元 ~ 150 元的銅板股/百元股
+            if close < 10 or close > 150:
+                continue
+
             ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
             std20 = float(df.iloc[-1]['Close'].rolling(20).std().iloc[-1])
             bb_upper = ma20 + (std20 * 2)
 
             bias = ((close - ma20) / ma20) * 100
 
-            # 條件 1: 低位階未爆漲 (月線乖離 <= 4.0% 且 未突破布林上軌)
-            if close >= bb_upper or bias > 4.0:
+            # 條件 1: 未過熱 (月線乖離 <= 3.5% 且 未超過布林上軌)
+            if close >= bb_upper or bias > 3.5:
                 continue
 
             # 條件 2: 外資買超 > 0 張
@@ -232,7 +236,8 @@ def screen_hidden_gems_fast():
             
             selected.append(
                 f"🔹 {disp_name} ({code})\n"
-                f"   • 收盤: {close:.2f} (月線乖離: {bias:+.1f}%)\n"
+                f"   • 收盤價: ${close:.2f}\n"
+                f"   • 月線乖離: {bias:+.1f}%\n"
                 f"   • 外資買超: {foreign_net:,} 張\n"
                 f"   • 營收 YoY: {yoy_disp}"
             )
@@ -240,16 +245,16 @@ def screen_hidden_gems_fast():
             continue
 
     if not selected:
-        return "🔍 即時掃描完成：目前擴大追蹤池中暫無完全符合「低位階 + 外資默默吃貨 + 營收優良」標的，建議先保持觀望。"
+        return "🔍 即時掃描完成：目前銅板/百元股池中暫無完全符合「低位階 + 外資買超 + 營收優良」標的，建議保持觀望。"
 
-    return "🎯 【AI 潛力黑馬股推薦】\n(廣泛產業掃描：低位階未大漲 + 外資默默佈局 + 營收優良):\n\n" + "\n\n".join(selected)
+    return "🎯 【AI 精選銅板/百元潛力股】\n(股價 10~150元：位階低未過熱 + 外資買超 + 營收穩健):\n\n" + "\n\n".join(selected)
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 5904 寶雅、5274 信驊）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 4916 事欣科、5904 寶雅）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
