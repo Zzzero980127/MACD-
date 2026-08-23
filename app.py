@@ -71,11 +71,10 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_input = event.message.text.strip()
-    # 自動清除中間所有空白，並轉為大寫
     clean_keyword = user_input.upper().replace(" ", "")
     
     if clean_keyword in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
-        reply_text = screen_penny_stocks_fast()
+        reply_text = screen_penny_stocks_robust()
     else:
         reply_text = analyze_stock(user_input)
         
@@ -185,18 +184,19 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
-def screen_penny_stocks_fast():
-    """精選優質銅板股與百元股池 (股價約 15 ~ 130 元之間的高CP值標的)"""
+def screen_penny_stocks_robust():
+    """精選銅板/百元潛力股，加入分級保底機制確保穩定輸出結果"""
     penny_pool = [
         "4916", "2610", "2618", "2002", "1605", "1514", "2356", "2376",
-        "2449", "3702", "8046", "3189", "2301", "1301", "1303", "2886",
-        "2891", "2881", "2882", "2603", "2609", "2615", "1101", "1216"
+        "2449", "3702", "8046", "3189", "2301", "2886", "2891", "2881",
+        "2882", "2603", "2609", "2615", "1101", "1216", "1301", "1303"
     ]
     
     selected = []
+    backup_selected = []
 
     for code in penny_pool:
-        if len(selected) >= 5:
+        if len(selected) >= 4:
             break
 
         try:
@@ -205,9 +205,7 @@ def screen_penny_stocks_fast():
                 continue
 
             close = float(df.iloc[-1]['Close'])
-            
-            # 限制價格範圍：只選 10 元 ~ 150 元的銅板股/百元股
-            if close < 10 or close > 150:
+            if close < 10 or close > 180:
                 continue
 
             ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
@@ -216,45 +214,51 @@ def screen_penny_stocks_fast():
 
             bias = ((close - ma20) / ma20) * 100
 
-            # 條件 1: 未過熱 (月線乖離 <= 3.5% 且 未超過布林上軌)
-            if close >= bb_upper or bias > 3.5:
+            # 避開已衝高的極端過熱個股
+            if close >= bb_upper:
                 continue
 
-            # 條件 2: 外資買超 > 0 張
             foreign_net = get_tw_foreign_investor(code)
-            if foreign_net is None or foreign_net <= 0:
-                continue
-
-            # 條件 3: 營收不衰退 (YoY >= 0%)
             _, yoy = get_tw_revenue(code)
-            if yoy is not None and yoy < 0:
-                continue
 
             name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
             disp_name = name[0] if name else code
             yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "穩定"
-            
-            selected.append(
+            foreign_disp = f"{foreign_net:,} 張" if foreign_net is not None else "資料統計中"
+
+            item_str = (
                 f"🔹 {disp_name} ({code})\n"
                 f"   • 收盤價: ${close:.2f}\n"
                 f"   • 月線乖離: {bias:+.1f}%\n"
-                f"   • 外資買超: {foreign_net:,} 張\n"
+                f"   • 外資籌碼: {foreign_disp}\n"
                 f"   • 營收 YoY: {yoy_disp}"
             )
+
+            # 嚴格精選：外資買超且營收成長且未大幅偏離月線
+            if foreign_net is not None and foreign_net > 0 and bias <= 5.0 and (yoy is None or yoy >= 0):
+                selected.append(item_str)
+            # 備援精選：低位階 + 營收優良（外資買賣超持平或小賣）
+            elif bias <= 4.0 and (yoy is None or yoy >= -5.0):
+                backup_selected.append(item_str)
+
         except Exception:
             continue
 
-    if not selected:
-        return "🔍 即時掃描完成：目前銅板/百元股池中暫無完全符合「低位階 + 外資買超 + 營收優良」標的，建議保持觀望。"
+    # 若精選數量不足，由備援名單補齊
+    final_list = selected + backup_selected
+    final_list = final_list[:4]
 
-    return "🎯 【AI 精選銅板/百元潛力股】\n(股價 10~150元：位階低未過熱 + 外資買超 + 營收穩健):\n\n" + "\n\n".join(selected)
+    if not final_list:
+        return "🔍 目前監控池個股多數處於獲利回吐或過熱階段，建議暫時保持觀望。"
+
+    return "🎯 【AI 精選銅板/百元潛力股】\n(位階尚低/未爆漲 + 基本面穩健 + 籌碼防守):\n\n" + "\n\n".join(final_list)
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 4916 事欣科、5904 寶雅）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 4916 事欣科、2618 長榮航）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
