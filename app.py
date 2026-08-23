@@ -14,20 +14,22 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 基礎熱門字典保底
+# 本地基礎備援字典
 STOCK_NAME_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
     "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
     "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
     "事欣科": "4916", "雷虎": "8033", "雷科": "6207", "環球晶": "6488", "中美晶": "5483",
-    "長榮": "2603", "陽明": "2609", "萬海": "2615", "世芯-KY": "3661", "材料-KY": "4763"
+    "上奇": "6105", "長榮": "2603", "陽明": "2609", "萬海": "2615"
 }
 
 def update_stock_name_map():
+    """從官方 openapi 批量更新字典"""
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
+    # 1. 上市公司
     try:
         url_twse = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -38,8 +40,9 @@ def update_stock_name_map():
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TWSE Basic Fetch Error: {e}")
+        print(f"TWSE Fetch Error: {e}")
 
+    # 2. 上櫃公司
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/mops_t187ap03_O"
         res = requests.get(url_tpex, headers=headers, timeout=5)
@@ -50,9 +53,29 @@ def update_stock_name_map():
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TPEx Basic Fetch Error: {e}")
+        print(f"TPEx Fetch Error: {e}")
 
+# 服務啟動時嘗試一次全量更新
 update_stock_name_map()
+
+def fetch_code_from_finmind_realtime(stock_name):
+    """【關鍵終極解決方案】查不到時，現場用 FinMind 雲端資料庫直接搜尋股票代碼"""
+    try:
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200 and res.json().get("status") == 200:
+            stock_list = res.json().get("data", [])
+            for item in stock_list:
+                s_id = item.get("stock_id", "").strip()
+                s_name = item.get("stock_name", "").strip()
+                if stock_name in s_name or s_name in stock_name:
+                    # 現場找到立刻存入記憶體字典，下次查詢 0 秒回應
+                    STOCK_NAME_MAP[s_name] = s_id
+                    return s_id, s_name
+    except Exception as e:
+        print(f"FinMind Realtime Search Error: {e}")
+    return None, None
 
 @app.route("/", methods=['GET'])
 def index():
@@ -86,25 +109,25 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
     
+    # 1. 直接輸入數字代碼 (如 6105)
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
+    # 2. 完全匹配字典
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
+    # 3. 字典模糊比對
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
-    update_stock_name_map()
-    if user_input in STOCK_NAME_MAP:
-        return STOCK_NAME_MAP[user_input], user_input
-
-    for name, code in STOCK_NAME_MAP.items():
-        if user_input in name or name in user_input:
-            return code, name
+    # 4. 字典都沒有，啟動【線上即時強抓】機制 (如: 輸入「上奇」)
+    real_code, real_name = fetch_code_from_finmind_realtime(user_input)
+    if real_code:
+        return real_code, real_name
 
     return clean_input, clean_input
 
@@ -185,7 +208,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """進化版 AI 選股：加入布林通道防追高機制 + 真正的外資佈局篩選"""
+    """選股機制：布林過熱防追高 + 外資買超篩選"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     quotes_data = {}
@@ -232,15 +255,12 @@ def screen_undervalued_stocks():
             close = float(close_str)
             trade_volume = int(vol_str) / 1000 if vol_str.isdigit() else 0
             
-            # 選股條件：10 ~ 200 元之間，成交張數 > 1,000 張
             if 10 <= close <= 200 and trade_volume > 1000:
                 foreign_net = foreign_buy_map.get(code, 0)
                 
-                # 必須有外資買超才納入選股評分，否則直接過濾掉
                 if foreign_net <= 0:
                     continue
 
-                # 抓取技術面數據，檢查布林通道防追高
                 df, _ = get_tw_stock_data(code)
                 if df is None or len(df) < 20:
                     continue
@@ -253,13 +273,10 @@ def screen_undervalued_stocks():
                 ma20 = float(latest_row['MA20'])
                 bb_upper = float(latest_row['BB_Upper'])
 
-                # 🛑 風控防追高機制 🛑
-                # 1. 股價低於月線 -> 排除 (趨勢不對)
-                # 2. 股價大於等於布林上軌的 98% -> 排除 (過熱避開追高)
+                # 風控：低於月線或貼近布林上軌(>98%)一律排除
                 if close < ma20 or close >= (bb_upper * 0.98):
                     continue
 
-                # 安全加分算法：外資買超越多 + 距離上軌仍有空間
                 score = 70 + min(foreign_net // 50, 25)
                 name = info.get('Name', code).strip()
 
@@ -279,7 +296,6 @@ def screen_undervalued_stocks():
     if top_picks:
         return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(top_picks)
 
-    # 假日保底名單：精心挑選「拉回打底、位階安全」標的
     dynamic_fallback = [
         "🤫 事欣科 (4916) - 安全動能評分: 85分\n   • 收盤價: $36.50 (低位階打底區)\n   • 成交量: 3,250 張\n   • 籌碼觀察: 航太軍工題材，股價貼近月線支撐",
         "🤫 雷虎 (8033) - 安全動能評分: 82分\n   • 收盤價: $62.10 (未觸及布林上軌)\n   • 成交量: 5,120 張\n   • 籌碼觀察: 無人機概念，站穩月線上，籌碼沉積",
@@ -293,7 +309,7 @@ def analyze_stock(user_input):
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 6488 環球晶、2330 台積電）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 6105 上奇、2330 台積電）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
