@@ -21,7 +21,6 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
-# 全局排行榜快取 (儲存後台持續跑出來的高分股)
 LEADERBOARD_CACHE = {}
 CACHE_LOCK = Lock()
 CURRENT_CHECK_INDEX = 0
@@ -68,9 +67,16 @@ def load_all_taiwan_stocks():
 
 load_all_taiwan_stocks()
 
-def get_tw_stock_data_finmind(stock_id):
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+def get_tw_stock_data_finmind(stock_id, end_date_str=None):
+    if end_date_str:
+        end_dt = datetime.datetime.strptime(end_date_str, "%Y%m%d")
+        start_date = (end_dt - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&end_date={end_date}"
+    else:
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+
     try:
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
         if res.status_code == 200:
@@ -86,9 +92,16 @@ def get_tw_stock_data_finmind(stock_id):
     except Exception: pass
     return None
 
-def get_tw_foreign_investor(stock_id):
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+def get_tw_foreign_investor(stock_id, end_date_str=None):
+    if end_date_str:
+        end_dt = datetime.datetime.strptime(end_date_str, "%Y%m%d")
+        start_date = (end_dt - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&end_date={end_date}"
+    else:
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+
     try:
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
         if res.status_code == 200:
@@ -104,7 +117,7 @@ def get_tw_foreign_investor(stock_id):
     except Exception: pass
     return None
 
-# 🔄 背景排程任務：每隔 30 秒自動抓 20 檔，滾動式更新全台股總排行榜 Top 5
+# 背景定時全台股掃描任務
 def background_stock_scanner():
     global CURRENT_CHECK_INDEX, LEADERBOARD_CACHE
     if len(STOCK_NAME_MAP) < 300:
@@ -114,7 +127,6 @@ def background_stock_scanner():
     if not all_stocks:
         return
 
-    # 批次取 20 檔標的
     batch_size = 20
     batch = all_stocks[CURRENT_CHECK_INDEX:CURRENT_CHECK_INDEX + batch_size]
     CURRENT_CHECK_INDEX = (CURRENT_CHECK_INDEX + batch_size) % len(all_stocks)
@@ -150,7 +162,6 @@ def background_stock_scanner():
         gain_5d = ((close - close_5d) / close_5d) * 100
         bias_pct = ((close - ma20) / ma20) * 100
 
-        # AI 篩選門檻
         if (10 <= close <= 600) and (gain_5d <= 10.0) and (-8.0 <= bias_pct <= 6.0) and (hist_today > hist_yesterday):
             foreign_net = get_tw_foreign_investor(code)
             foreign_val = foreign_net if foreign_net is not None else 0
@@ -170,23 +181,20 @@ def background_stock_scanner():
                 'score': score
             })
 
-    # 將本批次的高分股併入「總排行榜」，並保留全台股分數最高的 Top 5
     with CACHE_LOCK:
         for item in batch_candidates:
             LEADERBOARD_CACHE[item['code']] = item
 
-        # 排序並裁剪，只留評分最高的 5 檔
         sorted_all = sorted(LEADERBOARD_CACHE.values(), key=lambda x: x['score'], reverse=True)
         LEADERBOARD_CACHE = {x['code']: x for x in sorted_all[:5]}
 
-# 啟動背景計時器，每 25 秒背景自動執行一次滾動掃描
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=background_stock_scanner, trigger="interval", seconds=25)
 scheduler.start()
 
 @app.route("/", methods=['GET'])
 def index():
-    return 'TW Stock Bot Active with Background Scanner!'
+    return 'TW Stock Bot Active!'
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -203,8 +211,15 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    if "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
-        reply_text = get_ai_selected_stocks()
+    # 檢查是否含有 8 位數日期 (如 20260815)
+    date_match = re.search(r'20\d{6}', clean_keyword)
+    target_date = date_match.group(0) if date_match else None
+
+    if "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword or target_date:
+        if target_date:
+            reply_text = get_historical_ai_stocks(target_date)
+        else:
+            reply_text = get_ai_selected_stocks()
     else:
         reply_text = analyze_stock(user_input)
 
@@ -213,7 +228,7 @@ def handle_message(event):
         TextSendMessage(text=reply_text)
     )
 
-# 直接從背景快取拿 Top 5（秒回且結果最準確）
+# 1. 未帶日期：秒回當前全台股掃描 Top 5
 def get_ai_selected_stocks():
     with CACHE_LOCK:
         top_stocks = list(LEADERBOARD_CACHE.values())
@@ -237,6 +252,90 @@ def get_ai_selected_stocks():
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     return f"🎯 【{today_str} 全台股背景連掃即時 Top {len(results)}】:\n\n" + "\n\n".join(results)
+
+# 2. 帶歷史日期：進行歷史時間膠囊運算
+def get_historical_ai_stocks(query_date):
+    if len(STOCK_NAME_MAP) < 300:
+        load_all_taiwan_stocks()
+
+    all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
+    if not all_stocks:
+        return "⚠️ 資料庫初始化中，請稍後再試。"
+
+    # 使用查詢日期作為亂數種子，進行抽樣運算
+    rng = random.Random(query_date)
+    shuffled_pool = list(all_stocks)
+    rng.shuffle(shuffled_pool)
+
+    candidates = []
+    for name, code in shuffled_pool[:25]:
+        if code.startswith("00") or len(code) != 4:
+            continue
+
+        df = get_tw_stock_data_finmind(code, query_date)
+        if df is None or len(df) < 20:
+            continue
+
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = exp1 - exp2
+        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['DIF'] - df['MACD']
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
+
+        close = float(latest['Close'])
+        prev_close = float(prev['Close'])
+        close_5d = float(five_days_ago['Close'])
+        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+
+        hist_today = float(latest['Hist'])
+        hist_yesterday = float(prev['Hist'])
+
+        gain_5d = ((close - close_5d) / close_5d) * 100
+        bias_pct = ((close - ma20) / ma20) * 100
+
+        if (10 <= close <= 600) and (gain_5d <= 10.0) and (-8.0 <= bias_pct <= 6.0) and (hist_today > hist_yesterday):
+            foreign_net = get_tw_foreign_investor(code, query_date)
+            foreign_val = foreign_net if foreign_net is not None else 0
+            
+            score = (foreign_val * 0.6) + ((6.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
+            macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
+            
+            candidates.append({
+                'code': code,
+                'name': name,
+                'close': close,
+                'ma20': ma20,
+                'bias_pct': bias_pct,
+                'gain_5d': gain_5d,
+                'foreign_net': foreign_val,
+                'macd_status': macd_status_text,
+                'score': score
+            })
+
+    if not candidates:
+        return f"⚠️ 基準日 [{query_date}] 盤面無符合篩選標準的標的，請更換日期嘗試。"
+
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    top_candidates = candidates[:3]
+
+    results = []
+    for item in top_candidates:
+        card = (
+            f"🤫 {item['name']} ({item['code']})\n"
+            f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
+            f"   • 漲幅控管: 🛡️ 近5日 {item['gain_5d']:+.1f}%\n"
+            f"   • 位階狀態: 🟢 低位階 (離月線 {item['bias_pct']:+.1f}%)\n"
+            f"   • 指標狀態: 📉 MACD {item['macd_status']}\n"
+            f"   • 籌碼觀察: 🎯 外資 {item['foreign_net']} 張"
+        )
+        results.append(card)
+
+    return f"📜 【{query_date} 歷史選股回測選單 Top {len(top_candidates)}】:\n\n" + "\n\n".join(results)
 
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
