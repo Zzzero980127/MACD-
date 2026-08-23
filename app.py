@@ -185,11 +185,11 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """動態掃描全台股外資買超前列 + 篩選200元以下低位階冷門黑馬"""
+    """全市場外資買超掃描 + 200元以下動態評分排序（保底輸出高分標的）"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     candidate_codes = []
     
-    # 1. 向證交所 API 抓取全市場上市外資買超前列標的
+    # 1. 抓取證交所外資買超清單
     try:
         url = "https://openapi.twse.com.tw/v1/fund/T86"
         res = requests.get(url, headers=headers, timeout=5)
@@ -200,23 +200,19 @@ def screen_undervalued_stocks():
                 if code and code.isdigit() and not code.startswith("00"):
                     candidate_codes.append(code)
     except Exception as e:
-        print(f"TWSE Foreign Scan Error: {e}")
+        print(f"TWSE Scan Error: {e}")
 
-    # 備用中小型冷門清單 (防止證交所連線異常)
     if not candidate_codes:
-        candidate_codes = ["4916", "6207", "8033", "6187", "6274", "3189", "8046", "3017", "3324", "3702", "1514", "2301", "2449"]
+        candidate_codes = ["4916", "6207", "8033", "6187", "6274", "3189", "8046", "3017", "3324", "3702", "1514", "2301"]
 
-    # 自動剔除權值股/大家熟知的熱門標的
+    # 剔除大家都熟知的權值大牌
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
     filtered_pool = [c for c in candidate_codes if c not in famous_giants]
 
-    selected_results = []
+    scored_stocks = []
 
-    # 2. 進行條件精篩
-    for code in filtered_pool[:25]:
-        if len(selected_results) >= 4:
-            break
-
+    # 2. 進行彈性加分計算
+    for code in filtered_pool[:30]:
         try:
             df, _ = get_tw_stock_data(code)
             if df is None or len(df) < 20:
@@ -224,42 +220,60 @@ def screen_undervalued_stocks():
 
             close = float(df.iloc[-1]['Close'])
             
-            # 硬性條件 1：股價 200 元以下
+            # 股價限制：200 元以下
             if close > 200 or close < 10:
                 continue
 
             ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
             bias = ((close - ma20) / ma20) * 100
 
-            # 硬性條件 2：未暴漲過熱（月線乖離介於 -5% ~ +4.5%）
-            if bias > 4.5 or bias < -5.0:
+            # 嚴重過熱噴出者排除
+            if bias > 12.0:
                 continue
+
+            score = 50  # 基礎分
+            
+            # 位階越低/剛打底者加分越高
+            if -3.0 <= bias <= 4.0:
+                score += 35
+            elif bias < -3.0:
+                score += 20
+            else:
+                score += 10
 
             foreign_net = get_tw_foreign_investor(code)
-            # 硬性條件 3：外資實質買超
-            if foreign_net is None or foreign_net <= 0:
-                continue
+            if foreign_net is not None and foreign_net > 0:
+                score += 20
 
             _, yoy = get_tw_revenue(code)
+            if yoy is not None and yoy > 0:
+                score += 15
 
             name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
             disp_name = name[0] if name else code
             yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "穩定"
+            foreign_disp = f"{foreign_net:,} 張" if foreign_net is not None and foreign_net > 0 else "持平/微幅"
 
-            selected_results.append(
-                f"🤫 {disp_name} ({code}) - 外資暗自卡位\n"
-                f"   • 收盤價: ${close:.2f} (200元以下中小型股)\n"
-                f"   • 月線乖離: {bias:+.1f}% (打底/未暴漲過熱)\n"
-                f"   • 外資買超: {foreign_net:,} 張\n"
+            item_text = (
+                f"🤫 {disp_name} ({code}) - 綜合評分: {score}分\n"
+                f"   • 收盤價: ${close:.2f} (200元以下)\n"
+                f"   • 月線乖離: {bias:+.1f}%\n"
+                f"   • 外資籌碼: {foreign_disp}\n"
                 f"   • 營收 YoY: {yoy_disp}"
             )
+            
+            scored_stocks.append((score, item_text))
         except Exception:
             continue
 
-    if not selected_results:
-        return "🔍 今日全市場掃描：外資買超前列標的多數已大幅拉高噴出，目前暫無符合「低位階 + 200元以下 + 外資偷買」之隱形黑馬，建議保持觀望。"
+    # 按分數由高到低排序，選出最高分的前 4 檔
+    scored_stocks.sort(key=lambda x: x[0], reverse=True)
+    top_picks = [item[1] for item in scored_stocks[:4]]
 
-    return "🎯 【AI 全市場冷門黑馬掃描】\n(自動過濾熱門權值股，鎖定外資悄悄卡位 + 股價<200元未爆漲個股):\n\n" + "\n\n".join(selected_results)
+    if not top_picks:
+        return "⚠️ 今日全市場連線數據較為壅塞，請稍後再試。"
+
+    return "🎯 【AI 全市場冷門黑馬掃描】\n(已自動剔除權值股，取外資卡位 + 200元以下綜合評分最高者):\n\n" + "\n\n".join(top_picks)
 
 def analyze_stock(user_input):
     try:
