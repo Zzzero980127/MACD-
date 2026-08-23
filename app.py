@@ -14,44 +14,43 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-BACKUP_STOCK_MAP = {
-    "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
-    "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
-    "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
-    "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
-    "事欣科": "4916", "雷虎": "8033", "雷科": "6207"
-}
-
-STOCK_NAME_MAP = dict(BACKUP_STOCK_MAP)
+# 全台股名稱與代碼動態對照字典
+STOCK_NAME_MAP = {}
 
 def update_stock_name_map():
+    """自動從證交所(TWSE)與櫃買中心(TPEx)抓取全台股(上市+上櫃)股票代碼與名稱對照表"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
+    # 1. 抓取上市股票清單
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200:
             for item in res.json():
-                s_id = item.get("Code")
-                s_name = item.get("Name")
+                s_id = item.get("Code", "").strip()
+                s_name = item.get("Name", "").strip()
                 if s_id and s_name:
-                    STOCK_NAME_MAP[s_name.strip()] = s_id.strip()
+                    STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
         print(f"TWSE Fetch Error: {e}")
 
+    # 2. 抓取上櫃股票清單
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
         if res.status_code == 200:
             for item in res.json():
-                s_id = item.get("SecuritiesCompanyCode")
-                s_name = item.get("CompanyName")
+                s_id = item.get("SecuritiesCompanyCode", "").strip()
+                s_name = item.get("CompanyName", "").strip()
                 if s_id and s_name:
-                    STOCK_NAME_MAP[s_name.strip()] = s_id.strip()
+                    STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
         print(f"TPEx Fetch Error: {e}")
 
+    print(f"✅ 全台股字典載入完成！共包含 {len(STOCK_NAME_MAP)} 檔股票。")
+
+# 服務啟動時自動載入全台股清單
 update_stock_name_map()
 
 @app.route("/", methods=['GET'])
@@ -84,26 +83,31 @@ def handle_message(event):
     )
 
 def resolve_stock_symbol(user_input):
+    """支援：代碼 (2330)、完整名稱 (台積電)、模糊關鍵字 (台積) 自動比對"""
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
     
+    # 1. 輸入為數字代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
+    # 2. 完全匹配股票名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
+    # 3. 模糊搜尋 (如輸入 "台積" 自動對應 "台積電")
     for name, code in STOCK_NAME_MAP.items():
-        if user_input in name or name in user_input:
+        if user_input in name:
             return code, name
 
+    # 4. 若全字典查無資料，自動對外更新一次網路清單再試
     update_stock_name_map()
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
     for name, code in STOCK_NAME_MAP.items():
-        if user_input in name or name in user_input:
+        if user_input in name:
             return code, name
 
     return clean_input, clean_input
@@ -264,7 +268,7 @@ def analyze_stock(user_input):
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 8033 雷虎、4916 事欣科）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 2330 或 雷虎）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
