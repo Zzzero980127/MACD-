@@ -17,11 +17,10 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 常備對照表
 STOCK_NAME_MAP = {}
 
 def load_all_taiwan_stocks():
-    """直連 TWSE 與 TPEx 官方 OpenAPI 建立全台股對照表"""
+    """抓取上市 (TWSE) 與上櫃 (TPEx) 官方清單"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -180,21 +179,25 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """【真・全市場動態掃描】徹底刪除固定備援清單，採用隨機抽樣確保每日/每次結果完全不同"""
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    quotes_data = []
+    """【當日固定精選 Top 5】使用日期作為隨機種子，當天點擊 100 次結果都完全一致"""
+    if len(STOCK_NAME_MAP) < 1000:
+        load_all_taiwan_stocks()
 
-    # 1. 取得當前記憶體中的全台股代碼，並進行隨機洗牌 (Shuffle)
-    all_codes = list(STOCK_NAME_MAP.items())
-    random.shuffle(all_codes)
+    all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
+    if not all_stocks:
+        return "⚠️ 目前連線忙碌中，請於 10 秒後重新輸入「AI選股」。"
 
-    # 限制每次取 150 檔進行即時精密運算（避免 Line 機器人回應逾時）
-    sample_pool = all_codes[:150]
+    # 使用「今天日期」設定隨機種子，確保「當天順序固定，隔天自動更新」
+    today_str = datetime.datetime.now().strftime("%Y%m%d")
+    rng = random.Random(today_str)
+    
+    # 複製並打亂清單（當天打亂結果是固定的）
+    shuffled_pool = list(all_stocks)
+    rng.shuffle(shuffled_pool)
 
-    tier1_candidates = []
+    candidates = []
 
-    for name, code in sample_pool:
-        # 過濾掉 ETF (00開頭)
+    for name, code in shuffled_pool[:180]:
         if code.startswith("00") or len(code) != 4:
             continue
 
@@ -202,7 +205,6 @@ def screen_undervalued_stocks():
         if df is None or len(df) < 25:
             continue
 
-        # 計算均線、布林通道與 MACD
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
@@ -226,55 +228,39 @@ def screen_undervalued_stocks():
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
 
-        # --- 真・低位階防追高門檻 ---
-        # 1. 股價落在 15 ~ 200 元之間（過濾垃圾股與超高價股）
-        if not (15 <= close <= 200):
-            continue
-
-        # 2. 5日內累積漲幅 <= 3.0%（嚴禁噴出爆漲股票）
         gain_5d = ((close - close_5d) / close_5d) * 100
-        if gain_5d > 3.0:
-            continue
-
-        # 3. 當天漲幅 <= 1.5%（不追當天拉長紅）
         gain_1d = ((close - prev_close) / prev_close) * 100
-        if gain_1d > 1.5:
-            continue
-
-        # 4. 離月線乖離率在 -4.0% ~ +1.5%（底部位階）
         bias_pct = ((close - ma20) / ma20) * 100
-        if not (-4.0 <= bias_pct <= 1.5):
-            continue
 
-        # 5. 離布林上軌相當遠（低於上軌 90% 價格）
-        if close > bb_upper * 0.90:
-            continue
+        # 防追高技術面嚴格門檻
+        if (15 <= close <= 200) and (gain_5d <= 3.0) and (gain_1d <= 1.5) and (-4.0 <= bias_pct <= 1.5) and (close <= bb_upper * 0.90) and (hist_today > hist_yesterday):
+            foreign_net = get_tw_foreign_investor(code)
+            if foreign_net is not None and foreign_net > 0:
+                # 計算客觀綜合分數 (外資買超權重 + 股價位階低度)
+                score = (foreign_net * 0.6) + ((1.5 - bias_pct) * 20) + ((hist_today - hist_yesterday) * 50)
+                macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
+                
+                candidates.append({
+                    'code': code,
+                    'name': name,
+                    'close': close,
+                    'ma20': ma20,
+                    'bias_pct': bias_pct,
+                    'gain_5d': gain_5d,
+                    'foreign_net': foreign_net,
+                    'macd_status': macd_status_text,
+                    'score': score
+                })
 
-        # 6. MACD 柱狀體升高（綠柱縮短或紅柱生成，空方衰退）
-        if hist_today <= hist_yesterday:
-            continue
+    if not candidates:
+        return "⚠️ 當前盤面暫無符合「低位階+未暴漲+外資買超」的固定標的。"
 
-        # 7. 外資籌碼買超 (> 0 張)
-        foreign_net = get_tw_foreign_investor(code)
-        if foreign_net is not None and foreign_net > 0:
-            macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱初生/微擴張"
-
-            tier1_candidates.append({
-                'code': code,
-                'name': name,
-                'close': close,
-                'ma20': ma20,
-                'bias_pct': bias_pct,
-                'gain_5d': gain_5d,
-                'foreign_net': foreign_net,
-                'macd_status': macd_status_text
-            })
-
-        if len(tier1_candidates) >= 5:
-            break
+    # 依照綜合評分排序，挑選當天分數最高的 Top 5
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    top_5 = candidates[:5]
 
     results = []
-    for item in tier1_candidates:
+    for item in top_5:
         card = (
             f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
@@ -285,10 +271,7 @@ def screen_undervalued_stocks():
         )
         results.append(card)
 
-    if results:
-        return "🎯 【全市場隨機精選：未爆發低位股 + MACD空方衰退 + 外資買超 Top 5】:\n\n" + "\n\n".join(results)
-
-    return "⚠️ 隨機抽樣池中暫未符合條件標的，請再輸入一次「AI選股」進行重新掃描。"
+    return f"🎯 【{today_str} 當日固定精選 Top {len(top_5)}】:\n\n" + "\n\n".join(results)
 
 def analyze_stock(user_input):
     try:
