@@ -1,6 +1,6 @@
-Flask==3.0.0
-line-bot-sdk==3.5.0
-requests==2.31.0
-pandas==2.1.4
-yfinance==0.2.36
-gunicorn==21.2.0
+Flask
+line-bot-sdk
+requests
+pandas
+yfinance
+gunicorn
