@@ -5,7 +5,6 @@ import pandas as pd
 import datetime
 import re
 import json
-import time
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -136,7 +135,7 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 數據抓取
+# 3. FinMind 數據抓取 (超強容錯保護)
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
@@ -185,7 +184,11 @@ def get_tw_stock_revenue(stock_id):
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
                 df = pd.DataFrame(data["data"])
-                rev_col = 'revenue' if 'revenue' in df.columns else ('revenue_month' if 'revenue_month' in df.columns else None)
+                rev_col = None
+                for col in ['revenue', 'revenue_month', 'revenue_year']:
+                    if col in df.columns:
+                        rev_col = col
+                        break
                 if rev_col and len(df) >= 13:
                     df[rev_col] = pd.to_numeric(df[rev_col], errors='coerce')
                     df = df.dropna(subset=[rev_col])
@@ -203,20 +206,14 @@ def get_tw_stock_revenue(stock_id):
                     yoy_val = ((rev_latest - rev_ly) / rev_ly * 100) if rev_ly > 0 else 0.0
                     mom_val = ((rev_latest - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0.0
 
-                    if yoy_val > 15:
-                        eval_text = "🟢 強勁成長"
-                    elif yoy_val > 0:
-                        eval_text = "🟢 穩健成長"
-                    else:
-                        eval_text = "🔴 營收衰退"
-
+                    eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
                     return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
     except Exception:
         pass
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 掃描執行邏輯
+# 4. 掃描邏輯
 # ----------------------------------------------------
 def scan_one_stock():
     try:
@@ -287,7 +284,7 @@ def scan_one_stock():
         return f"Err: {str(e)}"
 
 # ----------------------------------------------------
-# 5. LINE Bot & Web Routes
+# 5. LINE Bot Routes (包含萬用全局 Exception 捕捉)
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
@@ -304,33 +301,36 @@ def callback():
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+    except Exception as e:
+        print(f"Webhook Callback Error: {e}")
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_input = event.message.text.strip()
-    clean_keyword = user_input.upper().replace(" ", "")
+    try:
+        user_input = event.message.text.strip()
+        clean_keyword = user_input.upper().replace(" ", "")
 
-    date_match = re.search(r'^(\20\d{6})$', clean_keyword)
+        date_match = re.search(r'^(\20\d{6})$', clean_keyword)
 
-    if date_match:
-        target_date = date_match.group(1)
-        history_report = get_history_from_db(target_date)
-        if history_report:
-            reply_text = f"📜【查閱 ({target_date}) 歷史 AI 選股紀錄】:\n\n" + history_report
+        if date_match:
+            target_date = date_match.group(1)
+            history_report = get_history_from_db(target_date)
+            if history_report:
+                reply_text = f"📜【查閱 ({target_date}) 歷史 AI 選股紀錄】:\n\n" + history_report
+            else:
+                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260823"
+        elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
+            reply_text = get_ai_selected_stocks()
         else:
-            reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260823"
-    elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
-        reply_text = get_ai_selected_stocks()
-    else:
-        reply_text = analyze_stock(user_input)
+            reply_text = analyze_stock(user_input)
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+    except Exception as e:
+        print(f"Handle Message Error: {e}")
 
 def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
@@ -352,7 +352,7 @@ def get_ai_selected_stocks():
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 10 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 2~3 分鐘後重新點選！"
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 档標的\n💡 請再等待約 2~3 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
