@@ -198,12 +198,13 @@ def screen_undervalued_stocks():
                 })
         except: continue
 
+    # 擴大掃描前 80 檔成交量大的非科技股
     candidates.sort(key=lambda x: x['volume'], reverse=True)
-    # 縮小掃描範圍至 20 檔以利於快速回應，避免 LINE 逾時
-    top_targets = candidates[:20]
+    top_targets = candidates[:80]
 
-    valid_candidates = []
-    
+    tier1_candidates = [] # 精確符合：MACD轉折 + 外資買超
+    tier2_candidates = [] # 備額補充：外資大買 + 站穩月線未過熱
+
     for item in top_targets:
         code = item['code']
         df, _ = get_tw_stock_data(code)
@@ -232,42 +233,51 @@ def screen_undervalued_stocks():
 
         foreign_net = get_tw_foreign_investor(code)
 
-        # 外資必須買超 > 0
-        is_foreign_buy = (foreign_net is not None and foreign_net > 0)
-        
-        # MACD 綠柱縮短 或 紅柱剛發動
-        is_macd_rebound = (hist_today < 0 and abs(hist_today) <= abs(hist_yesterday)) or \
-                          (hist_today > 0 and hist_today >= hist_yesterday)
+        # 基礎過濾：外資一定要買超 > 0 且 未爆噴過熱
+        if foreign_net is not None and foreign_net > 0 and close < (bb_upper * 0.98):
+            is_macd_rebound = (hist_today < 0 and abs(hist_today) <= abs(hist_yesterday)) or \
+                              (hist_today > 0 and hist_today >= hist_yesterday)
 
-        if is_foreign_buy and is_macd_rebound and close < (bb_upper * 0.98):
-            macd_status = "📉 綠柱收斂 (空方減弱)" if hist_today < 0 else "🔥 紅柱擴大 (多頭發動)"
-            valid_candidates.append({
+            obj = {
                 'code': code,
                 'name': item['name'],
                 'industry': item['industry'],
                 'close': close,
                 'ma20': ma20,
                 'foreign_net': foreign_net,
-                'macd_status': macd_status
-            })
+                'macd_status': "📉 綠柱收斂 (空方減弱)" if hist_today < 0 else "🔥 紅柱擴大 (多頭發動)"
+            }
 
-    valid_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
-    final_top5 = valid_candidates[:5]
+            if is_macd_rebound:
+                tier1_candidates.append(obj)
+            elif close >= ma20:
+                obj['macd_status'] = "🟢 站穩月線 (打底築底)"
+                tier2_candidates.append(obj)
+
+    # 排序：外資買超張數最多
+    tier1_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
+    tier2_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
+
+    # 合併前 5 名
+    final_top5 = tier1_candidates[:5]
+    if len(final_top5) < 5:
+        needed = 5 - len(final_top5)
+        final_top5.extend(tier2_candidates[:needed])
 
     results = []
     for item in final_top5:
         card = (
             f"🤫 {item['name']} ({item['code']}) - [{item['industry']}]\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
-            f"   • MACD訊號: {item['macd_status']}\n"
+            f"   • MACD/狀態: {item['macd_status']}\n"
             f"   • 籌碼動態: 🔥 外資買超 {item['foreign_net']:,} 張"
         )
         results.append(card)
 
     if results:
-        return "🎯 【AI 盤後轉折/外資加碼/非科技 Top 5】\n(MACD 空方衰退 + 外資轉買卡位):\n\n" + "\n\n".join(results)
+        return f"🎯 【AI 盤後低位階/外資加碼/非科技 Top 5】\n(精選 MACD轉折 + 外資買超強勢股):\n\n" + "\n\n".join(results)
     
-    return "⚠️ 今日無符合「MACD空方衰退/轉折 + 外資買超」之非科技標的，建議觀望。"
+    return "⚠️ 今日無符合「外資買超+安全打底」之非科技標的，建議觀望。"
 
 def analyze_stock(user_input):
     try:
