@@ -25,7 +25,7 @@ STOCK_NAME_MAP = {
 }
 
 def load_all_taiwan_stocks():
-    """啟動時自動讀取 FinMind 與 TWSE 全台股清單，載入全市場股票代碼"""
+    """啟動時自動讀取 FinMind 與 TWSE 全台股清單，全量載入記憶體"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -118,7 +118,7 @@ def get_tw_stock_data(stock_id):
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """營收計算邏輯：過濾無效與空值資料，防止 API 欄位缺失導致轉型除以零錯誤"""
+    """營收計算邏輯：清洗數據，自動過濾小於等於0的異常值，防護 Division by Zero 崩潰"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -127,7 +127,6 @@ def get_tw_revenue(stock_id):
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
             
-            # 清洗資料：強制轉為數值，過濾掉小於等於 0 的無效數據
             df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
             valid_df = df[df['revenue'] > 0].copy()
             
@@ -185,7 +184,8 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    """全動態選股：徹底刪除寫死名單，兩階段高速掃描，防封鎖且無破位股"""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
     quotes_data = {}
     try:
@@ -213,12 +213,12 @@ def screen_undervalued_stocks():
         print(f"Foreign Buy Fetch Error: {e}")
 
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
-    candidates = []
-
+    
+    # 第一階段：全市場快速過濾
+    pre_candidates = []
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00") or code in famous_giants:
             continue
-
         try:
             close_str = str(info.get('ClosingPrice', '0')).replace(',', '')
             vol_str = str(info.get('TradeVolume', '0')).replace(',', '')
@@ -227,80 +227,61 @@ def screen_undervalued_stocks():
 
             close = float(close_str)
             trade_volume = int(vol_str) / 1000 if vol_str.isdigit() else 0
-            
-            if 10 <= close <= 200 and trade_volume > 1000:
-                foreign_net = foreign_buy_map.get(code, 0)
-                if foreign_net <= 0:
-                    continue
+            foreign_net = foreign_buy_map.get(code, 0)
 
-                df, _ = get_tw_stock_data(code)
-                if df is None or len(df) < 60:
-                    continue
-
-                df['MA20'] = df['Close'].rolling(window=20).mean()
-                df['MA60'] = df['Close'].rolling(window=60).mean()
-                df['STD20'] = df['Close'].rolling(window=20).std()
-                df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
-
-                latest_row = df.iloc[-1]
-                ma20 = float(latest_row['MA20'])
-                ma60 = float(latest_row['MA60'])
-                bb_upper = float(latest_row['BB_Upper'])
-
-                # 風控邏輯：跌破月線/季線，或觸及布林過熱區一律排除
-                if close < ma20 or close < ma60 or close >= (bb_upper * 0.98):
-                    continue
-
-                score = 75 + min(foreign_net // 50, 20)
-                name = info.get('Name', code).strip()
-
-                item_text = (
-                    f"🤫 {name} ({code}) - 安全動能評分: {int(score)}分\n"
-                    f"   • 收盤價: ${close:.2f} (站穩月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
-                    f"   • 成交量: {int(trade_volume):,} 張\n"
-                    f"   • 籌碼觀察: 外資卡位買超 {foreign_net:,} 張"
-                )
-                candidates.append((score, item_text))
+            if 10 <= close <= 200 and trade_volume >= 1000 and foreign_net > 0:
+                pre_candidates.append({
+                    'code': code,
+                    'name': info.get('Name', code).strip(),
+                    'close': close,
+                    'volume': trade_volume,
+                    'foreign_net': foreign_net
+                })
         except:
             continue
 
+    pre_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
+    top_15 = pre_candidates[:15]
+
+    candidates = []
+    # 第二階段：對熱門前 15 檔執行技術指標驗證（月線/季線/布林）
+    for item in top_15:
+        code = item['code']
+        df, _ = get_tw_stock_data(code)
+        if df is None or len(df) < 60:
+            continue
+
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA60'] = df['Close'].rolling(window=60).mean()
+        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+
+        latest_row = df.iloc[-1]
+        close = item['close']
+        ma20 = float(latest_row['MA20'])
+        ma60 = float(latest_row['MA60'])
+        bb_upper = float(latest_row['BB_Upper'])
+
+        # 風控：跌破月線/季線 或 觸及布林過熱區一律排除
+        if close < ma20 or close < ma60 or close >= (bb_upper * 0.98):
+            continue
+
+        score = 75 + min(item['foreign_net'] // 50, 20)
+        card_text = (
+            f"🤫 {item['name']} ({code}) - 安全動能評分: {int(score)}分\n"
+            f"   • 收盤價: ${close:.2f} (站穩月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
+            f"   • 成交量: {int(item['volume']):,} 張\n"
+            f"   • 籌碼觀察: 外資卡位買超 {item['foreign_net']:,} 張"
+        )
+        candidates.append((score, card_text))
+
     candidates.sort(key=lambda x: x[0], reverse=True)
-    top_picks = [item[1] for item in candidates[:4]]
+    top_picks = [c[1] for c in candidates[:4]]
 
     if top_picks:
-        return "🎯 【AI 全市場黑馬即時掃描】\n(已過濾破位股與過熱區，精選站穩雙均線+外資買超標的):\n\n" + "\n\n".join(top_picks)
+        return "🎯 【AI 全市場黑馬即時掃描】\n(100% 當日動態計算，已排除破位與過熱標的):\n\n" + "\n\n".join(top_picks)
 
-    watchlist = [("6274", "台燿"), ("6187", "萬潤"), ("8033", "雷虎"), ("3441", "聯一光")]
-    dynamic_realtime_picks = []
-
-    for code, default_name in watchlist:
-        df, _ = get_tw_stock_data(code)
-        if df is not None and len(df) >= 60:
-            latest = df.iloc[-1]
-            real_close = float(latest['Close'])
-            real_vol = int(float(latest['Volume']) / 1000)
-            
-            df['MA20'] = df['Close'].rolling(window=20).mean()
-            df['MA60'] = df['Close'].rolling(window=60).mean()
-            ma20 = float(df.iloc[-1]['MA20'])
-            ma60 = float(df.iloc[-1]['MA60'])
-
-            if real_close < ma20 or real_close < ma60:
-                status_note = "⚠️ 跌破均線偏弱，建議觀望"
-            else:
-                status_note = "🟢 站穩均線，多頭結構完整"
-
-            dynamic_realtime_picks.append(
-                f"🤫 {default_name} ({code})\n"
-                f"   • 最新收盤價: ${real_close:.2f}\n"
-                f"   • 最新成交量: {real_vol:,} 張\n"
-                f"   • 技術狀態: {status_note}"
-            )
-
-    if dynamic_realtime_picks:
-        return "🎯 【AI 精選觀察清單】\n(備援模式 - 包含最新均線防禦狀態):\n\n" + "\n\n".join(dynamic_realtime_picks)
-
-    return "⚠️ 目前 API 維護中，請稍後再次嘗試。"
+    return "⚠️ 盤後全市場掃描完成：今日暫無符合「站穩雙均線 + 外資加碼 + 未過熱」的安全標的，建議多看少做。"
 
 def analyze_stock(user_input):
     try:
@@ -370,7 +351,7 @@ def analyze_stock(user_input):
 
         if foreign_net is not None:
             if foreign_net > 0:
-                foreign_text = f"買超 {foreign_net:,} 張"
+                foreign_text = f"買超 {foreign_text:,} 張" if 'foreign_text' in locals() else f"買超 {foreign_net:,} 張"
             elif foreign_net < 0:
                 foreign_text = f"賣超 {abs(foreign_net):,} 張"
             else:
