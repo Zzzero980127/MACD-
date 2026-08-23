@@ -405,7 +405,7 @@ def analyze_stock(user_input):
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['STD20'] = df['Close'].rolling(window=20).std(ddof=0)
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
         latest = df.iloc[-1]
