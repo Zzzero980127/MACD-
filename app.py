@@ -18,7 +18,8 @@ BACKUP_STOCK_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
     "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
-    "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443"
+    "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
+    "事欣科": "4916"
 }
 
 STOCK_NAME_MAP = dict(BACKUP_STOCK_MAP)
@@ -73,7 +74,7 @@ def handle_message(event):
     upper_input = user_input.upper()
     
     if upper_input in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
-        reply_text = screen_hidden_gems_all_market()
+        reply_text = screen_hidden_gems_fast()
     else:
         reply_text = analyze_stock(user_input)
         
@@ -111,7 +112,7 @@ def get_tw_stock_data(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, timeout=5)
         data = res.json()
         if data.get("status") == 200 and len(data.get("data", [])) >= 26:
             df = pd.DataFrame(data["data"])
@@ -127,7 +128,7 @@ def get_tw_revenue(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, timeout=5)
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -169,7 +170,7 @@ def get_tw_foreign_investor(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, timeout=5)
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
@@ -183,50 +184,20 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
-def fetch_active_stocks_from_market():
-    """動態取得全台股當日成交量 > 1000張 的股票清單"""
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    candidates = []
+def screen_hidden_gems_fast():
+    """多產業廣泛掃描池（涵蓋電子、半導體、AI、網通、軍工航航、金融傳產等關鍵標的）"""
+    expanded_pool = [
+        "2330", "2317", "2454", "2382", "3231", "3017", "3324", "6187", "6274", "3034",
+        "2308", "2345", "3711", "2379", "3035", "3661", "3443", "5274", "3293", "5904",
+        "4916", "2603", "2609", "2615", "2610", "2618", "2881", "2882", "2886", "2891",
+        "1513", "1514", "1519", "1605", "2376", "2301", "2356", "2449", "3702", "3037",
+        "8046", "3189", "6415", "3653", "2002", "1101", "1216", "9910", "1476", "9904"
+    ]
     
-    # 1. 抓取上市市場全標的
-    try:
-        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=8)
-        if res.status_code == 200:
-            for item in res.json():
-                code = item.get("Code", "").strip()
-                vol = float(item.get("TradeVolume", 0) or 0)
-                if len(code) == 4 and code.isdigit() and vol >= 1000000:  # 成交張數 >= 1000張
-                    candidates.append(code)
-    except Exception as e:
-        print(f"TWSE Active Fetch Error: {e}")
-
-    # 2. 抓取上櫃市場全標的
-    try:
-        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-        res = requests.get(url_tpex, headers=headers, timeout=8)
-        if res.status_code == 200:
-            for item in res.json():
-                code = item.get("SecuritiesCompanyCode", "").strip()
-                vol = float(item.get("TradingShares", 0) or 0)
-                if len(code) == 4 and code.isdigit() and vol >= 1000000:
-                    candidates.append(code)
-    except Exception as e:
-        print(f"TPEx Active Fetch Error: {e}")
-
-    return candidates
-
-def screen_hidden_gems_all_market():
-    """全市場掃描：外資默默買 + 低位階未爆漲 + 營收優良"""
-    candidates = fetch_active_stocks_from_market()
-    
-    if not candidates:
-        return "⚠️ 全市場數據掃描失敗，請稍後再試。"
-
     selected = []
 
-    for code in candidates:
-        if len(selected) >= 5:  # 精選回傳最符合條件的前 5 檔
+    for code in expanded_pool:
+        if len(selected) >= 5:  # 精選最多 5 檔
             break
 
         try:
@@ -241,23 +212,23 @@ def screen_hidden_gems_all_market():
 
             bias = ((close - ma20) / ma20) * 100
 
-            # 條件 1: 低位階未爆漲 (月線乖離 <= 3.0% 且 未觸及布林上軌)
-            if close >= bb_upper or bias > 3.0 or bias < -2.0:
+            # 條件 1: 低位階未爆漲 (月線乖離 <= 4.0% 且 未突破布林上軌)
+            if close >= bb_upper or bias > 4.0:
                 continue
 
-            # 條件 2: 外資買超 > 50 張
+            # 條件 2: 外資買超 > 0 張
             foreign_net = get_tw_foreign_investor(code)
-            if foreign_net is None or foreign_net < 50:
+            if foreign_net is None or foreign_net <= 0:
                 continue
 
-            # 條件 3: 營收年增 YoY >= 0%
+            # 條件 3: 營收不衰退 (YoY >= 0%)
             _, yoy = get_tw_revenue(code)
             if yoy is not None and yoy < 0:
                 continue
 
             name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
             disp_name = name[0] if name else code
-            yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "平穩"
+            yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "穩定"
             
             selected.append(
                 f"🔹 {disp_name} ({code})\n"
@@ -269,9 +240,9 @@ def screen_hidden_gems_all_market():
             continue
 
     if not selected:
-        return "🔍 全市場即時掃描完成：目前無完全符合「低位階 + 外資進駐 + 營收佳」的隱藏潛力股，建議觀望等待籌碼沉澱。"
+        return "🔍 即時掃描完成：目前擴大追蹤池中暫無完全符合「低位階 + 外資默默吃貨 + 營收優良」標的，建議先保持觀望。"
 
-    return "🎯 【全市場 AI 潛力黑馬股】\n(全台股動態掃描：低位階未大漲 + 外資默默吃貨 + 營收優良):\n\n" + "\n\n".join(selected)
+    return "🎯 【AI 潛力黑馬股推薦】\n(廣泛產業掃描：低位階未大漲 + 外資默默佈局 + 營收優良):\n\n" + "\n\n".join(selected)
 
 def analyze_stock(user_input):
     try:
