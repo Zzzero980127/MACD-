@@ -4,7 +4,6 @@ import requests
 import pandas as pd
 import datetime
 import re
-import yfinance as yf
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -23,8 +22,9 @@ STOCK_NAME_MAP = {}
 
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
 
+    # 上市股票清單
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -36,6 +36,7 @@ def load_all_taiwan_stocks():
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception: pass
 
+    # 上櫃股票清單
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res_tpex = requests.get(url_tpex, headers=headers, timeout=5)
@@ -68,7 +69,6 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    # 解析日期指令（例：20260820、選股 20260820、AI選股）
     date_match = re.search(r'20\d{6}', clean_keyword)
     target_date = date_match.group(0) if date_match else None
 
@@ -111,30 +111,23 @@ def resolve_stock_symbol(user_input):
 
     return clean_input, clean_input
 
-def get_tw_stock_data(stock_id):
-    if not stock_id.isdigit() or len(stock_id) != 4:
-        return None, stock_id
-
-    # 防封鎖 Session 設定
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-
-    for suffix in [".TW", ".TWO"]:
-        try:
-            ticker = f"{stock_id}{suffix}"
-            yf_obj = yf.Ticker(ticker, session=session)
-            df = yf_obj.history(period="3m")
-            if not df.empty and len(df) >= 15:
-                df = df.reset_index()
-                df = df.rename(columns={'Close': 'Close', 'Volume': 'Volume'})
-                df['Close'] = df['Close'].astype(float)
-                df['Volume'] = df['Volume'].astype(float)
-                return df, ticker
-        except Exception: continue
-
-    return None, stock_id
+def get_tw_stock_data_finmind(stock_id):
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+    try:
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == 200 and data.get("data"):
+                df = pd.DataFrame(data["data"])
+                df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+                df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+                df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+                df = df.dropna(subset=['Close'])
+                if len(df) >= 20:
+                    return df
+    except Exception: pass
+    return None
 
 def get_tw_revenue(stock_id):
     start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
@@ -167,9 +160,9 @@ def get_tw_revenue(stock_id):
                     yoy_str = f"{yoy:+.2f}%" if yoy is not None else "計算中"
 
                     status = "🟢 穩健成長" if (yoy and yoy > 0) else "🟡 整理/調整中"
-                    return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}", yoy
+                    return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}"
     except Exception: pass
-    return "數據更新中", None
+    return "數據更新中"
 
 def get_tw_foreign_investor(stock_id):
     start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
@@ -205,11 +198,11 @@ def screen_undervalued_stocks(query_date=None):
 
     candidates = []
 
-    for name, code in shuffled_pool[:180]:
+    for name, code in shuffled_pool[:120]:
         if code.startswith("00") or len(code) != 4:
             continue
 
-        df, _ = get_tw_stock_data(code)
+        df = get_tw_stock_data_finmind(code)
         if df is None or len(df) < 20:
             continue
 
@@ -231,7 +224,6 @@ def screen_undervalued_stocks(query_date=None):
         prev_close = float(prev['Close'])
         close_5d = float(five_days_ago['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
-        bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
 
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
@@ -240,7 +232,6 @@ def screen_undervalued_stocks(query_date=None):
         gain_1d = ((close - prev_close) / prev_close) * 100
         bias_pct = ((close - ma20) / ma20) * 100
 
-        # 微調篩選門檻，確保資料更容易被採納
         if (10 <= close <= 300) and (gain_5d <= 5.0) and (gain_1d <= 3.0) and (-6.0 <= bias_pct <= 3.0) and (hist_today > hist_yesterday):
             foreign_net = get_tw_foreign_investor(code)
             foreign_val = foreign_net if foreign_net is not None else 0
@@ -264,10 +255,10 @@ def screen_undervalued_stocks(query_date=None):
         return f"⚠️ 基準日 [{date_seed}] 盤面暫無符合條件的固定標的。"
 
     candidates.sort(key=lambda x: x['score'], reverse=True)
-    top_5 = candidates[:5]
+    top_candidates = candidates[:5]
 
     results = []
-    for item in top_5:
+    for item in top_candidates:
         card = (
             f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
@@ -278,7 +269,7 @@ def screen_undervalued_stocks(query_date=None):
         )
         results.append(card)
 
-    return f"🎯 【{date_seed} 精選固定 Top {len(top_5)}】:\n\n" + "\n\n".join(results)
+    return f"🎯 【{date_seed} 精選固定 Top {len(top_candidates)}】:\n\n" + "\n\n".join(results)
 
 def analyze_stock(user_input):
     try:
@@ -287,13 +278,13 @@ def analyze_stock(user_input):
         if not stock_code.isdigit() or len(stock_code) != 4:
             return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入 4 位數代碼查詢（例如：2881）。"
 
-        df, target_symbol = get_tw_stock_data(stock_code)
+        df = get_tw_stock_data_finmind(stock_code)
 
         if df is None or df.empty:
             return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後再試。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
-        revenue_info, _ = get_tw_revenue(stock_code)
+        revenue_info = get_tw_revenue(stock_code)
 
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -348,7 +339,7 @@ def analyze_stock(user_input):
             foreign_text = "籌碼結算中"
 
         if close < ma60 or diff_pct <= -3.0:
-            signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走走弱！"
+            signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走弱！"
         elif is_touch_bb_upper:
             signal = "⚠️【擇優減碼】股價推升至布林上軌過熱區，注意拉回。"
         elif close >= ma20 and hist_today > hist_yesterday:
@@ -359,10 +350,9 @@ def analyze_stock(user_input):
             signal = "⚪【觀望為主】多空方向未定。"
 
         pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"跌破月線 {abs(diff_pct):.2f}%"
-        title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
 
         return (
-            f"📊 {title_display} 技術與籌碼分析：\n"
+            f"📊 {display_name} ({stock_code}) 技術與籌碼分析：\n"
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
@@ -381,4 +371,3 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
-    
