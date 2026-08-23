@@ -72,8 +72,14 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    symbol = event.message.text.strip()
-    reply_text = analyze_stock(symbol)
+    user_input = event.message.text.strip()
+    
+    # 判斷是否觸發 AI 自動選股
+    if user_input in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
+        reply_text = screen_hidden_gems()
+    else:
+        reply_text = analyze_stock(user_input)
+        
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
@@ -157,10 +163,10 @@ def get_tw_revenue(stock_id):
                 else:
                     status = "🟢 動能持平"
 
-                return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}"
+                return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}", yoy
     except Exception:
         pass
-    return "無即時營收數據"
+    return "無即時營收數據", None
 
 def get_tw_foreign_investor(stock_id):
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date=2024-08-01"
@@ -180,6 +186,49 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
+def screen_hidden_gems():
+    """AI 選股：外資買超 + 位階低未大漲 + 營收優良"""
+    watchlist = ["2330", "2317", "2454", "2881", "2882", "2382", "3231", "5904", "5274", "3293", "3324", "3017", "6187", "6274", "3034"]
+    selected = []
+
+    for code in watchlist:
+        try:
+            df, _ = get_tw_stock_data(code)
+            if df is None or len(df) < 20:
+                continue
+
+            close = float(df.iloc[-1]['Close'])
+            ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
+            std20 = float(df.iloc[-1]['Close'].rolling(20).std().iloc[-1])
+            bb_upper = ma20 + (std20 * 2)
+
+            bias = ((close - ma20) / ma20) * 100
+
+            # 條件 1: 未爆漲 (低於布林上軌且乖離率 <= 5%)
+            if close >= bb_upper or bias > 5.0:
+                continue
+
+            # 條件 2: 外資近期買超
+            foreign_net = get_tw_foreign_investor(code)
+            if foreign_net is None or foreign_net <= 0:
+                continue
+
+            # 條件 3: 營收不差 (YoY >= 0%)
+            _, yoy = get_tw_revenue(code)
+            if yoy is not None and yoy < 0:
+                continue
+
+            name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
+            disp_name = name[0] if name else code
+            selected.append(f"🔹 {disp_name} ({code})\n   • 收盤: {close:.2f} (月線乖離: {bias:+.1f}%)\n   • 外資買超: {foreign_net:,} 張")
+        except Exception:
+            continue
+
+    if not selected:
+        return "🔍 目前追蹤池中暫無完全符合「外資偷偷買 + 低位階 + 營收佳」標的，建議觀望。"
+
+    return "🎯 【AI 潛力籌碼股清單】\n(外資佈局 + 營收好 + 未觸及布林上軌):\n\n" + "\n\n".join(selected)
+
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
@@ -192,20 +241,18 @@ def analyze_stock(user_input):
             return f"找不到代碼 [{stock_code}] 的台股價格數據，請確認代碼是否正確。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
-        revenue_info = get_tw_revenue(stock_code)
+        revenue_info, _ = get_tw_revenue(stock_code)
 
-        # MACD 技術指標
+        # MACD
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['Hist'] = df['DIF'] - df['MACD']
 
-        # 均線與均量
+        # MA & Bollinger
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-
-        # 布林通道 (Bollinger Bands: MA20 ± 2倍標準差)
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
@@ -233,7 +280,6 @@ def analyze_stock(user_input):
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
 
-        # 判斷是否突破或觸及布林上軌
         is_touch_bb_upper = close >= bb_upper
 
         if is_touch_bb_upper:
@@ -262,7 +308,6 @@ def analyze_stock(user_input):
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
 
-        # 操作建議邏輯（融入布林上軌防追高機制）
         if is_break_3pct or is_two_days_below:
             reasons = []
             if is_break_3pct:
