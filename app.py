@@ -118,7 +118,7 @@ def get_tw_stock_data(stock_id):
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """營收計算邏輯：清洗數據，自動過濾小於等於0的異常值，防護 Division by Zero 崩潰"""
+    """營收計算邏輯：過濾小於等於 0 的無效數據，防止 API 缺失引發 Division by Zero"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -184,18 +184,39 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """全動態選股：徹底刪除寫死名單，兩階段高速掃描，防封鎖且無破位股"""
+    """全動態選股：涵蓋「上市 + 上櫃」全市場，具備雙層彈性篩選機制機制"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
     quotes_data = {}
+    
+    # 1. 抓取 TWSE 證交所當日【上市】行情
     try:
-        url_quotes = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res_q = requests.get(url_quotes, headers=headers, timeout=5)
+        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res_q = requests.get(url_twse, headers=headers, timeout=5)
         if res_q.status_code == 200 and isinstance(res_q.json(), list):
-            quotes_data = {item['Code']: item for item in res_q.json()}
+            for item in res_q.json():
+                quotes_data[item['Code']] = item
     except Exception as e:
-        print(f"Quotes Fetch Error: {e}")
+        print(f"TWSE Quotes Fetch Error: {e}")
 
+    # 2. 抓取 TPEx 櫃買中心當日【上櫃】行情
+    try:
+        url_tpex_quotes = "https://www.tpex.org.tw/openapi/v1/t187ap05_O"
+        res_tpex = requests.get(url_tpex_quotes, headers=headers, timeout=5)
+        if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
+            for item in res_tpex.json():
+                code = item.get("SecuritiesCompanyCode", "").strip()
+                if code:
+                    quotes_data[code] = {
+                        'Code': code,
+                        'Name': item.get("CompanyName", code).strip(),
+                        'ClosingPrice': item.get("Close", "0"),
+                        'TradeVolume': item.get("TradingVolume", "0")
+                    }
+    except Exception as e:
+        print(f"TPEx Quotes Fetch Error: {e}")
+
+    # 3. 抓取當日【上市外資買賣超】
     foreign_buy_map = {}
     try:
         url_t86 = "https://openapi.twse.com.tw/v1/fund/T86"
@@ -212,9 +233,24 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"Foreign Buy Fetch Error: {e}")
 
+    # 4. 抓取當日【上櫃外資買賣超】
+    try:
+        url_tpex_f = "https://www.tpex.org.tw/openapi/v1/t135020"
+        res_tf = requests.get(url_tpex_f, headers=headers, timeout=5)
+        if res_tf.status_code == 200 and isinstance(res_tf.json(), list):
+            for item in res_tf.json():
+                code = item.get("SecuritiesCompanyCode", "").strip()
+                try:
+                    net = int(item.get("ForeignInvestorNetBuySell", "0").replace(",", ""))
+                    foreign_buy_map[code] = round(net / 1000)
+                except:
+                    continue
+    except Exception as e:
+        print(f"TPEx Foreign Buy Fetch Error: {e}")
+
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
     
-    # 第一階段：全市場快速過濾
+    # 全市場第一階段快速篩選
     pre_candidates = []
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00") or code in famous_giants:
@@ -229,7 +265,8 @@ def screen_undervalued_stocks():
             trade_volume = int(vol_str) / 1000 if vol_str.isdigit() else 0
             foreign_net = foreign_buy_map.get(code, 0)
 
-            if 10 <= close <= 200 and trade_volume >= 1000 and foreign_net > 0:
+            # 成交量 > 800張、股價 10~250 元
+            if 10 <= close <= 250 and trade_volume >= 800:
                 pre_candidates.append({
                     'code': code,
                     'name': info.get('Name', code).strip(),
@@ -241,11 +278,13 @@ def screen_undervalued_stocks():
             continue
 
     pre_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
-    top_15 = pre_candidates[:15]
+    top_20 = pre_candidates[:20]
 
-    candidates = []
-    # 第二階段：對熱門前 15 檔執行技術指標驗證（月線/季線/布林）
-    for item in top_15:
+    strict_candidates = []
+    relaxed_candidates = []
+
+    # 第二階段：指標驗證 (MA20/MA60/布林)
+    for item in top_20:
         code = item['code']
         df, _ = get_tw_stock_data(code)
         if df is None or len(df) < 60:
@@ -262,26 +301,31 @@ def screen_undervalued_stocks():
         ma60 = float(latest_row['MA60'])
         bb_upper = float(latest_row['BB_Upper'])
 
-        # 風控：跌破月線/季線 或 觸及布林過熱區一律排除
-        if close < ma20 or close < ma60 or close >= (bb_upper * 0.98):
-            continue
-
-        score = 75 + min(item['foreign_net'] // 50, 20)
+        score = 75 + min(max(item['foreign_net'], 0) // 50, 20)
+        
         card_text = (
-            f"🤫 {item['name']} ({code}) - 安全動能評分: {int(score)}分\n"
-            f"   • 收盤價: ${close:.2f} (站穩月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
+            f"🤫 {item['name']} ({code}) - 安全評分: {int(score)}分\n"
+            f"   • 收盤價: ${close:.2f} (月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
             f"   • 成交量: {int(item['volume']):,} 張\n"
-            f"   • 籌碼觀察: 外資卡位買超 {item['foreign_net']:,} 張"
+            f"   • 外資籌碼: {f'買超 {item[\"foreign_net\"]:,} 張' if item['foreign_net'] > 0 else '觀望中'}"
         )
-        candidates.append((score, card_text))
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top_picks = [c[1] for c in candidates[:4]]
+        if close >= ma20 and close >= ma60 and close < (bb_upper * 0.995):
+            strict_candidates.append((score, card_text))
+        elif close >= ma20:
+            relaxed_candidates.append((score, card_text))
 
-    if top_picks:
-        return "🎯 【AI 全市場黑馬即時掃描】\n(100% 當日動態計算，已排除破位與過熱標的):\n\n" + "\n\n".join(top_picks)
+    if strict_candidates:
+        strict_candidates.sort(key=lambda x: x[0], reverse=True)
+        top_picks = [c[1] for c in strict_candidates[:4]]
+        return "🎯 【AI 上市+上櫃黑馬即時掃描】\n(高安全性：站穩雙均線 + 籌碼加碼):\n\n" + "\n\n".join(top_picks)
+    
+    elif relaxed_candidates:
+        relaxed_candidates.sort(key=lambda x: x[0], reverse=True)
+        top_picks = [c[1] for c in relaxed_candidates[:4]]
+        return "🎯 【AI 上市+上櫃強勢動能掃描】\n(大盤波動下，精選站穩月線標的):\n\n" + "\n\n".join(top_picks)
 
-    return "⚠️ 盤後全市場掃描完成：今日暫無符合「站穩雙均線 + 外資加碼 + 未過熱」的安全標的，建議多看少做。"
+    return "⚠️ 盤後數據更新中或全市場觀望氣氛極濃，建議暫時以現金防守為主。"
 
 def analyze_stock(user_input):
     try:
@@ -351,7 +395,7 @@ def analyze_stock(user_input):
 
         if foreign_net is not None:
             if foreign_net > 0:
-                foreign_text = f"買超 {foreign_text:,} 張" if 'foreign_text' in locals() else f"買超 {foreign_net:,} 張"
+                foreign_text = f"買超 {foreign_net:,} 張"
             elif foreign_net < 0:
                 foreign_text = f"賣超 {abs(foreign_net):,} 張"
             else:
