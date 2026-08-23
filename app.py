@@ -12,8 +12,9 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
+# 填入您的 LINE 密鑰
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'oG8A/4QoXPau72qWtFOcV4Hq/Ca+EgcQoJgSMHUjbNPVjtgyGkBeTwdmqfBiEjqBbZLzUn0F70JNtdTgICSrgr T+4NysH5ayUtXj4B+06J6I2DW7BT3ruJHndDuag4zjys1CO836Jwy4fR0oDq6e7wdB04t89/1O/w1cDnyilFU=').strip()
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a332382036072d72899c94d5b').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -183,7 +184,6 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks(query_date=None):
-    """【當日固定精選 Top 5】支援歷史日期固定模擬"""
     if len(STOCK_NAME_MAP) < 1000:
         load_all_taiwan_stocks()
 
@@ -191,7 +191,6 @@ def screen_undervalued_stocks(query_date=None):
     if not all_stocks:
         return "⚠️ 目前連線忙碌中，請於 10 秒後重新輸入「AI選股」。"
 
-    # 若未指定日期，則抓今天日期
     date_seed = query_date if query_date else datetime.datetime.now().strftime("%Y%m%d")
     rng = random.Random(date_seed)
     
@@ -373,5 +372,4 @@ def analyze_stock(user_input):
         return f"分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(port=5000)
     app.run(port=5000)
