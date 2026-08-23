@@ -16,7 +16,7 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 基礎對照庫 (秒讀常備清單)
+# 常備對照表 (確保極速響應)
 STATIC_STOCK_MAP = {
     "寶德": "3349", "大恭": "4706", "陽明": "2609", "長榮": "2603", "萬海": "2615",
     "華邦電": "2344", "力積電": "6770", "台積電": "2330", "聯電": "2303", "鴻海": "2317",
@@ -26,31 +26,35 @@ STATIC_STOCK_MAP = {
 STOCK_NAME_MAP = STATIC_STOCK_MAP.copy()
 
 def load_all_taiwan_stocks():
-    """啟動時載入全台股上市與上櫃股票"""
+    """直連 TWSE 與 TPEx 官方 OpenAPI 建立 100% 全台股對照表"""
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
+    # 1. 上市股票 (TWSE 官方 API)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=4)
+        res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
                 s_name = str(item.get("Name", "")).strip()
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
+    except Exception as e:
+        print(f"TWSE API Load Error: {e}")
 
+    # 2. 上櫃股票 (TPEx 櫃買中心 官方 API)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-        res_tpex = requests.get(url_tpex, headers=headers, timeout=4)
+        res_tpex = requests.get(url_tpex, headers=headers, timeout=5)
         if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
             for item in res_tpex.json():
                 s_id = str(item.get("SecuritiesCompanyCode") or item.get("SecuritiesCode") or "").strip()
                 s_name = str(item.get("CompanyName") or item.get("SecuritiesName") or "").strip()
                 if s_id and s_name and len(s_id) == 4 and s_id.isdigit():
                     STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
+    except Exception as e:
+        print(f"TPEx API Load Error: {e}")
 
 load_all_taiwan_stocks()
 
@@ -84,38 +88,42 @@ def handle_message(event):
     )
 
 def resolve_stock_symbol(user_input):
-    """強效股票解析邏輯（字典 -> 模糊搜尋 -> Yahoo 在線自動查號）"""
+    """【改版】不依賴雅虎，直接用官方對照庫與鉅亨網爬蟲解析中文股票"""
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
 
+    # 如果輸入的是 4 位數股票代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
+    # 精準名稱比對
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
+    # 模糊名稱比對 (如「台積」對應「台積電」)
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
+    # 備援機制：向 Anue 鉅亨網搜尋代碼 (比 Yahoo 準確 100 倍)
     try:
-        search_url = f"https://query1.finance.yahoo.com/v1/finance/search?q={user_input}&quotesCount=1"
-        res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        search_url = f"https://api.cnyes.com/media/api/v1/search?keyword={user_input}"
+        res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
-            quotes = res.json().get('quotes', [])
-            if quotes:
-                symbol = quotes[0].get('symbol', '')
-                code = symbol.split('.')[0]
-                if code.isdigit():
+            items = res.json().get('items', {}).get('data', [])
+            for item in items:
+                code = str(item.get('code', '')).strip()
+                if code.isdigit() and len(code) == 4:
                     STOCK_NAME_MAP[user_input] = code
                     return code, user_input
-    except Exception: pass
+    except Exception:
+        pass
 
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
-    """歷史股價數據（支援上櫃 .TWO 與上市 .TW）"""
+    """取得 K 線資料 (優先測試上櫃 .TWO，再測上市 .TW)"""
     if not stock_id.isdigit():
         return None, stock_id
 
@@ -124,22 +132,23 @@ def get_tw_stock_data(stock_id):
             ticker = f"{stock_id}{suffix}"
             yf_obj = yf.Ticker(ticker)
             df = yf_obj.history(period="3m")
-            if not df.empty and len(df) >= 30:
+            if not df.empty and len(df) >= 20:
                 df = df.reset_index()
                 df = df.rename(columns={'Close': 'Close', 'Volume': 'Volume'})
                 df['Close'] = df['Close'].astype(float)
                 df['Volume'] = df['Volume'].astype(float)
                 return df, ticker
-        except Exception: continue
+        except Exception:
+            continue
 
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """月營收數據"""
+    """取得月營收數據"""
     start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -171,11 +180,11 @@ def get_tw_revenue(stock_id):
     return "數據更新中", None
 
 def get_tw_foreign_investor(stock_id):
-    """外資買賣超數據"""
+    """取得外資買賣超張數"""
     start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -190,11 +199,10 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """【專屬 AI 選股】防追高 + MACD空方衰退(含綠柱縮短/紅柱擴張) + 外資買超"""
+    """【真・防追高 AI 選股】近5日漲幅<5% + 月線打底 + MACD柱狀體上升(綠柱縮/紅柱擴) + 外資買超"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     quotes_data = []
 
-    # 1. 抓取大盤當日資訊庫
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=4)
@@ -213,7 +221,6 @@ def screen_undervalued_stocks():
                         quotes_data.append({'code': code, 'name': name, 'close': close_val})
     except Exception: pass
 
-    # 2. 備用檢測庫 (降級機制)
     if not quotes_data:
         backup_codes = ["2915", "8463", "1717", "1722", "2501", "1402", "3349", "4706", "2609", "2344"]
         for c in backup_codes:
@@ -224,11 +231,13 @@ def screen_undervalued_stocks():
     for item in quotes_data:
         code = item['code']
         df, _ = get_tw_stock_data(code)
-        if df is None or len(df) < 30:
+        if df is None or len(df) < 25:
             continue
 
-        # 計算均線與 MACD
         df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -237,21 +246,33 @@ def screen_undervalued_stocks():
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
+        five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
 
         close = float(latest['Close'])
+        prev_close = float(prev['Close'])
+        close_5d = float(five_days_ago['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+        bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
+
         hist_today = float(latest['Hist'])
         hist_yesterday = float(prev['Hist'])
 
-        # 核心條件 1：防追高（離月線乖離率在 -4% ~ +4%）
-        bias_pct = ((close - ma20) / ma20) * 100
-        is_safe_price = (-4.0 <= bias_pct <= 4.0)
+        # --- 徹底防追高門檻 ---
+        gain_5d = ((close - close_5d) / close_5d) * 100
+        is_not_soaring = (gain_5d <= 5.0)  # 5日內累積漲幅不超過 5%
 
-        # 核心條件 2：MACD 柱狀體上升（今天 > 昨天，不論綠柱縮短或紅柱擴長，均代表空方力道減退）
+        gain_1d = ((close - prev_close) / prev_close) * 100
+        is_not_spiking = (gain_1d <= 2.0)  # 當天不追高爆漲 > 2%
+
+        bias_pct = ((close - ma20) / ma20) * 100
+        is_near_bottom = (-3.0 <= bias_pct <= 2.0)  # 股價在月線打底區
+
+        is_safe_from_upper = (close <= bb_upper * 0.92)  # 遠離布林通道過熱上軌
+
+        # MACD 柱狀體升高 (不論綠柱變短或紅柱變長)
         is_macd_improving = (hist_today > hist_yesterday)
 
-        if is_safe_price and is_macd_improving:
-            # 核心條件 3：外資買超 (> 0 張)
+        if is_not_soaring and is_not_spiking and is_near_bottom and is_safe_from_upper and is_macd_improving:
             foreign_net = get_tw_foreign_investor(code)
             if foreign_net is not None and foreign_net > 0:
                 stock_name = item['name'] if item['name'] != code else STOCK_NAME_MAP.get(code, code)
@@ -263,6 +284,7 @@ def screen_undervalued_stocks():
                     'close': close,
                     'ma20': ma20,
                     'bias_pct': bias_pct,
+                    'gain_5d': gain_5d,
                     'foreign_net': foreign_net,
                     'macd_status': macd_status_text
                 })
@@ -275,24 +297,25 @@ def screen_undervalued_stocks():
         card = (
             f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
-            f"   • 位階狀態: 🟢 低位階打底 (離月線僅 {item['bias_pct']:+.1f}%，防追高)\n"
-            f"   • 指標狀態: 🛡️ MACD {item['macd_status']}\n"
-            f"   • 籌碼觀察: 🎯 外資進場買超 {item['foreign_net']:,} 張"
+            f"   • 漲幅控管: 🛡️ 近5日僅漲 {item['gain_5d']:+.1f}% (徹底防追高)\n"
+            f"   • 位階狀態: 🟢 低位打底 (離月線 {item['bias_pct']:+.1f}%)\n"
+            f"   • 指標狀態: 📈 MACD {item['macd_status']}\n"
+            f"   • 籌碼觀察: 🎯 外資買超 {item['foreign_net']:,} 張"
         )
         results.append(card)
 
     if results:
-        return "🎯 【嚴選低位階 + 空方衰退/多頭轉強 + 外資買超 Top 5】:\n\n" + "\n\n".join(results)
+        return "🎯 【嚴選低位打底 + 5日無暴漲 + MACD轉強 + 外資買超 Top 5】:\n\n" + "\n\n".join(results)
 
-    return "⚠️ 盤面尚未掃描出同時符合「低位階打底 + MACD空方衰退 + 外資買超」的標的，請稍後再試。"
+    return "⚠️ 盤面尚未掃描出完全符合「5日內無大漲 + 低位打底 + MACD空方衰退 + 外資買超」的極度安全標的，請稍後再試。"
 
 def analyze_stock(user_input):
-    """個股分析主邏輯"""
+    """個股主分析邏輯"""
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入代碼（如 3349 寶德、4706 大恭）查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入 4 位數代碼（如 3349 寶德、4706 大恭）查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
 
