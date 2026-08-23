@@ -7,7 +7,6 @@ import re
 import json
 import time
 from flask import Flask, request, abort
-from apscheduler.schedulers.background import BackgroundScheduler
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -101,7 +100,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 (TWSE) + 上櫃 (TPEx) 股票名稱與代號清單
+# 2. 上市 + 上櫃 股票清單
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -137,24 +136,22 @@ load_all_taiwan_stocks()
 # 3. FinMind 數據抓取
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
-    for attempt in range(2):
-        try:
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("status") == 200 and data.get("data"):
-                    df = pd.DataFrame(data["data"])
-                    df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-                    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-                    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-                    df = df.dropna(subset=['Close'])
-                    if len(df) >= 20:
-                        return df
-        except Exception:
-            time.sleep(1)
-            continue
+    try:
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == 200 and data.get("data"):
+                df = pd.DataFrame(data["data"])
+                df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+                df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+                df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+                df = df.dropna(subset=['Close'])
+                if len(df) >= 20:
+                    return df
+    except Exception:
+        pass
     return None
 
 def get_tw_foreign_investor(stock_id):
@@ -185,7 +182,7 @@ def get_tw_stock_revenue(stock_id):
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
                 df = pd.DataFrame(data["data"])
-                rev_col = 'revenue' if 'revenue' in df.columns else ['revenue_month' if 'revenue_month' in df.columns else None]
+                rev_col = 'revenue' if 'revenue' in df.columns else ('revenue_month' if 'revenue_month' in df.columns else None)
                 if rev_col and len(df) >= 13:
                     df[rev_col] = pd.to_numeric(df[rev_col], errors='coerce')
                     df = df.dropna(subset=[rev_col])
@@ -216,16 +213,16 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 全台股背景連續掃描器 (每 30 秒/檔)
+# 4. Cron 驅動掃描 API (由 UptimeRobot 觸發)
 # ----------------------------------------------------
-def background_stock_scanner():
+def scan_one_stock():
     try:
         if len(STOCK_NAME_MAP) < 300:
             load_all_taiwan_stocks()
 
         all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
         if not all_stocks:
-            return
+            return "No stocks available"
 
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
@@ -233,7 +230,6 @@ def background_stock_scanner():
 
         if not code.startswith("00") and len(code) == 4:
             df = get_tw_stock_data_finmind(code)
-            time.sleep(1.2)
 
             if df is not None and len(df) >= 20:
                 df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -259,8 +255,6 @@ def background_stock_scanner():
 
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
-                    time.sleep(1.0)
-                    
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
                     macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else "紅柱微幅擴張"
 
@@ -282,21 +276,21 @@ def background_stock_scanner():
         today_str = datetime.datetime.now().strftime("%Y%m%d")
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
         update_scanner_state(next_idx, total_scanned + 1, leaderboard)
+        return f"Scanned: {name}({code}), Total: {total_scanned + 1}"
 
     except Exception as e:
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=background_stock_scanner, trigger="interval", seconds=30)
-scheduler.start()
+        return f"Error: {str(e)}"
 
 # ----------------------------------------------------
-# 5. LINE Bot 處理與回傳輸出
+# 5. LINE Bot & Routes
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active!"
+    # 只要存取首頁，就觸發一次股票掃描！
+    res_msg = scan_one_stock()
+    return f"TW Stock Bot Active! [{res_msg}]"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -352,14 +346,7 @@ def get_ai_selected_stocks():
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 10 and not top_stocks:
-        pct = (total_scanned / 30) * 100
-        return (
-            f"⏳【AI 後台數據庫暖機中】\n"
-            f"--------------------\n"
-            f"• 當前進度: 已掃描 {total_scanned} / 30 檔基本庫 ({pct:.0f}%)\n"
-            f"• 安全機制: 30秒/檔 穩定運算中\n\n"
-            f"💡 請再等待約 2~3 分鐘後重新點選「AI選股」！"
-        )
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 2~3 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
@@ -473,5 +460,4 @@ def analyze_stock(user_input):
         return f"⚠️ 分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(port=5000）
-                        
+    app.run(port=5000)
