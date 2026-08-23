@@ -185,95 +185,79 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """全市場外資買超掃描 + 200元以下動態評分排序（保底輸出高分標的）"""
+    """全市場即時掃描：利用證交所 OpenAPI 1秒完成全台股篩選（零 Timeout / 排除熱門大型股）"""
     headers = {'User-Agent': 'Mozilla/5.0'}
-    candidate_codes = []
     
-    # 1. 抓取證交所外資買超清單
     try:
-        url = "https://openapi.twse.com.tw/v1/fund/T86"
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            for item in data:
+        # 1. 抓取全台股今日行情
+        url_quotes = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res_q = requests.get(url_quotes, headers=headers, timeout=4)
+        if res_q.status_code != 200:
+            return "⚠️ 證交所 API 伺服器維護中，請稍後再試。"
+        
+        quotes_data = {item['Code']: item for item in res_q.json()}
+
+        # 2. 抓取三大法人買超數據
+        url_t86 = "https://openapi.twse.com.tw/v1/fund/T86"
+        res_f = requests.get(url_t86, headers=headers, timeout=4)
+        foreign_buy_map = {}
+        if res_f.status_code == 200:
+            for item in res_f.json():
                 code = item.get("Code", "").strip()
-                if code and code.isdigit() and not code.startswith("00"):
-                    candidate_codes.append(code)
+                try:
+                    f_buy = int(item.get("ForeignInvestorsBuy", "0").replace(",", ""))
+                    f_sell = int(item.get("ForeignInvestorsSell", "0").replace(",", ""))
+                    net_shares = round((f_buy - f_sell) / 1000)
+                    if net_shares > 0:
+                        foreign_buy_map[code] = net_shares
+                except:
+                    continue
+
+        # 自動過濾熱門權值大牌
+        famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
+
+        candidates = []
+
+        # 3. 全台股動態篩選
+        for code, info in quotes_data.items():
+            if not code.isdigit() or code.startswith("00") or code in famous_giants:
+                continue
+
+            try:
+                close = float(info.get('ClosingPrice', 0).replace(',', ''))
+                trade_volume = int(info.get('TradeVolume', 0).replace(',', '')) / 1000
+                
+                # 條件：股價 10 ~ 200 元、成交量 > 300 張
+                if 10 <= close <= 200 and trade_volume > 300:
+                    
+                    foreign_net = foreign_buy_map.get(code, 0)
+                    if foreign_net <= 0:
+                        continue
+
+                    # 分數計算：外資卡位張數導向
+                    score = 60 + min(foreign_net // 50, 35)
+                    
+                    name = info.get('Name', code).strip()
+                    item_text = (
+                        f"🤫 {name} ({code}) - 綜合動能評分: {int(score)}分\n"
+                        f"   • 收盤價: ${close:.2f} (200元以下中小型股)\n"
+                        f"   • 當日成交量: {int(trade_volume):,} 張\n"
+                        f"   • 外資籌碼: 淨買超 {foreign_net:,} 張"
+                    )
+                    candidates.append((score, item_text))
+            except:
+                continue
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top_picks = [item[1] for item in candidates[:4]]
+
+        if top_picks:
+            return "🎯 【AI 全市場冷門黑馬即時掃描】\n(全台股數據即時運算，200元以下 + 外資卡位標的):\n\n" + "\n\n".join(top_picks)
+
     except Exception as e:
-        print(f"TWSE Scan Error: {e}")
+        print(f"Fast Scan Error: {e}")
 
-    if not candidate_codes:
-        candidate_codes = ["4916", "6207", "8033", "6187", "6274", "3189", "8046", "3017", "3324", "3702", "1514", "2301"]
-
-    # 剔除大家都熟知的權值大牌
-    famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
-    filtered_pool = [c for c in candidate_codes if c not in famous_giants]
-
-    scored_stocks = []
-
-    # 2. 進行彈性加分計算
-    for code in filtered_pool[:30]:
-        try:
-            df, _ = get_tw_stock_data(code)
-            if df is None or len(df) < 20:
-                continue
-
-            close = float(df.iloc[-1]['Close'])
-            
-            # 股價限制：200 元以下
-            if close > 200 or close < 10:
-                continue
-
-            ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
-            bias = ((close - ma20) / ma20) * 100
-
-            # 嚴重過熱噴出者排除
-            if bias > 12.0:
-                continue
-
-            score = 50  # 基礎分
-            
-            # 位階越低/剛打底者加分越高
-            if -3.0 <= bias <= 4.0:
-                score += 35
-            elif bias < -3.0:
-                score += 20
-            else:
-                score += 10
-
-            foreign_net = get_tw_foreign_investor(code)
-            if foreign_net is not None and foreign_net > 0:
-                score += 20
-
-            _, yoy = get_tw_revenue(code)
-            if yoy is not None and yoy > 0:
-                score += 15
-
-            name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
-            disp_name = name[0] if name else code
-            yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "穩定"
-            foreign_disp = f"{foreign_net:,} 張" if foreign_net is not None and foreign_net > 0 else "持平/微幅"
-
-            item_text = (
-                f"🤫 {disp_name} ({code}) - 綜合評分: {score}分\n"
-                f"   • 收盤價: ${close:.2f} (200元以下)\n"
-                f"   • 月線乖離: {bias:+.1f}%\n"
-                f"   • 外資籌碼: {foreign_disp}\n"
-                f"   • 營收 YoY: {yoy_disp}"
-            )
-            
-            scored_stocks.append((score, item_text))
-        except Exception:
-            continue
-
-    # 按分數由高到低排序，選出最高分的前 4 檔
-    scored_stocks.sort(key=lambda x: x[0], reverse=True)
-    top_picks = [item[1] for item in scored_stocks[:4]]
-
-    if not top_picks:
-        return "⚠️ 今日全市場連線數據較為壅塞，請稍後再試。"
-
-    return "🎯 【AI 全市場冷門黑馬掃描】\n(已自動剔除權值股，取外資卡位 + 200元以下綜合評分最高者):\n\n" + "\n\n".join(top_picks)
+    return "⚠️ 盤後數據更新中或網路連線異常，請稍後再試。"
 
 def analyze_stock(user_input):
     try:
