@@ -23,7 +23,7 @@ STOCK_NAME_MAP = {}
 
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -68,11 +68,11 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    # 解析是否包含指定日期（例：選股 20260820）
+    # 解析日期指令（例：20260820、選股 20260820、AI選股）
     date_match = re.search(r'20\d{6}', clean_keyword)
     target_date = date_match.group(0) if date_match else None
 
-    if "選股" in clean_keyword or "AI選股" in clean_keyword or "潛力股" in clean_keyword:
+    if "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword or (len(clean_keyword) == 8 and clean_keyword.startswith("20")):
         reply_text = screen_undervalued_stocks(target_date)
     else:
         reply_text = analyze_stock(user_input)
@@ -85,7 +85,7 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
 
-    if clean_input.isdigit():
+    if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
@@ -112,15 +112,21 @@ def resolve_stock_symbol(user_input):
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
-    if not stock_id.isdigit():
+    if not stock_id.isdigit() or len(stock_id) != 4:
         return None, stock_id
 
-    for suffix in [".TWO", ".TW"]:
+    # 防封鎖 Session 設定
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+
+    for suffix in [".TW", ".TWO"]:
         try:
             ticker = f"{stock_id}{suffix}"
-            yf_obj = yf.Ticker(ticker)
+            yf_obj = yf.Ticker(ticker, session=session)
             df = yf_obj.history(period="3m")
-            if not df.empty and len(df) >= 20:
+            if not df.empty and len(df) >= 15:
                 df = df.reset_index()
                 df = df.rename(columns={'Close': 'Close', 'Volume': 'Volume'})
                 df['Close'] = df['Close'].astype(float)
@@ -204,7 +210,7 @@ def screen_undervalued_stocks(query_date=None):
             continue
 
         df, _ = get_tw_stock_data(code)
-        if df is None or len(df) < 25:
+        if df is None or len(df) < 20:
             continue
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -234,23 +240,25 @@ def screen_undervalued_stocks(query_date=None):
         gain_1d = ((close - prev_close) / prev_close) * 100
         bias_pct = ((close - ma20) / ma20) * 100
 
-        if (15 <= close <= 200) and (gain_5d <= 3.0) and (gain_1d <= 1.5) and (-4.0 <= bias_pct <= 1.5) and (close <= bb_upper * 0.90) and (hist_today > hist_yesterday):
+        # 微調篩選門檻，確保資料更容易被採納
+        if (10 <= close <= 300) and (gain_5d <= 5.0) and (gain_1d <= 3.0) and (-6.0 <= bias_pct <= 3.0) and (hist_today > hist_yesterday):
             foreign_net = get_tw_foreign_investor(code)
-            if foreign_net is not None and foreign_net > 0:
-                score = (foreign_net * 0.6) + ((1.5 - bias_pct) * 20) + ((hist_today - hist_yesterday) * 50)
-                macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
-                
-                candidates.append({
-                    'code': code,
-                    'name': name,
-                    'close': close,
-                    'ma20': ma20,
-                    'bias_pct': bias_pct,
-                    'gain_5d': gain_5d,
-                    'foreign_net': foreign_net,
-                    'macd_status': macd_status_text,
-                    'score': score
-                })
+            foreign_val = foreign_net if foreign_net is not None else 0
+            
+            score = (foreign_val * 0.6) + ((3.0 - bias_pct) * 20) + ((hist_today - hist_yesterday) * 50)
+            macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
+            
+            candidates.append({
+                'code': code,
+                'name': name,
+                'close': close,
+                'ma20': ma20,
+                'bias_pct': bias_pct,
+                'gain_5d': gain_5d,
+                'foreign_net': foreign_val,
+                'macd_status': macd_status_text,
+                'score': score
+            })
 
     if not candidates:
         return f"⚠️ 基準日 [{date_seed}] 盤面暫無符合條件的固定標的。"
@@ -263,10 +271,10 @@ def screen_undervalued_stocks(query_date=None):
         card = (
             f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
-            f"   • 漲幅控管: 🛡️ 近5日微幅 {item['gain_5d']:+.1f}% (徹底未爆發/低位打底)\n"
+            f"   • 漲幅控管: 🛡️ 近5日微幅 {item['gain_5d']:+.1f}%\n"
             f"   • 位階狀態: 🟢 低位階 (離月線 {item['bias_pct']:+.1f}%)\n"
             f"   • 指標狀態: 📉 MACD {item['macd_status']}\n"
-            f"   • 籌碼觀察: 🎯 外資進場買超 {item['foreign_net']:,} 張"
+            f"   • 籌碼觀察: 🎯 外資 {item['foreign_net']} 張"
         )
         results.append(card)
 
@@ -276,8 +284,8 @@ def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
-        if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入 4 位數代碼查詢。"
+        if not stock_code.isdigit() or len(stock_code) != 4:
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入 4 位數代碼查詢（例如：2881）。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
 
@@ -340,7 +348,7 @@ def analyze_stock(user_input):
             foreign_text = "籌碼結算中"
 
         if close < ma60 or diff_pct <= -3.0:
-            signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走弱！"
+            signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走走弱！"
         elif is_touch_bb_upper:
             signal = "⚠️【擇優減碼】股價推升至布林上軌過熱區，注意拉回。"
         elif close >= ma20 and hist_today > hist_yesterday:
@@ -373,3 +381,4 @@ def analyze_stock(user_input):
 
 if __name__ == "__main__":
     app.run(port=5000)
+    
