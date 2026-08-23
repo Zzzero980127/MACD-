@@ -160,7 +160,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """每日動態：非科技股優先 + 尚未起漲 + 站穩支撐 + 前 5 名推薦"""
+    """全市場掃描：非科技股 + MACD 空方力道減弱(綠柱縮短) + 外資淨買超 + 未過熱」"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     quotes_data = {}
 
@@ -194,17 +194,16 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"TPEx Fetch Failed: {e}")
 
-    # 科技類別關鍵字（排除這些）
+    # 科技類別關鍵字（排除科技股）
     tech_keywords = ["半導體", "電子", "電腦", "光電", "通訊", "網通", "資訊服務", "電子零組件"]
-    
     candidates = []
 
+    # 3. 基礎過濾：排除科技股、確保流動性
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00"):
             continue
             
         industry = STOCK_INDUSTRY_MAP.get(code, "")
-        # 排除科技板塊，優先選擇非科技/傳產/金融/內需/生技等
         if any(tech in industry for tech in tech_keywords):
             continue
 
@@ -212,8 +211,7 @@ def screen_undervalued_stocks():
             close_val = float(info['close']) if info['close'] != '--' else 0
             vol_val = int(info['vol']) / 1000 if info['vol'].isdigit() else 0
 
-            # 篩選條件：股價 10~200 元，成交量 > 500 張
-            if 10 <= close_val <= 200 and vol_val >= 500:
+            if 10 <= close_val <= 300 and vol_val >= 500:
                 candidates.append({
                     'code': code,
                     'name': info['name'] or STOCK_NAME_MAP.get(code, code),
@@ -223,56 +221,82 @@ def screen_undervalued_stocks():
                 })
         except: continue
 
-    # 按成交量動態排序，取前 30 檔進技術面過濾
     candidates.sort(key=lambda x: x['volume'], reverse=True)
-    top_targets = candidates[:30]
+    top_targets = candidates[:40]
 
-    results = []
+    valid_candidates = []
     
+    # 4. 技術面 (MACD轉折) + 外資籌碼嚴格篩選
     for item in top_targets:
         code = item['code']
         df, _ = get_tw_stock_data(code)
-        if df is None or len(df) < 20:
+        if df is None or len(df) < 35:
             continue
+
+        # 計算 MACD 指標
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = exp1 - exp2
+        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['DIF'] - df['MACD']  # 柱狀體
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
         
         latest_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
+        
         close = float(latest_row['Close'])
         ma20 = float(latest_row['MA20']) if not pd.isna(latest_row['MA20']) else close
         bb_upper = float(latest_row['BB_Upper']) if not pd.isna(latest_row['BB_Upper']) else close
 
-        # 【核心條件：未起漲＋站穩月線】
-        # 1. 站穩月線 (close >= ma20)
-        # 2. 距離布林上軌仍有空間，非噴出狀態 (close < bb_upper * 0.96)
-        if close >= ma20 and close < (bb_upper * 0.96):
-            foreign_net = get_tw_foreign_investor(code)
-            
-            f_text = "外資觀望"
-            if foreign_net is not None:
-                if foreign_net > 0:
-                    f_text = f"🔥 外資買超 {foreign_net:,} 張"
-                elif foreign_net < 0:
-                    f_text = f"📉 外資賣超 {abs(foreign_net):,} 張"
+        hist_today = float(latest_row['Hist'])
+        hist_yesterday = float(prev_row['Hist'])
 
-            card = (
-                f"🤫 {item['name']} ({code}) - [{item['industry']}]\n"
-                f"   • 收盤價: ${close:.2f} (月線 ${ma20:.1f})\n"
-                f"   • 位階狀態: 底部打底完成，尚未過熱噴出\n"
-                f"   • 籌碼動態: {f_text}"
-            )
-            results.append(card)
-            
-            # 精確取前 5 名最優潛力標的
-            if len(results) >= 5:
-                break
+        # 線上抓取真實外資籌碼
+        foreign_net = get_tw_foreign_investor(code)
+
+        # 【核心條件】：
+        # 1. 外資淨買超 > 0
+        # 2. MACD 綠柱縮短 (空方力道減弱) 或 紅柱發動
+        # 3. 未衝過布林上軌過熱區
+        is_foreign_buy = (foreign_net is not None and foreign_net > 0)
+        
+        is_macd_rebound = (hist_today < 0 and abs(hist_today) < abs(hist_yesterday)) or \
+                          (hist_today > 0 and hist_today >= hist_yesterday)
+
+        if is_foreign_buy and is_macd_rebound:
+            if close < (bb_upper * 0.96):
+                macd_status = "📉 綠柱收斂 (空方力道減弱)" if hist_today < 0 else "🔥 紅柱擴大 (多頭發動)"
+                valid_candidates.append({
+                    'code': code,
+                    'name': item['name'],
+                    'industry': item['industry'],
+                    'close': close,
+                    'ma20': ma20,
+                    'foreign_net': foreign_net,
+                    'macd_status': macd_status
+                })
+
+    # 5. 依據外資買超張數排序，選出最優前 5 檔
+    valid_candidates.sort(key=lambda x: x['foreign_net'], reverse=True)
+    final_top5 = valid_candidates[:5]
+
+    results = []
+    for item in final_top5:
+        card = (
+            f"🤫 {item['name']} ({item['code']}) - [{item['industry']}]\n"
+            f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
+            f"   • MACD訊號: {item['macd_status']}\n"
+            f"   • 籌碼動態: 🔥 外資買超 {item['foreign_net']:,} 張"
+        )
+        results.append(card)
 
     if results:
-        return "🎯 【AI 盤後低位階/非科技黑馬 Top 5】\n(排除漲多過熱標的 + 精選底部起漲熱點):\n\n" + "\n\n".join(results)
+        return "🎯 【AI 盤後轉折/外資加碼/非科技 Top 5】\n(MACD 空方衰退 + 外資轉買卡位):\n\n" + "\n\n".join(results)
     
-    return "⚠️ 盤後掃描中或今日未有符合「低位階+安全打底」之非科技標的，建議觀望。"
+    return "⚠️ 今日無符合「MACD空方衰退/轉折 + 外資買超」之非科技標的，建議觀望。"
 
 def analyze_stock(user_input):
     try:
