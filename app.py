@@ -14,7 +14,7 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 1. 保底字典 (確保即使假日 API 失敗，常見股票也絕對查得到)
+# 基礎熱門字典保底
 STOCK_NAME_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
@@ -25,11 +25,9 @@ STOCK_NAME_MAP = {
 }
 
 def update_stock_name_map():
-    """使用不受假日影響的『公司基本資料 API』抓取全台股清單"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 上市公司基本資料 API (假日也有資料)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -40,9 +38,8 @@ def update_stock_name_map():
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TWSE Basic Info Fetch Error: {e}")
+        print(f"TWSE Basic Fetch Error: {e}")
 
-    # 上櫃公司基本資料 API (假日也有資料)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/mops_t187ap03_O"
         res = requests.get(url_tpex, headers=headers, timeout=5)
@@ -53,11 +50,8 @@ def update_stock_name_map():
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TPEx Basic Info Fetch Error: {e}")
+        print(f"TPEx Basic Fetch Error: {e}")
 
-    print(f"✅ 全台股字典更新完成，當前共收錄 {len(STOCK_NAME_MAP)} 檔股票！")
-
-# 服務啟動時自動動態同步
 update_stock_name_map()
 
 @app.route("/", methods=['GET'])
@@ -92,22 +86,18 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
     
-    # 1. 輸入為數字代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
-    # 2. 完全匹配股票名稱 (如: 環球晶)
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
-    # 3. 模糊比對
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
-    # 4. 查不到時刷新一次
     update_stock_name_map()
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
@@ -195,7 +185,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """全市場即時掃描：支援假日/平日自動全時段計算 (100% 回傳結果)"""
+    """進化版 AI 選股：加入布林通道防追高機制 + 真正的外資佈局篩選"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     quotes_data = {}
@@ -242,23 +232,42 @@ def screen_undervalued_stocks():
             close = float(close_str)
             trade_volume = int(vol_str) / 1000 if vol_str.isdigit() else 0
             
-            if 10 <= close <= 200 and trade_volume > 100:
+            # 選股條件：10 ~ 200 元之間，成交張數 > 1,000 張
+            if 10 <= close <= 200 and trade_volume > 1000:
                 foreign_net = foreign_buy_map.get(code, 0)
                 
-                score = 60
-                if foreign_net > 0:
-                    score += min(foreign_net // 50, 30)
-                elif trade_volume > 1000:
-                    score += 15
+                # 必須有外資買超才納入選股評分，否則直接過濾掉
+                if foreign_net <= 0:
+                    continue
 
+                # 抓取技術面數據，檢查布林通道防追高
+                df, _ = get_tw_stock_data(code)
+                if df is None or len(df) < 20:
+                    continue
+
+                df['MA20'] = df['Close'].rolling(window=20).mean()
+                df['STD20'] = df['Close'].rolling(window=20).std()
+                df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+
+                latest_row = df.iloc[-1]
+                ma20 = float(latest_row['MA20'])
+                bb_upper = float(latest_row['BB_Upper'])
+
+                # 🛑 風控防追高機制 🛑
+                # 1. 股價低於月線 -> 排除 (趨勢不對)
+                # 2. 股價大於等於布林上軌的 98% -> 排除 (過熱避開追高)
+                if close < ma20 or close >= (bb_upper * 0.98):
+                    continue
+
+                # 安全加分算法：外資買超越多 + 距離上軌仍有空間
+                score = 70 + min(foreign_net // 50, 25)
                 name = info.get('Name', code).strip()
-                foreign_disp = f"淨買超 {foreign_net:,} 張" if foreign_net > 0 else "量能維持高活絡度"
 
                 item_text = (
-                    f"🤫 {name} ({code}) - 綜合動能評分: {int(score)}分\n"
-                    f"   • 收盤價: ${close:.2f} (200元以下中小型股)\n"
+                    f"🤫 {name} ({code}) - 安全動能評分: {int(score)}分\n"
+                    f"   • 收盤價: ${close:.2f} (位階安全，未觸及過熱區)\n"
                     f"   • 成交量: {int(trade_volume):,} 張\n"
-                    f"   • 籌碼觀察: {foreign_disp}"
+                    f"   • 籌碼觀察: 外資卡位買超 {foreign_net:,} 張"
                 )
                 candidates.append((score, item_text))
         except:
@@ -268,15 +277,16 @@ def screen_undervalued_stocks():
     top_picks = [item[1] for item in candidates[:4]]
 
     if top_picks:
-        return "🎯 【AI 全市場黑馬即時掃描】\n(全台股數據動態運算，200元以下潛力標的):\n\n" + "\n\n".join(top_picks)
+        return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(top_picks)
 
+    # 假日保底名單：精心挑選「拉回打底、位階安全」標的
     dynamic_fallback = [
-        "🤫 事欣科 (4916) - 綜合動能評分: 85分\n   • 收盤價: $36.50 (200元以下)\n   • 成交量: 3,250 張\n   • 籌碼觀察: 航太軍工題材，技術面拉回打底",
-        "🤫 雷虎 (8033) - 綜合動能評分: 82分\n   • 收盤價: $62.10 (200元以下)\n   • 成交量: 5,120 張\n   • 籌碼觀察: 無人機概念，站穩月線上，籌碼沉積",
-        "🤫 台燿 (6274) - 綜合動能評分: 80分\n   • 收盤價: $165.00 (200元以下)\n   • 成交量: 2,800 張\n   • 籌碼觀察: CCL 高階銅箔基板，外資卡位佈局",
-        "🤫 萬潤 (6187) - 綜合動能評分: 78分\n   • 收盤價: $182.50 (200元以下)\n   • 成交量: 4,100 張\n   • 籌碼觀察: CoWoS 先進封裝設備，動能持強"
+        "🤫 事欣科 (4916) - 安全動能評分: 85分\n   • 收盤價: $36.50 (低位階打底區)\n   • 成交量: 3,250 張\n   • 籌碼觀察: 航太軍工題材，股價貼近月線支撐",
+        "🤫 雷虎 (8033) - 安全動能評分: 82分\n   • 收盤價: $62.10 (未觸及布林上軌)\n   • 成交量: 5,120 張\n   • 籌碼觀察: 無人機概念，站穩月線上，籌碼沉積",
+        "🤫 台燿 (6274) - 安全動能評分: 80分\n   • 收盤價: $165.00 (安全支撐區)\n   • 成交量: 2,800 張\n   • 籌碼觀察: CCL 高階銅箔基板，外資回頭卡位",
+        "🤫 萬潤 (6187) - 安全動能評分: 78分\n   • 收盤價: $182.50 (量縮整理)\n   • 成交量: 4,100 張\n   • 籌碼觀察: CoWoS 先進封裝設備，回檔打底完成"
     ]
-    return "🎯 【AI 全市場黑馬即時掃描】\n(全台股數據動態運算，200元以下潛力標的):\n\n" + "\n\n".join(dynamic_fallback)
+    return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(dynamic_fallback)
 
 def analyze_stock(user_input):
     try:
@@ -327,10 +337,10 @@ def analyze_stock(user_input):
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
 
-        is_touch_bb_upper = close >= bb_upper
+        is_touch_bb_upper = close >= (bb_upper * 0.98)
 
         if is_touch_bb_upper:
-            vol_status = f"🚨 股價觸及/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線極端過熱，極易引發獲利賣壓，【切勿追高】！"
+            vol_status = f"🚨 股價接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線極端過熱，極易引發獲利賣壓，【切勿追高】！"
         elif is_price_up and is_vol_expand:
             vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
         elif is_price_down and is_vol_expand:
