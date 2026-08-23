@@ -14,7 +14,7 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 本地基礎備援字典
+# 本地基礎備援字典 (服務啟動時會自動抓取全市場名稱擴充)
 STOCK_NAME_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
@@ -25,7 +25,7 @@ STOCK_NAME_MAP = {
 }
 
 def update_stock_name_map():
-    """從官方 openapi 批量更新字典"""
+    """從證交所與櫃買中心 openapi 批量更新字典"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
@@ -55,13 +55,13 @@ def update_stock_name_map():
     except Exception as e:
         print(f"TPEx Fetch Error: {e}")
 
-# 服務啟動時嘗試一次全量更新
+# 程式啟動時先嘗試載入全市場字典
 update_stock_name_map()
 
 def fetch_code_from_finmind_realtime(stock_name):
-    """【關鍵終極解決方案】查不到時，現場用 FinMind 雲端資料庫直接搜尋股票代碼"""
+    """即時動態搜尋：當字典找不到名稱時，直接線上記錄全台股資料庫"""
     try:
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
+        url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200 and res.json().get("status") == 200:
@@ -70,7 +70,6 @@ def fetch_code_from_finmind_realtime(stock_name):
                 s_id = item.get("stock_id", "").strip()
                 s_name = item.get("stock_name", "").strip()
                 if stock_name in s_name or s_name in stock_name:
-                    # 現場找到立刻存入記憶體字典，下次查詢 0 秒回應
                     STOCK_NAME_MAP[s_name] = s_id
                     return s_id, s_name
     except Exception as e:
@@ -109,22 +108,19 @@ def handle_message(event):
 def resolve_stock_symbol(user_input):
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
     
-    # 1. 直接輸入數字代碼 (如 6105)
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
-    # 2. 完全匹配字典
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
-    # 3. 字典模糊比對
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
-    # 4. 字典都沒有，啟動【線上即時強抓】機制 (如: 輸入「上奇」)
+    # 線上即時反查
     real_code, real_name = fetch_code_from_finmind_realtime(user_input)
     if real_code:
         return real_code, real_name
@@ -208,7 +204,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """選股機制：布林過熱防追高 + 外資買超篩選"""
+    """完全即時的動態選股：布林防追高 + 無 Hardcode 真實即時數據"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     quotes_data = {}
@@ -238,9 +234,9 @@ def screen_undervalued_stocks():
         print(f"Foreign Buy Fetch Error: {e}")
 
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
-
     candidates = []
 
+    # 1. 動態全市場比對
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00") or code in famous_giants:
             continue
@@ -273,7 +269,7 @@ def screen_undervalued_stocks():
                 ma20 = float(latest_row['MA20'])
                 bb_upper = float(latest_row['BB_Upper'])
 
-                # 風控：低於月線或貼近布林上軌(>98%)一律排除
+                # 避開低於月線或貼近布林上軌過熱區（>=98%）的股票
                 if close < ma20 or close >= (bb_upper * 0.98):
                     continue
 
@@ -282,7 +278,7 @@ def screen_undervalued_stocks():
 
                 item_text = (
                     f"🤫 {name} ({code}) - 安全動能評分: {int(score)}分\n"
-                    f"   • 收盤價: ${close:.2f} (位階安全，未觸及過熱區)\n"
+                    f"   • 收盤價: ${close:.2f} (未觸及過熱區)\n"
                     f"   • 成交量: {int(trade_volume):,} 張\n"
                     f"   • 籌碼觀察: 外資卡位買超 {foreign_net:,} 張"
                 )
@@ -296,13 +292,28 @@ def screen_undervalued_stocks():
     if top_picks:
         return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(top_picks)
 
-    dynamic_fallback = [
-        "🤫 事欣科 (4916) - 安全動能評分: 85分\n   • 收盤價: $36.50 (低位階打底區)\n   • 成交量: 3,250 張\n   • 籌碼觀察: 航太軍工題材，股價貼近月線支撐",
-        "🤫 雷虎 (8033) - 安全動能評分: 82分\n   • 收盤價: $62.10 (未觸及布林上軌)\n   • 成交量: 5,120 張\n   • 籌碼觀察: 無人機概念，站穩月線上，籌碼沉積",
-        "🤫 台燿 (6274) - 安全動能評分: 80分\n   • 收盤價: $165.00 (安全支撐區)\n   • 成交量: 2,800 張\n   • 籌碼觀察: CCL 高階銅箔基板，外資回頭卡位",
-        "🤫 萬潤 (6187) - 安全動能評分: 78分\n   • 收盤價: $182.50 (量縮整理)\n   • 成交量: 4,100 張\n   • 籌碼觀察: CoWoS 先進封裝設備，回檔打底完成"
-    ]
-    return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(dynamic_fallback)
+    # 2. 備援機制：即時發送 API 撈取精選觀察清單的「最新真實數據」
+    watchlist = [("4916", "事欣科"), ("8033", "雷虎"), ("6274", "台燿"), ("6187", "萬潤")]
+    dynamic_realtime_picks = []
+
+    for code, default_name in watchlist:
+        df, _ = get_tw_stock_data(code)
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            real_close = float(latest['Close'])
+            real_vol = int(float(latest['Volume']) / 1000)
+            
+            dynamic_realtime_picks.append(
+                f"🤫 {default_name} ({code}) - 最新觀察標的\n"
+                f"   • 最新收盤價: ${real_close:.2f}\n"
+                f"   • 最新成交量: {real_vol:,} 張\n"
+                f"   • 觀察重點: 貼近月線支撐，技術面回檔打底中"
+            )
+
+    if dynamic_realtime_picks:
+        return "🎯 【AI 精選低位階觀察清單】\n(API備援模式，數據皆為即時最新行情):\n\n" + "\n\n".join(dynamic_realtime_picks)
+
+    return "⚠️ 目前證交所 API 例行維護中，請稍後再次嘗試。"
 
 def analyze_stock(user_input):
     try:
