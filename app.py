@@ -66,7 +66,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 (TWSE) + 上櫃 (TPEx) 股票名稱與代碼對照庫
+# 2. 上市 (TWSE) + 上櫃 (TPEx) 股票名稱對照庫
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -99,7 +99,7 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 技術面與籌碼數據抓取
+# 3. FinMind 數據抓取 (K線、外資、營收)
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
@@ -137,8 +137,35 @@ def get_tw_foreign_investor(stock_id):
     except Exception: pass
     return 0
 
+def get_tw_stock_revenue(stock_id):
+    try:
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == 200 and data.get("data"):
+                df = pd.DataFrame(data["data"])
+                if not df.empty:
+                    latest = df.iloc[-1]
+                    rev_date = latest.get('date', '未知')
+                    yoy = latest.get('year_ov_year_growth', 0)
+                    mom = latest.get('month_ov_month_growth', 0)
+                    yoy_val = float(yoy) if yoy is not None else 0.0
+                    mom_val = float(mom) if mom is not None else 0.0
+                    
+                    if yoy_val > 15:
+                        eval_text = "🟢 強勁成長"
+                    elif yoy_val > 0:
+                        eval_text = "🟢 穩健成長"
+                    else:
+                        eval_text = "🔴 營收衰退"
+                    return f"{rev_date} | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
+    except Exception: pass
+    return "暫無最新營收數據"
+
 # ----------------------------------------------------
-# 4. 背景慢速輪播 (30秒/檔，安全防爆，自動寫入 SQLite)
+# 4. 背景慢速輪播 (30秒/檔，安全防爆)
 # ----------------------------------------------------
 def background_stock_scanner():
     global CURRENT_INDEX, TOTAL_SCANNED, LEADERBOARD_CACHE
@@ -203,7 +230,6 @@ def background_stock_scanner():
             sorted_all = sorted(LEADERBOARD_CACHE.values(), key=lambda x: x['score'], reverse=True)
             LEADERBOARD_CACHE = {x['code']: x for x in sorted_all[:5]}
 
-            # 自動發布並保存當天歷史報告
             report = format_ai_report(list(LEADERBOARD_CACHE.values()))
             today_str = datetime.datetime.now().strftime("%Y%m%d")
             save_history_to_db(today_str, report)
@@ -234,7 +260,6 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    # 檢查是否為 8 碼日期查詢 (例如: 20260823)
     date_match = re.search(r'^(20\d{6})$', clean_keyword)
 
     if date_match:
@@ -294,7 +319,7 @@ def get_ai_selected_stocks():
     return f"🎯 【{today_str} AI 全台股背景掃描 Top 3】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 中文 / 代碼 智慧解析 (支援模糊搜尋與上市上櫃)
+# 6. 個股智慧解析 (含 MACD、布林通道、外資、營收、建議)
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
@@ -302,16 +327,13 @@ def resolve_stock_symbol(user_input):
 
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
 
-    # 4 位數代碼
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         return clean_input, name[0] if name else clean_input
 
-    # 精確中文名稱匹配
     if clean_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[clean_input], clean_input
 
-    # 模糊中文名稱匹配 (例如輸入 "力積" 可對應到 "力積電")
     for name, code in STOCK_NAME_MAP.items():
         if clean_input in name or name in clean_input:
             return code, name
@@ -330,6 +352,7 @@ def analyze_stock(user_input):
             return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後再試。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
+        revenue_info = get_tw_stock_revenue(stock_code)
 
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -390,10 +413,13 @@ def analyze_stock(user_input):
             f"量價結構:\n   {vol_status}\n"
             f"外資籌碼: {foreign_text}\n"
             f"-------------------\n"
+            f"📈 基本面與營收：\n   {revenue_info}\n"
+            f"-------------------\n"
             f"💡 操作建議：\n{signal}"
         )
     except Exception as e:
         return f"分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
+    app.run(port=5000)
     app.run(port=5000)
