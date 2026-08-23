@@ -98,7 +98,7 @@ def resolve_stock_symbol(user_input):
 
 def get_tw_stock_data(stock_id):
     """雙源備援行情機制：主源 FinMind -> 備源 yfinance"""
-    # 1. 優先試用 FinMind (精簡天數至 80 天，降低 Rate Limit)
+    # 1. 優先試用 FinMind (抓取 80 天資料)
     start_date = (datetime.datetime.now() - datetime.timedelta(days=80)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -116,7 +116,7 @@ def get_tw_stock_data(stock_id):
     except Exception:
         pass
 
-    # 2. FinMind 失敗或被限制時，無縫啟動 yfinance (自動試驗 .TW 與 .TWO)
+    # 2. FinMind 被限制或失敗時，啟動 yfinance 備援 (自動嘗試 .TW 與 .TWO)
     for suffix in [".TW", ".TWO"]:
         try:
             ticker = f"{stock_id}{suffix}"
@@ -199,7 +199,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """精簡型 AI 選股（控管在 8 檔以內，防止觸發 Rate Limit）"""
+    """冷門低位階選股策略：避開散戶當沖熱門股，鎖定溫和打底籌碼乾淨股"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     quotes_data = {}
 
@@ -216,6 +216,7 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"TWSE OpenData Error: {e}")
 
+    # 1. 剔除科技熱門板塊，避開電子當沖散戶大軍
     tech_keywords = ["半導體", "電子", "電腦", "光電", "通訊", "網通", "資訊服務", "電子零組件"]
     candidates = []
 
@@ -231,7 +232,8 @@ def screen_undervalued_stocks():
             close_val = float(info['close']) if info['close'] != '--' else 0
             vol_val = int(info['vol']) / 1000 if info['vol'].isdigit() else 0
 
-            if 10 <= close_val <= 300 and vol_val >= 800:
+            # 2. 過濾熱門爆量股：鎖定成交量 400 ~ 5000 張（籌碼乾淨，無大批散戶）
+            if 15 <= close_val <= 120 and 400 <= vol_val <= 5000:
                 candidates.append({
                     'code': code,
                     'name': info['name'] or STOCK_NAME_MAP.get(code, code),
@@ -242,43 +244,53 @@ def screen_undervalued_stocks():
         except: continue
 
     candidates.sort(key=lambda x: x['volume'], reverse=True)
-    top_targets = candidates[:8]  # 精簡為前 8 檔以節省流量
+    top_targets = candidates[:10]
 
-    results = []
+    tier1_candidates = []
+
     for item in top_targets:
         code = item['code']
         df, _ = get_tw_stock_data(code)
-        if df is None or len(df) < 15:
+        if df is None or len(df) < 20:
             continue
 
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['DIF'] = exp1 - exp2
-        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['Hist'] = df['DIF'] - df['MACD']
-
         df['MA20'] = df['Close'].rolling(window=20).mean()
-        
         latest_row = df.iloc[-1]
         close = float(latest_row['Close'])
         ma20 = float(latest_row['MA20']) if not pd.isna(latest_row['MA20']) else close
-        hist_today = float(latest_row['Hist'])
 
-        foreign_net = get_tw_foreign_investor(code)
-        foreign_str = f"外資買超 {foreign_net:,} 張" if (foreign_net and foreign_net > 0) else "外資觀望"
-        macd_status = "📉 綠柱收斂 (空方減弱)" if hist_today < 0 else "🔥 紅柱擴大 (多頭發動)"
+        # 計算與月線的乖離率
+        bias_pct = ((close - ma20) / ma20) * 100
 
-        results.append(
-            f"🤫 {item['name']} ({code}) - [{item['industry']}]\n"
-            f"   • 收盤價: ${close:.2f} (月線 ${ma20:.1f})\n"
-            f"   • MACD狀態: {macd_status}\n"
-            f"   • 籌碼動態: {foreign_str}"
+        # 3. 嚴格限縮：距離月線僅 -2% 至 +5% 之間（嚴禁追高，剛打底完成）
+        if -2.0 <= bias_pct <= 5.0:
+            foreign_net = get_tw_foreign_investor(code)
+            foreign_str = f"外資默默佈局 {foreign_net:,} 張" if (foreign_net and foreign_net > 0) else "籌碼沉澱（無散戶追捧）"
+
+            tier1_candidates.append({
+                'code': code,
+                'name': item['name'],
+                'industry': item['industry'],
+                'close': close,
+                'ma20': ma20,
+                'bias_pct': bias_pct,
+                'foreign_str': foreign_str
+            })
+
+    results = []
+    for item in tier1_candidates[:5]:
+        card = (
+            f"🤫 {item['name']} ({item['code']}) - [{item['industry']}]\n"
+            f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
+            f"   • 位階狀態: 🟢 低位階打底 (離月線僅 {item['bias_pct']:+.1f}%)\n"
+            f"   • 籌碼觀察: {item['foreign_str']}"
         )
+        results.append(card)
 
     if results:
-        return "🎯 【AI 精選低位階/非科技強勢股 Top 5】:\n\n" + "\n\n".join(results[:5])
+        return "🎯 【冷門低位階 / 籌碼乾淨精選 Top 5】:\n（無散戶過度追捧、安全不追高）\n\n" + "\n\n".join(results)
     
-    return "⚠️ 數據更新中，請稍後再試。"
+    return "⚠️ 盤面符合低位階冷門標的更新中，請稍後再試。"
 
 def analyze_stock(user_input):
     """個股完整技術分析與策略分析"""
@@ -295,7 +307,6 @@ def analyze_stock(user_input):
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
 
-        # 指標計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -330,7 +341,6 @@ def analyze_stock(user_input):
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
         is_touch_bb_upper = close >= (bb_upper * 0.98)
 
-        # 價量判斷
         if is_touch_bb_upper:
             vol_status = f"🚨 接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線過熱，切勿盲目追高！"
         elif price_change_pct > 0 and is_vol_expand:
@@ -349,7 +359,6 @@ def analyze_stock(user_input):
         else:
             foreign_text = "籌碼結算中"
 
-        # 訊號與策略建議
         if close < ma60 or diff_pct <= -3.0:
             signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走弱！"
         elif is_touch_bb_upper:
