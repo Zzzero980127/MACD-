@@ -3,6 +3,7 @@ import random
 import requests
 import pandas as pd
 import datetime
+import re
 import yfinance as yf
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -11,8 +12,8 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'oG8A/4QoXPau72qWtFOcV4Hq/Ca+EgcQoJgSMHUjbNPVjtgyGkBeTwdmqfBiEjqBbZLzUn0F70JNtdTgICSrgr T+4NysH5ayUtXj4B+06J6I2DW7BT3ruJHndDuag4zjys1CO836Jwy4fR0oDq6e7wdB04t89/1O/w1cDnyilFU=')
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a332382036072d72899c94d5b')
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -20,7 +21,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_NAME_MAP = {}
 
 def load_all_taiwan_stocks():
-    """抓取上市 (TWSE) 與上櫃 (TPEx) 官方清單"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
 
@@ -67,8 +67,12 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    if clean_keyword in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
-        reply_text = screen_undervalued_stocks()
+    # 解析是否包含指定日期（例：選股 20260820）
+    date_match = re.search(r'20\d{6}', clean_keyword)
+    target_date = date_match.group(0) if date_match else None
+
+    if "選股" in clean_keyword or "AI選股" in clean_keyword or "潛力股" in clean_keyword:
+        reply_text = screen_undervalued_stocks(target_date)
     else:
         reply_text = analyze_stock(user_input)
 
@@ -178,8 +182,8 @@ def get_tw_foreign_investor(stock_id):
     except Exception: pass
     return None
 
-def screen_undervalued_stocks():
-    """【當日固定精選 Top 5】使用日期作為隨機種子，當天點擊 100 次結果都完全一致"""
+def screen_undervalued_stocks(query_date=None):
+    """【當日固定精選 Top 5】支援歷史日期固定模擬"""
     if len(STOCK_NAME_MAP) < 1000:
         load_all_taiwan_stocks()
 
@@ -187,11 +191,10 @@ def screen_undervalued_stocks():
     if not all_stocks:
         return "⚠️ 目前連線忙碌中，請於 10 秒後重新輸入「AI選股」。"
 
-    # 使用「今天日期」設定隨機種子，確保「當天順序固定，隔天自動更新」
-    today_str = datetime.datetime.now().strftime("%Y%m%d")
-    rng = random.Random(today_str)
+    # 若未指定日期，則抓今天日期
+    date_seed = query_date if query_date else datetime.datetime.now().strftime("%Y%m%d")
+    rng = random.Random(date_seed)
     
-    # 複製並打亂清單（當天打亂結果是固定的）
     shuffled_pool = list(all_stocks)
     rng.shuffle(shuffled_pool)
 
@@ -232,11 +235,9 @@ def screen_undervalued_stocks():
         gain_1d = ((close - prev_close) / prev_close) * 100
         bias_pct = ((close - ma20) / ma20) * 100
 
-        # 防追高技術面嚴格門檻
         if (15 <= close <= 200) and (gain_5d <= 3.0) and (gain_1d <= 1.5) and (-4.0 <= bias_pct <= 1.5) and (close <= bb_upper * 0.90) and (hist_today > hist_yesterday):
             foreign_net = get_tw_foreign_investor(code)
             if foreign_net is not None and foreign_net > 0:
-                # 計算客觀綜合分數 (外資買超權重 + 股價位階低度)
                 score = (foreign_net * 0.6) + ((1.5 - bias_pct) * 20) + ((hist_today - hist_yesterday) * 50)
                 macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
                 
@@ -253,9 +254,8 @@ def screen_undervalued_stocks():
                 })
 
     if not candidates:
-        return "⚠️ 當前盤面暫無符合「低位階+未暴漲+外資買超」的固定標的。"
+        return f"⚠️ 基準日 [{date_seed}] 盤面暫無符合條件的固定標的。"
 
-    # 依照綜合評分排序，挑選當天分數最高的 Top 5
     candidates.sort(key=lambda x: x['score'], reverse=True)
     top_5 = candidates[:5]
 
@@ -271,7 +271,7 @@ def screen_undervalued_stocks():
         )
         results.append(card)
 
-    return f"🎯 【{today_str} 當日固定精選 Top {len(top_5)}】:\n\n" + "\n\n".join(results)
+    return f"🎯 【{date_seed} 精選固定 Top {len(top_5)}】:\n\n" + "\n\n".join(results)
 
 def analyze_stock(user_input):
     try:
@@ -373,4 +373,5 @@ def analyze_stock(user_input):
         return f"分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
+    app.run(port=5000)
     app.run(port=5000)
