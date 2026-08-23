@@ -8,13 +8,14 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
+# 從環境變數讀取 LINE 金鑰 (此處保留備援憑證)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'oG8A/4QoXPau72qWtFOcV4Hq/Ca+EgcQoJgSMHUjbNPVjtgyGkBeTwdmqfBiEjqBbZLzUn0F70JNtdTgICSrgr T+4NysH5ayUtXj4B+06J6I2DW7BT3ruJHndDuag4zjys1CO836Jwy4fR0oDq6e7wdB04t89/1O/w1cDnyilFU=')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a332382036072d72899c94d5b')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 本地基礎備援字典 (服務啟動時會自動抓取全市場名稱擴充)
+# 本地基礎字典 (啟動時會自動調用 API 載入全台股萬筆對照)
 STOCK_NAME_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
@@ -25,7 +26,7 @@ STOCK_NAME_MAP = {
 }
 
 def update_stock_name_map():
-    """從證交所與櫃買中心 openapi 批量更新字典"""
+    """從證交所與櫃買中心 openapi 全量更新字典"""
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
@@ -55,11 +56,11 @@ def update_stock_name_map():
     except Exception as e:
         print(f"TPEx Fetch Error: {e}")
 
-# 程式啟動時先嘗試載入全市場字典
+# 程式啟動時先載入一次全市場字典
 update_stock_name_map()
 
 def fetch_code_from_finmind_realtime(stock_name):
-    """即時動態搜尋：當字典找不到名稱時，直接線上記錄全台股資料庫"""
+    """即時線上反查：若字典找不到，現場搜尋 FinMind 資料庫並寫入字典"""
     try:
         url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -120,7 +121,7 @@ def resolve_stock_symbol(user_input):
         if user_input in name or name in user_input:
             return code, name
 
-    # 線上即時反查
+    # 字典沒有時啟動線上即時反查
     real_code, real_name = fetch_code_from_finmind_realtime(user_input)
     if real_code:
         return real_code, real_name
@@ -157,7 +158,6 @@ def get_tw_revenue(stock_id):
                 
                 rev_now = float(latest.get('revenue', 0))
                 rev_prev = float(prev.get('revenue', 0))
-                
                 mom = ((rev_now - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0
                 
                 yoy = None
@@ -204,7 +204,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """完全即時的動態選股：布林防追高 + 無 Hardcode 真實即時數據"""
+    """【全動態選股演算法】：嚴格要求站穩月線+季線，一票否決所有破位空頭股"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     quotes_data = {}
@@ -226,8 +226,7 @@ def screen_undervalued_stocks():
                 try:
                     f_buy = int(item.get("ForeignInvestorsBuy", "0").replace(",", ""))
                     f_sell = int(item.get("ForeignInvestorsSell", "0").replace(",", ""))
-                    net_shares = round((f_buy - f_sell) / 1000)
-                    foreign_buy_map[code] = net_shares
+                    foreign_buy_map[code] = round((f_buy - f_sell) / 1000)
                 except:
                     continue
     except Exception as e:
@@ -236,7 +235,7 @@ def screen_undervalued_stocks():
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
     candidates = []
 
-    # 1. 動態全市場比對
+    # 1. 全市場動態檢測
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00") or code in famous_giants:
             continue
@@ -244,7 +243,6 @@ def screen_undervalued_stocks():
         try:
             close_str = str(info.get('ClosingPrice', '0')).replace(',', '')
             vol_str = str(info.get('TradeVolume', '0')).replace(',', '')
-            
             if not close_str or close_str == '--':
                 continue
 
@@ -253,32 +251,35 @@ def screen_undervalued_stocks():
             
             if 10 <= close <= 200 and trade_volume > 1000:
                 foreign_net = foreign_buy_map.get(code, 0)
-                
                 if foreign_net <= 0:
                     continue
 
                 df, _ = get_tw_stock_data(code)
-                if df is None or len(df) < 20:
+                if df is None or len(df) < 60:  # 須有至少60交易日計算季線
                     continue
 
                 df['MA20'] = df['Close'].rolling(window=20).mean()
+                df['MA60'] = df['Close'].rolling(window=60).mean()
                 df['STD20'] = df['Close'].rolling(window=20).std()
                 df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
                 latest_row = df.iloc[-1]
                 ma20 = float(latest_row['MA20'])
+                ma60 = float(latest_row['MA60'])
                 bb_upper = float(latest_row['BB_Upper'])
 
-                # 避開低於月線或貼近布林上軌過熱區（>=98%）的股票
-                if close < ma20 or close >= (bb_upper * 0.98):
+                # 【嚴格風控門檻】：
+                # (1) 低於月線 MA20 或 低於季線 MA60 -> 淘汰
+                # (2) 股價達到布林上軌過熱區 (>=98%) -> 淘汰防追高
+                if close < ma20 or close < ma60 or close >= (bb_upper * 0.98):
                     continue
 
-                score = 70 + min(foreign_net // 50, 25)
+                score = 75 + min(foreign_net // 50, 20)
                 name = info.get('Name', code).strip()
 
                 item_text = (
                     f"🤫 {name} ({code}) - 安全動能評分: {int(score)}分\n"
-                    f"   • 收盤價: ${close:.2f} (未觸及過熱區)\n"
+                    f"   • 收盤價: ${close:.2f} (站穩月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
                     f"   • 成交量: {int(trade_volume):,} 張\n"
                     f"   • 籌碼觀察: 外資卡位買超 {foreign_net:,} 張"
                 )
@@ -290,30 +291,40 @@ def screen_undervalued_stocks():
     top_picks = [item[1] for item in candidates[:4]]
 
     if top_picks:
-        return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除布林過熱區，精選低位階+外資佈局標的):\n\n" + "\n\n".join(top_picks)
+        return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除破位股與過熱區，精選站穩雙均線+外資買超標的):\n\n" + "\n\n".join(top_picks)
 
-    # 2. 備援機制：即時發送 API 撈取精選觀察清單的「最新真實數據」
-    watchlist = [("4916", "事欣科"), ("8033", "雷虎"), ("6274", "台燿"), ("6187", "萬潤")]
+    # 2. 備援機制：動態計算觀察清單的「真實最新價格與均線狀態」
+    watchlist = [("6274", "台燿"), ("6187", "萬潤"), ("8033", "雷虎"), ("4916", "事欣科")]
     dynamic_realtime_picks = []
 
     for code, default_name in watchlist:
         df, _ = get_tw_stock_data(code)
-        if df is not None and not df.empty:
+        if df is not None and len(df) >= 60:
             latest = df.iloc[-1]
             real_close = float(latest['Close'])
             real_vol = int(float(latest['Volume']) / 1000)
             
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            df['MA60'] = df['Close'].rolling(window=60).mean()
+            ma20 = float(df.iloc[-1]['MA20'])
+            ma60 = float(df.iloc[-1]['MA60'])
+
+            if real_close < ma20 or real_close < ma60:
+                status_note = "⚠️ 跌破均線空頭修正，建議觀望"
+            else:
+                status_note = "🟢 站穩月季線，多頭結構完整"
+
             dynamic_realtime_picks.append(
-                f"🤫 {default_name} ({code}) - 最新觀察標的\n"
+                f"🤫 {default_name} ({code})\n"
                 f"   • 最新收盤價: ${real_close:.2f}\n"
                 f"   • 最新成交量: {real_vol:,} 張\n"
-                f"   • 觀察重點: 貼近月線支撐，技術面回檔打底中"
+                f"   • 技術狀態: {status_note}"
             )
 
     if dynamic_realtime_picks:
-        return "🎯 【AI 精選低位階觀察清單】\n(API備援模式，數據皆為即時最新行情):\n\n" + "\n\n".join(dynamic_realtime_picks)
+        return "🎯 【AI 精選觀察清單】\n(API備援模式 - 數據與均線均為即時真實計算):\n\n" + "\n\n".join(dynamic_realtime_picks)
 
-    return "⚠️ 目前證交所 API 例行維護中，請稍後再次嘗試。"
+    return "⚠️ 目前 API 進行例行維護中，請稍後再次嘗試。"
 
 def analyze_stock(user_input):
     try:
@@ -329,13 +340,16 @@ def analyze_stock(user_input):
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
 
+        # MACD 指標計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['Hist'] = df['DIF'] - df['MACD']
 
+        # 均線與布林通道計算 (包含季線 MA60)
         df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
@@ -346,6 +360,7 @@ def analyze_stock(user_input):
         close = float(latest['Close'])
         prev_close = float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+        ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
         prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
         bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
 
@@ -389,31 +404,35 @@ def analyze_stock(user_input):
         else:
             foreign_text = "查無即時外資數據"
 
+        # 訊號診斷邏輯
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
+        is_below_ma60 = close < ma60
 
-        if is_break_3pct or is_two_days_below:
+        if is_below_ma60 or is_break_3pct or is_two_days_below:
             reasons = []
+            if is_below_ma60:
+                reasons.append(f"跌破季線(${ma60:.1f})")
             if is_break_3pct:
-                reasons.append(f"跌破月線 {abs(diff_pct):.2f}%")
+                reasons.append(f"跌破月線{abs(diff_pct):.1f}%")
             if is_two_days_below:
                 reasons.append("連2日低於月線")
-            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，趨勢轉弱！"
+            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，走勢轉弱破位！"
 
         elif is_touch_bb_upper:
-            signal = "⚠️【嚴防追高 / 可擇優減碼】股價已推升至布林上軌極限，短線隨時有回檔拉回風險！"
+            signal = "⚠️【嚴防追高 / 可擇優減碼】股價已推升至布林上軌極限，短線隨時有拉回風險！"
 
         elif close < ma20:
             signal = "🟡【警戒觀望】微幅低於月線，趨勢偏弱，建議先觀望。"
 
         elif hist_today > 0 and hist_today >= hist_yesterday:
-            signal = "🔥【多頭續抱/加碼】強勢站穩月線且 MACD 紅柱擴大，多方控盤！"
+            signal = "🔥【多頭續抱/加碼】站穩月季線且 MACD 紅柱擴大，多方強勢控盤！"
 
         elif hist_today > 0 and hist_today < hist_yesterday:
-            signal = "🟢【偏多持有】站穩月線上，但多頭力道稍緩，建議續抱。"
+            signal = "🟢【偏多持有】站穩雙均線上，但多頭力道稍緩，建議續抱。"
 
         elif hist_today < 0 and abs(hist_today) < abs(hist_yesterday):
-            signal = "🟢【試買建倉】站穩月線且空方力道減弱，可考慮建立分批試買單。"
+            signal = "🟢【試買建倉】站穩雙均線且空方力道減弱，可考慮建立分批試買單。"
 
         else:
             signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立。"
@@ -426,6 +445,7 @@ def analyze_stock(user_input):
             f"-------------------\n"
             f"最新收盤價: {close:.2f}\n"
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
+            f"60日均線(季線): {ma60:.2f}\n"
             f"布林通道上軌: {bb_upper:.2f}\n"
             f"量價與通道結構:\n   {vol_status}\n"
             f"外資籌碼: {foreign_text}\n"
