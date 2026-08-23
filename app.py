@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import datetime
 import re
-from threading import Lock
+import json
 from flask import Flask, request, abort
 from apscheduler.schedulers.background import BackgroundScheduler
 from linebot import LineBotApi, WebhookHandler
@@ -22,26 +22,61 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 DB_FILE = 'stock_history.db'
 STOCK_NAME_MAP = {}
-LEADERBOARD_CACHE = {}
-CACHE_LOCK = Lock()
-
-TOTAL_SCANNED = 0
-CURRENT_INDEX = 0
 
 # ----------------------------------------------------
-# 1. SQLite 資料庫初始化與讀寫
+# 1. SQLite 資料庫初始化與共享存取 (解決多執行緒隔離)
 # ----------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # 歷史紀錄表
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS history (
             date TEXT PRIMARY KEY,
             content TEXT
         )
     ''')
+    # 即時背景輪播統計表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scanner_state (
+            id INTEGER PRIMARY KEY,
+            current_index INTEGER,
+            total_scanned INTEGER,
+            leaderboard_json TEXT
+        )
+    ''')
+    # 初始狀態建置
+    cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1')
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, "{}")')
+    
     conn.commit()
     conn.close()
+
+def get_scanner_state():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT current_index, total_scanned, leaderboard_json FROM scanner_state WHERE id = 1')
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0], row[1], json.loads(row[2])
+    except Exception: pass
+    return 0, 0, {}
+
+def update_scanner_state(current_index, total_scanned, leaderboard_dict):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE scanner_state 
+            SET current_index = ?, total_scanned = ?, leaderboard_json = ? 
+            WHERE id = 1
+        ''', (current_index, total_scanned, json.dumps(leaderboard_dict)))
+        conn.commit()
+        conn.close()
+    except Exception: pass
 
 def save_history_to_db(date_str, content_str):
     try:
@@ -72,7 +107,6 @@ def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=3)
@@ -84,7 +118,6 @@ def load_all_taiwan_stocks():
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception: pass
 
-    # 上櫃股票 (TPEx)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=3)
@@ -99,13 +132,13 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 數據抓取 (K線、外資、營收)
+# 3. FinMind 數據抓取 (含精準營收計算)
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -123,7 +156,7 @@ def get_tw_foreign_investor(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -139,36 +172,46 @@ def get_tw_foreign_investor(stock_id):
 
 def get_tw_stock_revenue(stock_id):
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
                 df = pd.DataFrame(data["data"])
-                if not df.empty:
-                    latest = df.iloc[-1]
-                    rev_date = latest.get('date', '未知')
-                    yoy = latest.get('year_ov_year_growth', 0)
-                    mom = latest.get('month_ov_month_growth', 0)
-                    yoy_val = float(yoy) if yoy is not None else 0.0
-                    mom_val = float(mom) if mom is not None else 0.0
+                rev_col = 'revenue' if 'revenue' in df.columns else ('revenue_month' if 'revenue_month' in df.columns else None)
+                if rev_col and len(df) >= 13:
+                    df[rev_col] = pd.to_numeric(df[rev_col], errors='coerce')
+                    df = df.dropna(subset=[rev_col])
                     
+                    latest = df.iloc[-1]
+                    prev_month = df.iloc[-2]
+                    last_year = df.iloc[-13]
+
+                    rev_latest = float(latest[rev_col])
+                    rev_prev = float(prev_month[rev_col])
+                    rev_ly = float(last_year[rev_col])
+
+                    rev_date = f"{latest.get('revenue_year', '')}/{str(latest.get('revenue_month', '')).zfill(2)}" if 'revenue_year' in latest else latest.get('date', '最新')
+
+                    yoy_val = ((rev_latest - rev_ly) / rev_ly * 100) if rev_ly > 0 else 0.0
+                    mom_val = ((rev_latest - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0.0
+
                     if yoy_val > 15:
                         eval_text = "🟢 強勁成長"
                     elif yoy_val > 0:
                         eval_text = "🟢 穩健成長"
                     else:
                         eval_text = "🔴 營收衰退"
-                    return f"{rev_date} | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
+
+                    return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
     except Exception: pass
-    return "暫無最新營收數據"
+    return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景慢速輪播 (30秒/檔，安全防爆)
+# 4. 全台股背景慢速輪播 (30秒/檔，安全存儲至 DB)
 # ----------------------------------------------------
 def background_stock_scanner():
-    global CURRENT_INDEX, TOTAL_SCANNED, LEADERBOARD_CACHE
     if len(STOCK_NAME_MAP) < 300:
         load_all_taiwan_stocks()
 
@@ -176,70 +219,70 @@ def background_stock_scanner():
     if not all_stocks:
         return
 
-    name, code = all_stocks[CURRENT_INDEX]
-    CURRENT_INDEX = (CURRENT_INDEX + 1) % len(all_stocks)
-    TOTAL_SCANNED += 1
+    curr_idx, total_scanned, leaderboard = get_scanner_state()
 
-    if code.startswith("00") or len(code) != 4:
-        return
+    name, code = all_stocks[curr_idx % len(all_stocks)]
+    next_idx = (curr_idx + 1) % len(all_stocks)
+    total_scanned += 1
 
-    df = get_tw_stock_data_finmind(code)
-    if df is None or len(df) < 20:
-        return
+    if not code.startswith("00") and len(code) == 4:
+        df = get_tw_stock_data_finmind(code)
+        if df is not None and len(df) >= 20:
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+            df['DIF'] = exp1 - exp2
+            df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+            df['Hist'] = df['DIF'] - df['MACD']
 
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = exp1 - exp2
-    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['Hist'] = df['DIF'] - df['MACD']
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
 
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
+            close = float(latest['Close'])
+            close_5d = float(five_days_ago['Close'])
+            ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
 
-    close = float(latest['Close'])
-    close_5d = float(five_days_ago['Close'])
-    ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+            hist_today = float(latest['Hist'])
+            hist_yesterday = float(prev['Hist'])
 
-    hist_today = float(latest['Hist'])
-    hist_yesterday = float(prev['Hist'])
+            gain_5d = ((close - close_5d) / close_5d) * 100
+            bias_pct = ((close - ma20) / ma20) * 100
 
-    gain_5d = ((close - close_5d) / close_5d) * 100
-    bias_pct = ((close - ma20) / ma20) * 100
+            # 精準篩選：全台股綜合評價最高前 5 名
+            if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
+                foreign_val = get_tw_foreign_investor(code)
+                score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
+                macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
 
-    if (10 <= close <= 600) and (gain_5d <= 12.0) and (-8.0 <= bias_pct <= 8.0) and (hist_today > hist_yesterday):
-        foreign_val = get_tw_foreign_investor(code)
-        score = (foreign_val * 0.6) + ((8.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
-        macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱微幅擴張"
+                leaderboard[code] = {
+                    'code': code,
+                    'name': name,
+                    'close': close,
+                    'ma20': ma20,
+                    'bias_pct': bias_pct,
+                    'gain_5d': gain_5d,
+                    'foreign_net': foreign_val,
+                    'macd_status': macd_status_text,
+                    'score': score
+                }
 
-        item = {
-            'code': code,
-            'name': name,
-            'close': close,
-            'ma20': ma20,
-            'bias_pct': bias_pct,
-            'gain_5d': gain_5d,
-            'foreign_net': foreign_val,
-            'macd_status': macd_status_text,
-            'score': score
-        }
+                # 重新動態排序，永遠保留全台股最優 Top 5
+                sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
+                leaderboard = {x['code']: x for x in sorted_list[:5]}
 
-        with CACHE_LOCK:
-            LEADERBOARD_CACHE[code] = item
-            sorted_all = sorted(LEADERBOARD_CACHE.values(), key=lambda x: x['score'], reverse=True)
-            LEADERBOARD_CACHE = {x['code']: x for x in sorted_all[:5]}
+                # 保存本日最新精選報告
+                today_str = datetime.datetime.now().strftime("%Y%m%d")
+                save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
 
-            report = format_ai_report(list(LEADERBOARD_CACHE.values()))
-            today_str = datetime.datetime.now().strftime("%Y%m%d")
-            save_history_to_db(today_str, report)
+    update_scanner_state(next_idx, total_scanned, leaderboard)
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=background_stock_scanner, trigger="interval", seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
-# 5. LINE Bot 訊息處理邏輯
+# 5. LINE Bot 處理與動態輸出
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
@@ -282,7 +325,7 @@ def handle_message(event):
 def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
     results = []
-    for item in top_stocks[:3]:
+    for item in top_stocks[:5]:
         card = (
             f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
@@ -295,31 +338,30 @@ def format_ai_report(top_stocks):
     return "\n\n".join(results)
 
 def get_ai_selected_stocks():
-    global TOTAL_SCANNED
-    with CACHE_LOCK:
-        top_stocks = list(LEADERBOARD_CACHE.values())
+    curr_idx, total_scanned, leaderboard = get_scanner_state()
+    top_stocks = list(leaderboard.values())
 
-    if TOTAL_SCANNED < 10 and not top_stocks:
-        pct = (TOTAL_SCANNED / 30) * 100
+    if total_scanned < 10 and not top_stocks:
+        pct = (total_scanned / 30) * 100
         return (
             f"⏳ 【AI 後台數據庫暖機中】\n"
             f"-------------------\n"
-            f"• 當前進度: 已掃描 {TOTAL_SCANNED} / 30 檔基本庫 ({pct:.0f}%)\n"
+            f"• 當前進度: 已掃描 {total_scanned} / 30 檔基本庫 ({pct:.0f}%)\n"
             f"• 安全機制: 30秒/檔 穩定運算中\n\n"
             f"💡 請再等待約 2~3 分鐘後重新點選「AI選股」！"
         )
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
-    scanned_info = f"(後台已累計掃描 {TOTAL_SCANNED} 檔標的)"
+    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
-        return f"🎯 【{today_str} AI 選股報告】:\n{scanned_info}\n目前掃描區域暫無符合標的，背景持續輪播中！"
+        return f"🎯 【{today_str} AI 全台股動態排名】:\n{scanned_info}\n目前掃描區域暫無符合標準標的，後台持續輪播更新中！"
 
-    return f"🎯 【{today_str} AI 全台股背景掃描 Top 3】\n{scanned_info}:\n\n" + report_content
+    return f"🎯 【{today_str} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 個股智慧解析 (含 MACD、布林通道、外資、營收、建議)
+# 6. 個股智慧解析
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
@@ -421,5 +463,4 @@ def analyze_stock(user_input):
         return f"分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(port=5000)
     app.run(port=5000)
