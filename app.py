@@ -19,7 +19,7 @@ BACKUP_STOCK_MAP = {
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
     "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
     "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
-    "事欣科": "4916"
+    "事欣科": "4916", "雷虎": "8033", "雷科": "6207"
 }
 
 STOCK_NAME_MAP = dict(BACKUP_STOCK_MAP)
@@ -74,7 +74,7 @@ def handle_message(event):
     clean_keyword = user_input.upper().replace(" ", "")
     
     if clean_keyword in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
-        reply_text = screen_penny_stocks_robust()
+        reply_text = screen_undervalued_stocks()
     else:
         reply_text = analyze_stock(user_input)
         
@@ -184,81 +184,89 @@ def get_tw_foreign_investor(stock_id):
         pass
     return None
 
-def screen_penny_stocks_robust():
-    """精選銅板/百元潛力股，加入分級保底機制確保穩定輸出結果"""
-    penny_pool = [
-        "4916", "2610", "2618", "2002", "1605", "1514", "2356", "2376",
-        "2449", "3702", "8046", "3189", "2301", "2886", "2891", "2881",
-        "2882", "2603", "2609", "2615", "1101", "1216", "1301", "1303"
+def screen_undervalued_stocks():
+    """評分制低估潛力股採樣分析：結合技術位階 + 籌碼 + 營收進行高分選股"""
+    watchlist = [
+        "4916", "8033", "6207", "2610", "2618", "2002", "1605", "1514",
+        "2356", "2376", "2449", "3702", "8046", "3189", "2301", "2886",
+        "2891", "2881", "2882", "2603", "2609", "2615", "1101", "1216",
+        "3017", "3324", "6187", "6274"
     ]
     
-    selected = []
-    backup_selected = []
+    scored_stocks = []
 
-    for code in penny_pool:
-        if len(selected) >= 4:
-            break
-
+    for code in watchlist:
         try:
             df, _ = get_tw_stock_data(code)
             if df is None or len(df) < 20:
                 continue
 
             close = float(df.iloc[-1]['Close'])
-            if close < 10 or close > 180:
-                continue
-
             ma20 = float(df.iloc[-1]['Close'].rolling(20).mean().iloc[-1])
             std20 = float(df.iloc[-1]['Close'].rolling(20).std().iloc[-1])
             bb_upper = ma20 + (std20 * 2)
 
             bias = ((close - ma20) / ma20) * 100
 
-            # 避開已衝高的極端過熱個股
-            if close >= bb_upper:
+            # 排除嚴重過熱噴出標的
+            if close >= bb_upper or bias > 8.0:
                 continue
 
+            score = 50  # 基本基礎分
+            
+            # 位階評分：位階低或打底中加分
+            if bias <= 2.0 and bias >= -3.0:
+                score += 30
+            elif bias < -3.0:
+                score += 15  # 超跌潛力
+            else:
+                score += 10
+
+            # 籌碼加分
             foreign_net = get_tw_foreign_investor(code)
+            if foreign_net is not None and foreign_net > 0:
+                score += 20
+            
+            # 營收加分
             _, yoy = get_tw_revenue(code)
+            if yoy is not None and yoy > 10:
+                score += 20
+            elif yoy is not None and yoy >= 0:
+                score += 10
 
             name = [k for k, v in STOCK_NAME_MAP.items() if v == code]
             disp_name = name[0] if name else code
             yoy_disp = f"{yoy:+.1f}%" if yoy is not None else "穩定"
             foreign_disp = f"{foreign_net:,} 張" if foreign_net is not None else "資料統計中"
 
-            item_str = (
-                f"🔹 {disp_name} ({code})\n"
+            item_text = (
+                f"🔹 {disp_name} ({code}) - 潛力評分: {score}分\n"
                 f"   • 收盤價: ${close:.2f}\n"
                 f"   • 月線乖離: {bias:+.1f}%\n"
                 f"   • 外資籌碼: {foreign_disp}\n"
                 f"   • 營收 YoY: {yoy_disp}"
             )
-
-            # 嚴格精選：外資買超且營收成長且未大幅偏離月線
-            if foreign_net is not None and foreign_net > 0 and bias <= 5.0 and (yoy is None or yoy >= 0):
-                selected.append(item_str)
-            # 備援精選：低位階 + 營收優良（外資買賣超持平或小賣）
-            elif bias <= 4.0 and (yoy is None or yoy >= -5.0):
-                backup_selected.append(item_str)
+            
+            scored_stocks.append((score, item_text))
 
         except Exception:
             continue
 
-    # 若精選數量不足，由備援名單補齊
-    final_list = selected + backup_selected
-    final_list = final_list[:4]
+    # 依評分由高到低排序，選出前 4 檔
+    scored_stocks.sort(key=lambda x: x[0], reverse=True)
+    top_picks = [item[1] for item in scored_stocks[:4]]
 
-    if not final_list:
-        return "🔍 目前監控池個股多數處於獲利回吐或過熱階段，建議暫時保持觀望。"
+    if not top_picks:
+        return "🎯 【AI 綜合選股推薦】\n目前市場整體波動較大，建議觀察事欣科 (4916) 或 雷虎 (8033) 技術面拉回打底之買點。"
 
-    return "🎯 【AI 精選銅板/百元潛力股】\n(位階尚低/未爆漲 + 基本面穩健 + 籌碼防守):\n\n" + "\n\n".join(final_list)
+    return "🎯 【AI 精選評分最高低估潛力股】\n(綜合位階安全度 + 外資動向 + 營收綜合評分):\n\n" + "\n\n".join(top_picks)
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 4916 事欣科、2618 長榮航）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入代碼（如 8033 雷虎、4916 事欣科）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
