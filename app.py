@@ -14,50 +14,33 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 基礎對照字典
-STOCK_NAME_MAP = {
-    "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
-    "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
-    "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
-    "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
-    "事欣科": "4916", "雷虎": "8033", "雷科": "6207", "環球晶": "6488", "中美晶": "5483",
-    "上奇": "6105", "長榮": "2603", "陽明": "2609", "萬海": "2615", "金居": "8358"
-}
+STOCK_NAME_MAP = {}
+STOCK_INDUSTRY_MAP = {}
 
 def load_all_taiwan_stocks():
-    """啟動時自動讀取 FinMind 與 TWSE 全台股清單"""
-    global STOCK_NAME_MAP
+    """啟動時自動讀取全台股名稱與產業別，用來過濾科技股"""
+    global STOCK_NAME_MAP, STOCK_INDUSTRY_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     try:
         url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
-        res = requests.get(url, headers=headers, timeout=6)
+        res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200 and res.json().get("status") == 200:
             for item in res.json().get("data", []):
                 s_id = str(item.get("stock_id", "")).strip()
                 s_name = str(item.get("stock_name", "")).strip()
+                s_ind = str(item.get("industry_category", "")).strip()
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
+                    STOCK_INDUSTRY_MAP[s_id] = s_ind
     except Exception as e:
         print(f"FinMind Bulk Load Error: {e}")
-
-    try:
-        url_twse = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
-        res = requests.get(url_twse, headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                s_id = str(item.get("公司代號", "")).strip()
-                s_name = str(item.get("公司簡稱", "")).strip()
-                if s_id and s_name:
-                    STOCK_NAME_MAP[s_name] = s_id
-    except Exception as e:
-        print(f"TWSE Fetch Error: {e}")
 
 load_all_taiwan_stocks()
 
 @app.route("/", methods=['GET'])
 def index():
-    return 'TW Stock Bot is running alive!'
+    return 'TW Stock Bot Active!'
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -135,7 +118,6 @@ def get_tw_revenue(stock_id):
                 rev_prev = float(prev['revenue'])
                 
                 mom = ((rev_now - rev_prev) / rev_prev) * 100
-                
                 yoy = None
                 if len(valid_df) >= 13:
                     last_year = valid_df.iloc[-13]
@@ -151,15 +133,12 @@ def get_tw_revenue(stock_id):
                     status = "🔥 優於預期 (年增雙位數)"
                 elif yoy is not None and yoy >= 0:
                     status = "🟢 符合預期 (穩健成長)"
-                elif yoy is not None:
-                    status = "🟡 稍低於預期 (衰退/放緩)"
                 else:
-                    status = "🟢 動能持平"
+                    status = "🟡 稍低於預期 (放緩/整理)"
 
                 return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}", yoy
-    except Exception as e:
-        print(f"Revenue Error: {e}")
-        
+    except Exception:
+        pass
     return "無即時營收數據", None
 
 def get_tw_foreign_investor(stock_id):
@@ -181,15 +160,14 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """全動態選股：上市+上櫃，具備 FinMind 備用機制與終極保底"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    """每日動態：非科技股優先 + 尚未起漲 + 站穩支撐 + 前 5 名推薦"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
     quotes_data = {}
-    foreign_buy_map = {}
 
-    # 1. 上市行情
+    # 1. 抓取上市行情
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res_q = requests.get(url_twse, headers=headers, timeout=3)
+        res_q = requests.get(url_twse, headers=headers, timeout=4)
         if res_q.status_code == 200 and isinstance(res_q.json(), list):
             for item in res_q.json():
                 quotes_data[item['Code']] = {
@@ -200,10 +178,10 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"TWSE Fetch Failed: {e}")
 
-    # 2. 上櫃行情
+    # 2. 抓取上櫃行情
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/t187ap05_O"
-        res_tpex = requests.get(url_tpex, headers=headers, timeout=3)
+        res_tpex = requests.get(url_tpex, headers=headers, timeout=4)
         if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
             for item in res_tpex.json():
                 code = item.get("SecuritiesCompanyCode", "").strip()
@@ -216,63 +194,38 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"TPEx Fetch Failed: {e}")
 
-    # 3. 外資買賣超 (上市)
-    try:
-        url_t86 = "https://openapi.twse.com.tw/v1/fund/T86"
-        res_f = requests.get(url_t86, headers=headers, timeout=3)
-        if res_f.status_code == 200 and isinstance(res_f.json(), list):
-            for item in res_f.json():
-                code = item.get("Code", "").strip()
-                try:
-                    b = int(item.get("ForeignInvestorsBuy", "0").replace(",", ""))
-                    s = int(item.get("ForeignInvestorsSell", "0").replace(",", ""))
-                    foreign_buy_map[code] = round((b - s) / 1000)
-                except: continue
-    except Exception as e:
-        print(f"Foreign T86 Fetch Failed: {e}")
-
-    # 4. 外資買賣超 (上櫃)
-    try:
-        url_tpex_f = "https://www.tpex.org.tw/openapi/v1/t135020"
-        res_tf = requests.get(url_tpex_f, headers=headers, timeout=3)
-        if res_tf.status_code == 200 and isinstance(res_tf.json(), list):
-            for item in res_tf.json():
-                code = item.get("SecuritiesCompanyCode", "").strip()
-                try:
-                    net = int(item.get("ForeignInvestorNetBuySell", "0").replace(",", ""))
-                    foreign_buy_map[code] = round(net / 1000)
-                except: continue
-    except Exception as e:
-        print(f"TPEx Foreign Buy Fetch Failed: {e}")
-
-    famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882"]
+    # 科技類別關鍵字（排除這些）
+    tech_keywords = ["半導體", "電子", "電腦", "光電", "通訊", "網通", "資訊服務", "電子零組件"]
+    
     candidates = []
 
     for code, info in quotes_data.items():
-        if not code.isdigit() or code.startswith("00") or code in famous_giants:
+        if not code.isdigit() or code.startswith("00"):
             continue
+            
+        industry = STOCK_INDUSTRY_MAP.get(code, "")
+        # 排除科技板塊，優先選擇非科技/傳產/金融/內需/生技等
+        if any(tech in industry for tech in tech_keywords):
+            continue
+
         try:
             close_val = float(info['close']) if info['close'] != '--' else 0
             vol_val = int(info['vol']) / 1000 if info['vol'].isdigit() else 0
-            f_net = foreign_buy_map.get(code, 0)
 
-            if 10 <= close_val <= 300 and vol_val >= 500:
+            # 篩選條件：股價 10~200 元，成交量 > 500 張
+            if 10 <= close_val <= 200 and vol_val >= 500:
                 candidates.append({
                     'code': code,
-                    'name': info['name'] or code,
+                    'name': info['name'] or STOCK_NAME_MAP.get(code, code),
                     'close': close_val,
                     'volume': vol_val,
-                    'foreign_net': f_net
+                    'industry': industry or "非科技傳產"
                 })
         except: continue
 
-    candidates.sort(key=lambda x: (x['foreign_net'], x['volume']), reverse=True)
-    top_targets = candidates[:12]
-
-    # API 無回應時之備用觀察個股
-    if not top_targets:
-        backup_codes = ["8358", "6187", "3324", "3653", "6274", "3017", "5274", "3293"]
-        top_targets = [{'code': c, 'name': STOCK_NAME_MAP.get(c, c), 'close': 0, 'volume': 0, 'foreign_net': 0} for c in backup_codes]
+    # 按成交量動態排序，取前 30 檔進技術面過濾
+    candidates.sort(key=lambda x: x['volume'], reverse=True)
+    top_targets = candidates[:30]
 
     results = []
     
@@ -283,41 +236,54 @@ def screen_undervalued_stocks():
             continue
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA60'] = df['Close'].rolling(window=60).mean()
+        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
         
         latest_row = df.iloc[-1]
         close = float(latest_row['Close'])
         ma20 = float(latest_row['MA20']) if not pd.isna(latest_row['MA20']) else close
-        ma60 = float(latest_row['MA60']) if not pd.isna(latest_row['MA60']) else close
+        bb_upper = float(latest_row['BB_Upper']) if not pd.isna(latest_row['BB_Upper']) else close
 
-        if close >= ma20:
-            name = item['name'] if item['name'] != code else STOCK_NAME_MAP.get(code, code)
-            f_text = f"買超 {item['foreign_net']:,} 張" if item['foreign_net'] > 0 else "籌碼整理中"
+        # 【核心條件：未起漲＋站穩月線】
+        # 1. 站穩月線 (close >= ma20)
+        # 2. 距離布林上軌仍有空間，非噴出狀態 (close < bb_upper * 0.96)
+        if close >= ma20 and close < (bb_upper * 0.96):
+            foreign_net = get_tw_foreign_investor(code)
             
+            f_text = "外資觀望"
+            if foreign_net is not None:
+                if foreign_net > 0:
+                    f_text = f"🔥 外資買超 {foreign_net:,} 張"
+                elif foreign_net < 0:
+                    f_text = f"📉 外資賣超 {abs(foreign_net):,} 張"
+
             card = (
-                f"🤫 {name} ({code})\n"
-                f"   • 收盤價: ${close:.2f} (月線 ${ma20:.1f} / 季線 ${ma60:.1f})\n"
-                f"   • 外資動態: {f_text}"
+                f"🤫 {item['name']} ({code}) - [{item['industry']}]\n"
+                f"   • 收盤價: ${close:.2f} (月線 ${ma20:.1f})\n"
+                f"   • 位階狀態: 底部打底完成，尚未過熱噴出\n"
+                f"   • 籌碼動態: {f_text}"
             )
             results.append(card)
-            if len(results) >= 4:
+            
+            # 精確取前 5 名最優潛力標的
+            if len(results) >= 5:
                 break
 
     if results:
-        return "🎯 【AI 上市+上櫃黑馬即時掃描】\n(精選站穩月線與動能指標標的):\n\n" + "\n\n".join(results)
+        return "🎯 【AI 盤後低位階/非科技黑馬 Top 5】\n(排除漲多過熱標的 + 精選底部起漲熱點):\n\n" + "\n\n".join(results)
     
-    return "🎯 【AI 盤後焦點觀察標的】:\n\n🤫 金居 (8358)\n   • 趨勢：站穩月線多頭軌道\n\n🤫 萬潤 (6187)\n   • 趨勢：半導體設備籌碼加碼"
+    return "⚠️ 盤後掃描中或今日未有符合「低位階+安全打底」之非科技標的，建議觀望。"
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 8358 金居、2330 台積電）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以輸入名稱或代碼（如 2603 長榮、8358 金居）查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
-            return f"找不到代碼 [{stock_code}] 的台股價格數據，請確認代碼是否正確。"
+            return f"找不到代碼 [{stock_code}] 的數據，請確認輸入是否正確。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
@@ -341,7 +307,6 @@ def analyze_stock(user_input):
         prev_close = float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
         ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
-        prev_ma20 = float(prev['MA20']) if not pd.isna(prev['MA20']) else prev_close
         bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
 
         hist_today = float(latest['Hist'])
@@ -353,68 +318,38 @@ def analyze_stock(user_input):
         vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
         
         price_change_pct = ((close - prev_close) / prev_close) * 100
-        is_price_up = price_change_pct > 0
-        is_price_down = price_change_pct < 0
-
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
-
         is_touch_bb_upper = close >= (bb_upper * 0.98)
 
         if is_touch_bb_upper:
-            vol_status = f"🚨 股價接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線極端過熱，極易引發獲利賣壓，【切勿追高】！"
-        elif is_price_up and is_vol_expand:
-            vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈，追價意願高"
-        elif is_price_down and is_vol_expand:
-            vol_status = f"📉 下跌放量 ({price_change_pct:.1f}%)\n   👉 恐慌盤湧出/大戶拋售，注意續跌風險"
-        elif is_price_up and is_vol_shrink:
-            vol_status = f"⚠️ 上漲量縮 (+{price_change_pct:.1f}%)\n   👉 量價背離！買盤停滯，需防範【見頂回落】"
-        elif is_price_down and is_vol_shrink:
-            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂/惜售，極可能接近【見底反彈】"
+            vol_status = f"🚨 接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n   👉 短線極端過熱，切勿盲目追高！"
+        elif price_change_pct > 0 and is_vol_expand:
+            vol_status = f"🔥 上漲放量 (+{price_change_pct:.1f}%)\n   👉 多頭攻擊強烈"
+        elif price_change_pct < 0 and is_vol_expand:
+            vol_status = f"📉 下跌放量 ({price_change_pct:.1f}%)\n   👉 注意大戶賣壓與續跌風險"
+        elif price_change_pct > 0 and is_vol_shrink:
+            vol_status = f"⚠️ 上漲量縮 (+{price_change_pct:.1f}%)\n   👉 量價背離，提防高位拉回"
+        elif price_change_pct < 0 and is_vol_shrink:
+            vol_status = f"🛡️ 下跌量縮 ({price_change_pct:.1f}%)\n   👉 賣壓沉寂，容易迎來止跌反彈"
         else:
-            vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)\n   👉 量能無明顯變化"
+            vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)"
 
         if foreign_net is not None:
-            if foreign_net > 0:
-                foreign_text = f"買超 {foreign_net:,} 張"
-            elif foreign_net < 0:
-                foreign_text = f"賣超 {abs(foreign_net):,} 張"
-            else:
-                foreign_text = "買賣超 0 張"
+            foreign_text = f"買超 {foreign_net:,} 張" if foreign_net > 0 else (f"賣超 {abs(foreign_net):,} 張" if foreign_net < 0 else "買賣超 0 張")
         else:
             foreign_text = "查無即時外資數據"
 
-        is_break_3pct = diff_pct <= -3.0
-        is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
-        is_below_ma60 = close < ma60
-
-        if is_below_ma60 or is_break_3pct or is_two_days_below:
-            reasons = []
-            if is_below_ma60:
-                reasons.append(f"跌破季線(${ma60:.1f})")
-            if is_break_3pct:
-                reasons.append(f"跌破月線{abs(diff_pct):.1f}%")
-            if is_two_days_below:
-                reasons.append("連2日低於月線")
-            signal = f"🔴【建議出場/停損】{' & '.join(reasons)}，走勢轉弱破位！"
-
+        if close < ma60 or diff_pct <= -3.0:
+            signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走弱！"
         elif is_touch_bb_upper:
-            signal = "⚠️【嚴防追高 / 可擇優減碼】股價已推升至布林上軌極限，短線隨時有拉回風險！"
-
-        elif close < ma20:
-            signal = "🟡【警戒觀望】微幅低於月線，趨勢偏弱，建議先觀望。"
-
-        elif hist_today > 0 and hist_today >= hist_yesterday:
-            signal = "🔥【多頭續抱/加碼】站穩月季線且 MACD 紅柱擴大，多方強勢控盤！"
-
-        elif hist_today > 0 and hist_today < hist_yesterday:
-            signal = "🟢【偏多持有】站穩雙均線上，但多頭力道稍緩，建議續抱。"
-
-        elif hist_today < 0 and abs(hist_today) < abs(hist_yesterday):
-            signal = "🟢【試買建倉】站穩雙均線且空方力道減弱，可考慮建立分批試買單。"
-
+            signal = "⚠️【擇優減碼】股價推升至布林上軌過熱區，注意拉回。"
+        elif close >= ma20 and hist_today > 0 and hist_today >= hist_yesterday:
+            signal = "🔥【多頭控盤】站穩均線且 MACD 紅柱擴力，可持股或分批佈局。"
+        elif close >= ma20:
+            signal = "🟢【偏多觀察】站穩月線軌道，走勢穩健。"
         else:
-            signal = "⚪【盤整觀望】多空力道均衡，建議靜待方向確立。"
+            signal = "⚪【觀望為主】多空方向未定。"
 
         pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"跌破月線 {abs(diff_pct):.2f}%"
         title_display = f"{display_name} ({stock_code})" if display_name != stock_code else target_symbol
@@ -426,7 +361,7 @@ def analyze_stock(user_input):
             f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
             f"60日均線(季線): {ma60:.2f}\n"
             f"布林通道上軌: {bb_upper:.2f}\n"
-            f"量價與通道結構:\n   {vol_status}\n"
+            f"量價結構:\n   {vol_status}\n"
             f"外資籌碼: {foreign_text}\n"
             f"-------------------\n"
             f"📈 基本面與營收：\n"
