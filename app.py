@@ -27,27 +27,30 @@ STOCK_NAME_MAP = {}
 # 1. SQLite 資料庫初始化與操作
 # ----------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS history (
-            date TEXT PRIMARY KEY,
-            content TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS scanner_state (
-            id INTEGER PRIMARY KEY,
-            current_index INTEGER,
-            total_scanned INTEGER,
-            leaderboard_json TEXT
-        )
-    ''')
-    cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1')
-    if cursor.fetchone()[0] == 0:
-        cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, "{}")')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+                date TEXT PRIMARY KEY,
+                content TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scanner_state (
+                id INTEGER PRIMARY KEY,
+                current_index INTEGER,
+                total_scanned INTEGER,
+                leaderboard_json TEXT
+            )
+        ''')
+        cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1')
+        if cursor.fetchone()[0] == 0:
+            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, "{}")')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
 
 def get_scanner_state():
     try:
@@ -139,7 +142,7 @@ def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -158,7 +161,7 @@ def get_tw_foreign_investor(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -177,7 +180,7 @@ def get_tw_stock_revenue(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -213,7 +216,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. Cron 驅動掃描 API (由 UptimeRobot 觸發)
+# 4. 掃描執行邏輯
 # ----------------------------------------------------
 def scan_one_stock():
     try:
@@ -222,7 +225,7 @@ def scan_one_stock():
 
         all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
         if not all_stocks:
-            return "No stocks available"
+            return "No stocks"
 
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
@@ -276,21 +279,24 @@ def scan_one_stock():
         today_str = datetime.datetime.now().strftime("%Y%m%d")
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
         update_scanner_state(next_idx, total_scanned + 1, leaderboard)
-        return f"Scanned: {name}({code}), Total: {total_scanned + 1}"
+        return f"OK: {name}({code}) | Total: {total_scanned + 1}"
 
     except Exception as e:
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
-        return f"Error: {str(e)}"
+        return f"Err: {str(e)}"
 
 # ----------------------------------------------------
-# 5. LINE Bot & Routes
+# 5. LINE Bot & Web Routes
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    # 只要存取首頁，就觸發一次股票掃描！
-    res_msg = scan_one_stock()
-    return f"TW Stock Bot Active! [{res_msg}]"
+    return "TW Stock Bot Active!"
+
+@app.route("/scan", methods=['GET'])
+def trigger_scan():
+    res = scan_one_stock()
+    return res
 
 @app.route("/callback", methods=['POST'])
 def callback():
