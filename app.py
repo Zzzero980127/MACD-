@@ -16,47 +16,41 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a33238203607
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-STOCK_NAME_MAP = {}
-STOCK_INDUSTRY_MAP = {}
+# 基礎對照庫 (秒讀常備清單)
+STATIC_STOCK_MAP = {
+    "寶德": "3349", "大恭": "4706", "陽明": "2609", "長榮": "2603", "萬海": "2615",
+    "華邦電": "2344", "力積電": "6770", "台積電": "2330", "聯電": "2303", "鴻海": "2317",
+    "潤泰全": "2915", "潤泰材": "8463", "廣達": "2382", "緯創": "3231", "技嘉": "2376"
+}
+
+STOCK_NAME_MAP = STATIC_STOCK_MAP.copy()
 
 def load_all_taiwan_stocks():
-    """完整載入上市與上櫃股票名稱與產業（修正上櫃抓取失敗問題）"""
-    global STOCK_NAME_MAP, STOCK_INDUSTRY_MAP
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    """啟動時載入全台股上市與上櫃股票"""
+    global STOCK_NAME_MAP
+    headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # 1. 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=5)
+        res = requests.get(url_twse, headers=headers, timeout=4)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
                 s_name = str(item.get("Name", "")).strip()
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
-    except Exception as e:
-        print(f"TWSE Load Error: {e}")
+    except Exception: pass
 
-    # 2. 上櫃股票 (TPEx) - 備用多重 API 源確保精準抓取
-    tpex_urls = [
-        "https://www.tpex.org.tw/openapi/v1/mopsfront/t187ap03_O",
-        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-    ]
-    for url in tpex_urls:
-        try:
-            res_tpex = requests.get(url, headers=headers, timeout=5)
-            if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
-                for item in res_tpex.json():
-                    s_id = str(item.get("SecuritiesCompanyCode") or item.get("Date") or item.get("SecuritiesCode") or "").strip()
-                    s_name = str(item.get("CompanyName") or item.get("CompanyName") or item.get("SecuritiesName") or "").strip()
-                    s_ind = str(item.get("IndustryCharacter", "")).strip()
-                    
-                    if s_id and s_name and len(s_id) == 4 and s_id.isdigit():
-                        STOCK_NAME_MAP[s_name] = s_id
-                        if s_ind:
-                            STOCK_INDUSTRY_MAP[s_id] = s_ind
-        except Exception as e:
-            print(f"TPEx Load Error ({url}): {e}")
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
+        res_tpex = requests.get(url_tpex, headers=headers, timeout=4)
+        if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
+            for item in res_tpex.json():
+                s_id = str(item.get("SecuritiesCompanyCode") or item.get("SecuritiesCode") or "").strip()
+                s_name = str(item.get("CompanyName") or item.get("SecuritiesName") or "").strip()
+                if s_id and s_name and len(s_id) == 4 and s_id.isdigit():
+                    STOCK_NAME_MAP[s_name] = s_id
+    except Exception: pass
 
 load_all_taiwan_stocks()
 
@@ -90,70 +84,62 @@ def handle_message(event):
     )
 
 def resolve_stock_symbol(user_input):
-    """強效股票名稱與代碼解析"""
+    """強效股票解析邏輯（字典 -> 模糊搜尋 -> Yahoo 在線自動查號）"""
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
-    
-    # 若輸入純數字代碼
+
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
-    # 精準匹配名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
-    # 模糊匹配名稱（包含關鍵字）
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
-    # 完全找不到時返回原始輸入，讓後續 API 嘗試查詢
+    try:
+        search_url = f"https://query1.finance.yahoo.com/v1/finance/search?q={user_input}&quotesCount=1"
+        res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
+        if res.status_code == 200:
+            quotes = res.json().get('quotes', [])
+            if quotes:
+                symbol = quotes[0].get('symbol', '')
+                code = symbol.split('.')[0]
+                if code.isdigit():
+                    STOCK_NAME_MAP[user_input] = code
+                    return code, user_input
+    except Exception: pass
+
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
-    """雙數據源：FinMind -> yfinance (.TW 上市與 .TWO 上櫃)"""
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    """歷史股價數據（支援上櫃 .TWO 與上市 .TW）"""
+    if not stock_id.isdigit():
+        return None, stock_id
 
-    try:
-        res = requests.get(url, headers=headers, timeout=2)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("status") == 200 and len(data.get("data", [])) >= 15:
-                df = pd.DataFrame(data["data"])
-                df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-                df['Close'] = df['Close'].astype(float)
-                df['Volume'] = df['Volume'].astype(float)
-                return df, f"{stock_id}"
-    except Exception:
-        pass
-
-    # yfinance 備援機制：自動嘗試上市 (.TW) 及上櫃 (.TWO)
-    for suffix in [".TW", ".TWO"]:
+    for suffix in [".TWO", ".TW"]:
         try:
             ticker = f"{stock_id}{suffix}"
             yf_obj = yf.Ticker(ticker)
             df = yf_obj.history(period="3m")
-            if not df.empty and len(df) >= 15:
+            if not df.empty and len(df) >= 30:
                 df = df.reset_index()
                 df = df.rename(columns={'Close': 'Close', 'Volume': 'Volume'})
                 df['Close'] = df['Close'].astype(float)
                 df['Volume'] = df['Volume'].astype(float)
                 return df, ticker
-        except Exception:
-            continue
+        except Exception: continue
 
     return None, stock_id
 
 def get_tw_revenue(stock_id):
-    """取得基本面月營收狀況"""
+    """月營收數據"""
     start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        res = requests.get(url, headers=headers, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -179,25 +165,17 @@ def get_tw_revenue(stock_id):
                     mom_str = f"{mom:+.2f}%"
                     yoy_str = f"{yoy:+.2f}%" if yoy is not None else "計算中"
 
-                    if yoy is not None and yoy > 10:
-                        status = "🔥 優於預期 (年增雙位數)"
-                    elif yoy is not None and yoy >= 0:
-                        status = "🟢 符合預期 (穩健成長)"
-                    else:
-                        status = "🟡 稍低於預期 (放緩/整理)"
-
+                    status = "🟢 穩健成長" if (yoy and yoy > 0) else "🟡 整理/調整中"
                     return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}", yoy
-    except Exception:
-        pass
-    return "數據結算中/暫無資料", None
+    except Exception: pass
+    return "數據更新中", None
 
 def get_tw_foreign_investor(stock_id):
-    """外資買賣超統計"""
+    """外資買賣超數據"""
     start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        res = requests.get(url, headers=headers, timeout=2)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -208,110 +186,118 @@ def get_tw_foreign_investor(stock_id):
                     day_data = foreign_df[foreign_df['date'] == latest_date]
                     net_shares = day_data['buy'].sum() - day_data['sell'].sum()
                     return round(net_shares / 1000)
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def screen_undervalued_stocks():
-    """冷門低位階選股策略"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    quotes_data = {}
+    """【專屬 AI 選股】防追高 + MACD空方衰退(含綠柱縮短/紅柱擴張) + 外資買超"""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    quotes_data = []
 
+    # 1. 抓取大盤當日資訊庫
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res_q = requests.get(url_twse, headers=headers, timeout=3)
-        if res_q.status_code == 200 and isinstance(res_q.json(), list):
-            for item in res_q.json():
-                quotes_data[item['Code']] = {
-                    'name': item.get('Name', '').strip(),
-                    'close': str(item.get('ClosingPrice', '0')).replace(',', ''),
-                    'vol': str(item.get('TradeVolume', '0')).replace(',', '')
-                }
-    except Exception as e:
-        print(f"TWSE OpenData Error: {e}")
+        res = requests.get(url_twse, headers=headers, timeout=4)
+        if res.status_code == 200 and isinstance(res.json(), list):
+            for item in res.json():
+                code = str(item.get('Code', '')).strip()
+                name = str(item.get('Name', '')).strip()
+                close_str = str(item.get('ClosingPrice', '0')).replace(',', '')
+                vol_str = str(item.get('TradeVolume', '0')).replace(',', '')
 
-    tech_keywords = ["半導體", "電子", "光電", "通訊", "網通"]
-    candidates = []
+                if code.isdigit() and not code.startswith("00") and close_str != '--':
+                    close_val = float(close_str)
+                    vol_val = int(vol_str) / 1000 if vol_str.isdigit() else 0
 
-    for code, info in quotes_data.items():
-        if not code.isdigit() or code.startswith("00"):
-            continue
+                    if 15 <= close_val <= 150 and 300 <= vol_val <= 8000:
+                        quotes_data.append({'code': code, 'name': name, 'close': close_val})
+    except Exception: pass
 
-        industry = STOCK_INDUSTRY_MAP.get(code, "")
-        if any(tech in industry for tech in tech_keywords):
-            continue
-
-        try:
-            close_val = float(info['close']) if info['close'] != '--' else 0
-            vol_val = int(info['vol']) / 1000 if info['vol'].isdigit() else 0
-
-            if 15 <= close_val <= 120 and 400 <= vol_val <= 5000:
-                candidates.append({
-                    'code': code,
-                    'name': info['name'] or STOCK_NAME_MAP.get(code, code),
-                    'close': close_val,
-                    'volume': vol_val,
-                    'industry': industry or "一般產業"
-                })
-        except: continue
-
-    candidates.sort(key=lambda x: x['volume'], reverse=True)
-    top_targets = candidates[:10]
+    # 2. 備用檢測庫 (降級機制)
+    if not quotes_data:
+        backup_codes = ["2915", "8463", "1717", "1722", "2501", "1402", "3349", "4706", "2609", "2344"]
+        for c in backup_codes:
+            quotes_data.append({'code': c, 'name': STOCK_NAME_MAP.get(c, c), 'close': 50})
 
     tier1_candidates = []
 
-    for item in top_targets:
+    for item in quotes_data:
         code = item['code']
         df, _ = get_tw_stock_data(code)
-        if df is None or len(df) < 20:
+        if df is None or len(df) < 30:
             continue
 
+        # 計算均線與 MACD
         df['MA20'] = df['Close'].rolling(window=20).mean()
-        latest_row = df.iloc[-1]
-        close = float(latest_row['Close'])
-        ma20 = float(latest_row['MA20']) if not pd.isna(latest_row['MA20']) else close
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = exp1 - exp2
+        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['DIF'] - df['MACD']
 
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        close = float(latest['Close'])
+        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+        hist_today = float(latest['Hist'])
+        hist_yesterday = float(prev['Hist'])
+
+        # 核心條件 1：防追高（離月線乖離率在 -4% ~ +4%）
         bias_pct = ((close - ma20) / ma20) * 100
+        is_safe_price = (-4.0 <= bias_pct <= 4.0)
 
-        if -2.0 <= bias_pct <= 5.0:
+        # 核心條件 2：MACD 柱狀體上升（今天 > 昨天，不論綠柱縮短或紅柱擴長，均代表空方力道減退）
+        is_macd_improving = (hist_today > hist_yesterday)
+
+        if is_safe_price and is_macd_improving:
+            # 核心條件 3：外資買超 (> 0 張)
             foreign_net = get_tw_foreign_investor(code)
-            foreign_str = f"外資默默佈局 {foreign_net:,} 張" if (foreign_net and foreign_net > 0) else "籌碼沉澱（無散戶追捧）"
+            if foreign_net is not None and foreign_net > 0:
+                stock_name = item['name'] if item['name'] != code else STOCK_NAME_MAP.get(code, code)
+                macd_status_text = "綠柱縮短（空方衰退）" if hist_today < 0 else "紅柱擴張（多頭轉強）"
 
-            tier1_candidates.append({
-                'code': code,
-                'name': item['name'],
-                'industry': item['industry'],
-                'close': close,
-                'ma20': ma20,
-                'bias_pct': bias_pct,
-                'foreign_str': foreign_str
-            })
+                tier1_candidates.append({
+                    'code': code,
+                    'name': stock_name,
+                    'close': close,
+                    'ma20': ma20,
+                    'bias_pct': bias_pct,
+                    'foreign_net': foreign_net,
+                    'macd_status': macd_status_text
+                })
+
+        if len(tier1_candidates) >= 5:
+            break
 
     results = []
-    for item in tier1_candidates[:5]:
+    for item in tier1_candidates:
         card = (
-            f"🤫 {item['name']} ({item['code']}) - [{item['industry']}]\n"
+            f"🤫 {item['name']} ({item['code']})\n"
             f"   • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
-            f"   • 位階狀態: 🟢 低位階打底 (離月線僅 {item['bias_pct']:+.1f}%)\n"
-            f"   • 籌碼觀察: {item['foreign_str']}"
+            f"   • 位階狀態: 🟢 低位階打底 (離月線僅 {item['bias_pct']:+.1f}%，防追高)\n"
+            f"   • 指標狀態: 🛡️ MACD {item['macd_status']}\n"
+            f"   • 籌碼觀察: 🎯 外資進場買超 {item['foreign_net']:,} 張"
         )
         results.append(card)
 
     if results:
-        return "🎯 【冷門低位階 / 籌碼乾淨精選 Top 5】:\n（無散戶過度追捧、安全不追高）\n\n" + "\n\n".join(results)
+        return "🎯 【嚴選低位階 + 空方衰退/多頭轉強 + 外資買超 Top 5】:\n\n" + "\n\n".join(results)
 
-    return "⚠️ 盤面符合低位階冷門標的更新中，請稍後再試。"
+    return "⚠️ 盤面尚未掃描出同時符合「低位階打底 + MACD空方衰退 + 外資買超」的標的，請稍後再試。"
 
 def analyze_stock(user_input):
-    """個股完整技術與籌碼分析"""
+    """個股分析主邏輯"""
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
-        # 嘗試取得數據
+        if not stock_code.isdigit():
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以嘗試直接輸入代碼（如 3349 寶德、4706 大恭）查詢。"
+
         df, target_symbol = get_tw_stock_data(stock_code)
-        
+
         if df is None or df.empty:
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以輸入代碼（如 3349、4706）或精準名稱查詢。"
+            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後再試。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
@@ -372,8 +358,8 @@ def analyze_stock(user_input):
             signal = "🔴【建議出場/觀望】跌破關鍵支撐或均線走弱！"
         elif is_touch_bb_upper:
             signal = "⚠️【擇優減碼】股價推升至布林上軌過熱區，注意拉回。"
-        elif close >= ma20 and hist_today > 0 and hist_today >= hist_yesterday:
-            signal = "🔥【多頭控盤】站穩均線且 MACD 紅柱擴力，可持股或分批佈局。"
+        elif close >= ma20 and hist_today > hist_yesterday:
+            signal = "🔥【多頭控盤】站穩均線且 MACD 柱狀體升高，可持股或分批佈局。"
         elif close >= ma20:
             signal = "🟢【偏多觀察】站穩月線軌道，走勢穩健。"
         else:
