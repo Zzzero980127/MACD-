@@ -8,29 +8,39 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 從環境變數讀取 LINE 金鑰 (此處保留備援憑證)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', 'oG8A/4QoXPau72qWtFOcV4Hq/Ca+EgcQoJgSMHUjbNPVjtgyGkBeTwdmqfBiEjqBbZLzUn0F70JNtdTgICSrgr T+4NysH5ayUtXj4B+06J6I2DW7BT3ruJHndDuag4zjys1CO836Jwy4fR0oDq6e7wdB04t89/1O/w1cDnyilFU=')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '87cb520a332382036072d72899c94d5b')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 本地基礎字典 (啟動時會自動調用 API 載入全台股萬筆對照)
+# 基礎對照字典
 STOCK_NAME_MAP = {
     "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "富邦金": "2881", "國泰金": "2882",
     "廣達": "2382", "緯創": "3231", "華航": "2610", "長榮航": "2618", "健策": "3653",
     "寶雅": "5904", "信驊": "5274", "鈊象": "3293", "雙鴻": "3324", "奇鋐": "3017",
     "萬潤": "6187", "台燿": "6274", "聯詠": "3034", "世芯": "3661", "創意": "3443",
     "事欣科": "4916", "雷虎": "8033", "雷科": "6207", "環球晶": "6488", "中美晶": "5483",
-    "上奇": "6105", "長榮": "2603", "陽明": "2609", "萬海": "2615"
+    "上奇": "6105", "長榮": "2603", "陽明": "2609", "萬海": "2615", "金居": "8358"
 }
 
-def update_stock_name_map():
-    """從證交所與櫃買中心 openapi 全量更新字典"""
+def load_all_taiwan_stocks():
+    """啟動時自動讀取 FinMind 與 TWSE 全台股清單，載入全市場股票代碼"""
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 1. 上市公司
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
+        res = requests.get(url, headers=headers, timeout=6)
+        if res.status_code == 200 and res.json().get("status") == 200:
+            for item in res.json().get("data", []):
+                s_id = str(item.get("stock_id", "")).strip()
+                s_name = str(item.get("stock_name", "")).strip()
+                if s_id and s_name:
+                    STOCK_NAME_MAP[s_name] = s_id
+    except Exception as e:
+        print(f"FinMind Bulk Load Error: {e}")
+
     try:
         url_twse = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -43,39 +53,7 @@ def update_stock_name_map():
     except Exception as e:
         print(f"TWSE Fetch Error: {e}")
 
-    # 2. 上櫃公司
-    try:
-        url_tpex = "https://www.tpex.org.tw/openapi/v1/mops_t187ap03_O"
-        res = requests.get(url_tpex, headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                s_id = str(item.get("公司代號", "")).strip()
-                s_name = str(item.get("公司簡稱", "")).strip()
-                if s_id and s_name:
-                    STOCK_NAME_MAP[s_name] = s_id
-    except Exception as e:
-        print(f"TPEx Fetch Error: {e}")
-
-# 程式啟動時先載入一次全市場字典
-update_stock_name_map()
-
-def fetch_code_from_finmind_realtime(stock_name):
-    """即時線上反查：若字典找不到，現場搜尋 FinMind 資料庫並寫入字典"""
-    try:
-        url = "https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200 and res.json().get("status") == 200:
-            stock_list = res.json().get("data", [])
-            for item in stock_list:
-                s_id = item.get("stock_id", "").strip()
-                s_name = item.get("stock_name", "").strip()
-                if stock_name in s_name or s_name in stock_name:
-                    STOCK_NAME_MAP[s_name] = s_id
-                    return s_id, s_name
-    except Exception as e:
-        print(f"FinMind Realtime Search Error: {e}")
-    return None, None
+load_all_taiwan_stocks()
 
 @app.route("/", methods=['GET'])
 def index():
@@ -121,11 +99,6 @@ def resolve_stock_symbol(user_input):
         if user_input in name or name in user_input:
             return code, name
 
-    # 字典沒有時啟動線上即時反查
-    real_code, real_name = fetch_code_from_finmind_realtime(user_input)
-    if real_code:
-        return real_code, real_name
-
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
@@ -145,6 +118,7 @@ def get_tw_stock_data(stock_id):
     return None, stock_id
 
 def get_tw_revenue(stock_id):
+    """營收計算邏輯：過濾無效與空值資料，防止 API 欄位缺失導致轉型除以零錯誤"""
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date=2024-01-01"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -152,24 +126,30 @@ def get_tw_revenue(stock_id):
         data = res.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
-            if len(df) >= 2:
-                latest = df.iloc[-1]
-                prev = df.iloc[-2]
+            
+            # 清洗資料：強制轉為數值，過濾掉小於等於 0 的無效數據
+            df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+            valid_df = df[df['revenue'] > 0].copy()
+            
+            if len(valid_df) >= 2:
+                latest = valid_df.iloc[-1]
+                prev = valid_df.iloc[-2]
                 
-                rev_now = float(latest.get('revenue', 0))
-                rev_prev = float(prev.get('revenue', 0))
-                mom = ((rev_now - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0
+                rev_now = float(latest['revenue'])
+                rev_prev = float(prev['revenue'])
+                
+                mom = ((rev_now - rev_prev) / rev_prev) * 100
                 
                 yoy = None
-                if len(df) >= 13:
-                    last_year = df.iloc[-13]
-                    rev_ly = float(last_year.get('revenue', 0))
+                if len(valid_df) >= 13:
+                    last_year = valid_df.iloc[-13]
+                    rev_ly = float(last_year['revenue'])
                     if rev_ly > 0:
-                        yoy = (rev_now - rev_ly) / rev_ly * 100
+                        yoy = ((rev_now - rev_ly) / rev_ly) * 100
 
                 month_str = f"{latest.get('revenue_year')}/{latest.get('revenue_month')}月"
                 mom_str = f"{mom:+.2f}%"
-                yoy_str = f"{yoy:+.2f}%" if yoy is not None else "資料計算中"
+                yoy_str = f"{yoy:+.2f}%" if yoy is not None else "計算中"
 
                 if yoy is not None and yoy > 10:
                     status = "🔥 優於預期 (年增雙位數)"
@@ -181,8 +161,9 @@ def get_tw_revenue(stock_id):
                     status = "🟢 動能持平"
 
                 return f"{month_str} | YoY: {yoy_str} | MoM: {mom_str}\n   評價: {status}", yoy
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Revenue Processing Error for {stock_id}: {e}")
+        
     return "無即時營收數據", None
 
 def get_tw_foreign_investor(stock_id):
@@ -204,7 +185,6 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """【全動態選股演算法】：嚴格要求站穩月線+季線，一票否決所有破位空頭股"""
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     quotes_data = {}
@@ -235,7 +215,6 @@ def screen_undervalued_stocks():
     famous_giants = ["2330", "2317", "2454", "2382", "3231", "2603", "2609", "2615", "2881", "2882", "2886", "2002"]
     candidates = []
 
-    # 1. 全市場動態檢測
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00") or code in famous_giants:
             continue
@@ -255,7 +234,7 @@ def screen_undervalued_stocks():
                     continue
 
                 df, _ = get_tw_stock_data(code)
-                if df is None or len(df) < 60:  # 須有至少60交易日計算季線
+                if df is None or len(df) < 60:
                     continue
 
                 df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -268,9 +247,7 @@ def screen_undervalued_stocks():
                 ma60 = float(latest_row['MA60'])
                 bb_upper = float(latest_row['BB_Upper'])
 
-                # 【嚴格風控門檻】：
-                # (1) 低於月線 MA20 或 低於季線 MA60 -> 淘汰
-                # (2) 股價達到布林上軌過熱區 (>=98%) -> 淘汰防追高
+                # 風控邏輯：跌破月線/季線，或觸及布林過熱區一律排除
                 if close < ma20 or close < ma60 or close >= (bb_upper * 0.98):
                     continue
 
@@ -291,10 +268,9 @@ def screen_undervalued_stocks():
     top_picks = [item[1] for item in candidates[:4]]
 
     if top_picks:
-        return "🎯 【AI 全市場黑馬即時掃描】\n(已剔除破位股與過熱區，精選站穩雙均線+外資買超標的):\n\n" + "\n\n".join(top_picks)
+        return "🎯 【AI 全市場黑馬即時掃描】\n(已過濾破位股與過熱區，精選站穩雙均線+外資買超標的):\n\n" + "\n\n".join(top_picks)
 
-    # 2. 備援機制：動態計算觀察清單的「真實最新價格與均線狀態」
-    watchlist = [("6274", "台燿"), ("6187", "萬潤"), ("8033", "雷虎"), ("4916", "事欣科")]
+    watchlist = [("6274", "台燿"), ("6187", "萬潤"), ("8033", "雷虎"), ("3441", "聯一光")]
     dynamic_realtime_picks = []
 
     for code, default_name in watchlist:
@@ -310,9 +286,9 @@ def screen_undervalued_stocks():
             ma60 = float(df.iloc[-1]['MA60'])
 
             if real_close < ma20 or real_close < ma60:
-                status_note = "⚠️ 跌破均線空頭修正，建議觀望"
+                status_note = "⚠️ 跌破均線偏弱，建議觀望"
             else:
-                status_note = "🟢 站穩月季線，多頭結構完整"
+                status_note = "🟢 站穩均線，多頭結構完整"
 
             dynamic_realtime_picks.append(
                 f"🤫 {default_name} ({code})\n"
@@ -322,16 +298,16 @@ def screen_undervalued_stocks():
             )
 
     if dynamic_realtime_picks:
-        return "🎯 【AI 精選觀察清單】\n(API備援模式 - 數據與均線均為即時真實計算):\n\n" + "\n\n".join(dynamic_realtime_picks)
+        return "🎯 【AI 精選觀察清單】\n(備援模式 - 包含最新均線防禦狀態):\n\n" + "\n\n".join(dynamic_realtime_picks)
 
-    return "⚠️ 目前 API 進行例行維護中，請稍後再次嘗試。"
+    return "⚠️ 目前 API 維護中，請稍後再次嘗試。"
 
 def analyze_stock(user_input):
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
         if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 6105 上奇、2330 台積電）進行查詢。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以改輸入股票名稱或代碼（如 8358 金居、2330 台積電）進行查詢。"
 
         df, target_symbol = get_tw_stock_data(stock_code)
         if df is None or df.empty:
@@ -340,14 +316,12 @@ def analyze_stock(user_input):
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
 
-        # MACD 指標計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['Hist'] = df['DIF'] - df['MACD']
 
-        # 均線與布林通道計算 (包含季線 MA60)
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
@@ -404,7 +378,6 @@ def analyze_stock(user_input):
         else:
             foreign_text = "查無即時外資數據"
 
-        # 訊號診斷邏輯
         is_break_3pct = diff_pct <= -3.0
         is_two_days_below = (close < ma20) and (prev_close < prev_ma20)
         is_below_ma60 = close < ma60
