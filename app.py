@@ -20,11 +20,12 @@ STOCK_NAME_MAP = {}
 STOCK_INDUSTRY_MAP = {}
 
 def load_all_taiwan_stocks():
-    """啟動時自動載入台股上市櫃股票清單"""
+    """完整載入上市與上櫃股票名稱與產業（修正上櫃抓取失敗問題）"""
     global STOCK_NAME_MAP, STOCK_INDUSTRY_MAP
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    # 1. 上市股票 (TWSE)
     try:
-        # 上市股票清單
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
@@ -33,20 +34,29 @@ def load_all_taiwan_stocks():
                 s_name = str(item.get("Name", "")).strip()
                 if s_id and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
-
-        # 上櫃股票與產業清單
-        url_tpex = "https://www.tpex.org.tw/openapi/v1/mopsfront/t187ap03_O"
-        res_tpex = requests.get(url_tpex, headers=headers, timeout=5)
-        if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
-            for item in res_tpex.json():
-                s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip()
-                s_ind = str(item.get("IndustryCharacter", "")).strip()
-                if s_id and s_name:
-                    STOCK_NAME_MAP[s_name] = s_id
-                    STOCK_INDUSTRY_MAP[s_id] = s_ind
     except Exception as e:
-        print(f"Stock Map Load Error: {e}")
+        print(f"TWSE Load Error: {e}")
+
+    # 2. 上櫃股票 (TPEx) - 備用多重 API 源確保精準抓取
+    tpex_urls = [
+        "https://www.tpex.org.tw/openapi/v1/mopsfront/t187ap03_O",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
+    ]
+    for url in tpex_urls:
+        try:
+            res_tpex = requests.get(url, headers=headers, timeout=5)
+            if res_tpex.status_code == 200 and isinstance(res_tpex.json(), list):
+                for item in res_tpex.json():
+                    s_id = str(item.get("SecuritiesCompanyCode") or item.get("Date") or item.get("SecuritiesCode") or "").strip()
+                    s_name = str(item.get("CompanyName") or item.get("CompanyName") or item.get("SecuritiesName") or "").strip()
+                    s_ind = str(item.get("IndustryCharacter", "")).strip()
+                    
+                    if s_id and s_name and len(s_id) == 4 and s_id.isdigit():
+                        STOCK_NAME_MAP[s_name] = s_id
+                        if s_ind:
+                            STOCK_INDUSTRY_MAP[s_id] = s_ind
+        except Exception as e:
+            print(f"TPEx Load Error ({url}): {e}")
 
 load_all_taiwan_stocks()
 
@@ -68,41 +78,45 @@ def callback():
 def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
-    
+
     if clean_keyword in ["AI選股", "選股", "潛力股", "AI選股推薦"]:
         reply_text = screen_undervalued_stocks()
     else:
         reply_text = analyze_stock(user_input)
-        
+
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
 
 def resolve_stock_symbol(user_input):
-    """精準解析代碼與名稱"""
+    """強效股票名稱與代碼解析"""
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
+    
+    # 若輸入純數字代碼
     if clean_input.isdigit():
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         stock_name = name[0] if name else clean_input
         return clean_input, stock_name
 
+    # 精準匹配名稱
     if user_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[user_input], user_input
 
+    # 模糊匹配名稱（包含關鍵字）
     for name, code in STOCK_NAME_MAP.items():
         if user_input in name or name in user_input:
             return code, name
 
+    # 完全找不到時返回原始輸入，讓後續 API 嘗試查詢
     return clean_input, clean_input
 
 def get_tw_stock_data(stock_id):
-    """雙源備援行情機制：主源 FinMind -> 備源 yfinance"""
-    # 1. 優先試用 FinMind (抓取 80 天資料)
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=80)).strftime("%Y-%m-%d")
+    """雙數據源：FinMind -> yfinance (.TW 上市與 .TWO 上櫃)"""
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
+
     try:
         res = requests.get(url, headers=headers, timeout=2)
         if res.status_code == 200:
@@ -112,11 +126,11 @@ def get_tw_stock_data(stock_id):
                 df = df.rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
                 df['Close'] = df['Close'].astype(float)
                 df['Volume'] = df['Volume'].astype(float)
-                return df, f"{stock_id}.TW"
+                return df, f"{stock_id}"
     except Exception:
         pass
 
-    # 2. FinMind 被限制或失敗時，啟動 yfinance 備援 (自動嘗試 .TW 與 .TWO)
+    # yfinance 備援機制：自動嘗試上市 (.TW) 及上櫃 (.TWO)
     for suffix in [".TW", ".TWO"]:
         try:
             ticker = f"{stock_id}{suffix}"
@@ -146,13 +160,13 @@ def get_tw_revenue(stock_id):
                 df = pd.DataFrame(data["data"])
                 df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
                 valid_df = df[df['revenue'] > 0].copy()
-                
+
                 if len(valid_df) >= 2:
                     latest = valid_df.iloc[-1]
                     prev = valid_df.iloc[-2]
                     rev_now = float(latest['revenue'])
                     rev_prev = float(prev['revenue'])
-                    
+
                     mom = ((rev_now - rev_prev) / rev_prev) * 100
                     yoy = None
                     if len(valid_df) >= 12:
@@ -199,7 +213,7 @@ def get_tw_foreign_investor(stock_id):
     return None
 
 def screen_undervalued_stocks():
-    """冷門低位階選股策略：避開散戶當沖熱門股，鎖定溫和打底籌碼乾淨股"""
+    """冷門低位階選股策略"""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     quotes_data = {}
 
@@ -216,14 +230,13 @@ def screen_undervalued_stocks():
     except Exception as e:
         print(f"TWSE OpenData Error: {e}")
 
-    # 1. 剔除科技熱門板塊，避開電子當沖散戶大軍
-    tech_keywords = ["半導體", "電子", "電腦", "光電", "通訊", "網通", "資訊服務", "電子零組件"]
+    tech_keywords = ["半導體", "電子", "光電", "通訊", "網通"]
     candidates = []
 
     for code, info in quotes_data.items():
         if not code.isdigit() or code.startswith("00"):
             continue
-            
+
         industry = STOCK_INDUSTRY_MAP.get(code, "")
         if any(tech in industry for tech in tech_keywords):
             continue
@@ -232,14 +245,13 @@ def screen_undervalued_stocks():
             close_val = float(info['close']) if info['close'] != '--' else 0
             vol_val = int(info['vol']) / 1000 if info['vol'].isdigit() else 0
 
-            # 2. 過濾熱門爆量股：鎖定成交量 400 ~ 5000 張（籌碼乾淨，無大批散戶）
             if 15 <= close_val <= 120 and 400 <= vol_val <= 5000:
                 candidates.append({
                     'code': code,
                     'name': info['name'] or STOCK_NAME_MAP.get(code, code),
                     'close': close_val,
                     'volume': vol_val,
-                    'industry': industry or "非科技傳產"
+                    'industry': industry or "一般產業"
                 })
         except: continue
 
@@ -259,10 +271,8 @@ def screen_undervalued_stocks():
         close = float(latest_row['Close'])
         ma20 = float(latest_row['MA20']) if not pd.isna(latest_row['MA20']) else close
 
-        # 計算與月線的乖離率
         bias_pct = ((close - ma20) / ma20) * 100
 
-        # 3. 嚴格限縮：距離月線僅 -2% 至 +5% 之間（嚴禁追高，剛打底完成）
         if -2.0 <= bias_pct <= 5.0:
             foreign_net = get_tw_foreign_investor(code)
             foreign_str = f"外資默默佈局 {foreign_net:,} 張" if (foreign_net and foreign_net > 0) else "籌碼沉澱（無散戶追捧）"
@@ -289,20 +299,19 @@ def screen_undervalued_stocks():
 
     if results:
         return "🎯 【冷門低位階 / 籌碼乾淨精選 Top 5】:\n（無散戶過度追捧、安全不追高）\n\n" + "\n\n".join(results)
-    
+
     return "⚠️ 盤面符合低位階冷門標的更新中，請稍後再試。"
 
 def analyze_stock(user_input):
-    """個股完整技術分析與策略分析"""
+    """個股完整技術與籌碼分析"""
     try:
         stock_code, display_name = resolve_stock_symbol(user_input)
 
-        if not stock_code.isdigit():
-            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以輸入名稱或代碼（如 2915 潤泰全、8463 潤泰材）查詢。"
-
+        # 嘗試取得數據
         df, target_symbol = get_tw_stock_data(stock_code)
+        
         if df is None or df.empty:
-            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的即時行情，請稍後再試。"
+            return f"⚠️ 找不到「{user_input}」的台股資料。\n您可以輸入代碼（如 3349、4706）或精準名稱查詢。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info, _ = get_tw_revenue(stock_code)
@@ -321,7 +330,7 @@ def analyze_stock(user_input):
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
-        
+
         close = float(latest['Close'])
         prev_close = float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
@@ -335,7 +344,7 @@ def analyze_stock(user_input):
 
         vol_today = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
-        
+
         price_change_pct = ((close - prev_close) / prev_close) * 100
         is_vol_expand = vol_today >= vol_ma5 * 1.15
         is_vol_shrink = vol_today <= vol_ma5 * 0.85
