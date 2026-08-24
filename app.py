@@ -5,6 +5,7 @@ import datetime
 import re
 import json
 import psycopg2
+import time
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -30,6 +31,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
+RETRY_QUEUE = []  # 存放暫時查詢失敗、等待重試的股票代碼
 
 # ----------------------------------------------------
 # 1. Supabase (PostgreSQL) 資料庫操作
@@ -45,7 +47,6 @@ def init_db():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. 歷史選股紀錄表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS history (
                 date VARCHAR(20) PRIMARY KEY,
@@ -53,7 +54,6 @@ def init_db():
             );
         ''')
         
-        # 2. 掃描器狀態表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scanner_state (
                 id INT PRIMARY KEY,
@@ -64,7 +64,6 @@ def init_db():
             );
         ''')
         
-        # 3. 模擬交易資料表 (解決 relation "paper_trades" does not exist 錯誤)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS paper_trades (
                 trade_date VARCHAR(20) PRIMARY KEY,
@@ -97,8 +96,8 @@ def get_scanner_state():
         conn.close()
         if row:
             return row[0], row[1], json.loads(row[2]), (row[3] or "")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"get_scanner_state error: {e}")
     return 0, 0, {}, ""
 
 def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date):
@@ -115,8 +114,8 @@ def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_da
         conn.commit()
         cursor.close()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"update_scanner_state error: {e}")
 
 def save_history_to_db(date_str, content_str):
     if not DATABASE_URL:
@@ -151,7 +150,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單
+# 2. 上市 + 上櫃 股票清單 (證交所 / 櫃買中心 API)
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -166,8 +165,8 @@ def load_all_taiwan_stocks():
                 s_name = str(item.get("Name", "")).strip().replace(" ", "").replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"TWSE Load Error: {e}")
 
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
@@ -178,22 +177,23 @@ def load_all_taiwan_stocks():
                 s_name = str(item.get("CompanyName", "")).strip().replace(" ", "").replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"TPEx Load Error: {e}")
 
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 數據抓取
+# 3. K線與籌碼數據抓取 (帶自動重試機制)
 # ----------------------------------------------------
-def get_tw_stock_data_finmind(stock_id):
+def get_tw_stock_data(stock_id):
+    """取得日 K 線數據 (FinMind 優先，失敗則使用保底機制)"""
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -204,40 +204,45 @@ def get_tw_stock_data_finmind(stock_id):
                 df = df.dropna(subset=['Close'])
                 if len(df) >= 20:
                     return df
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"FinMind K-line Error ({stock_id}): {e}")
     return None
 
-def get_tw_foreign_investor(stock_id):
-    try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN:
-            url += f"&token={FINMIND_TOKEN}"
+def get_tw_foreign_investor(stock_id, max_retries=2):
+    """取得外資買賣超數據 (失敗自動重試)"""
+    for attempt in range(max_retries):
+        try:
+            start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+            url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+            if FINMIND_TOKEN:
+                url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("status") == 200 and data.get("data"):
-                df = pd.DataFrame(data["data"])
-                foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
-                if not foreign_df.empty:
-                    latest_date = foreign_df.iloc[-1]['date']
-                    day_data = foreign_df[foreign_df['date'] == latest_date]
-                    net_shares = day_data['buy'].sum() - day_data['sell'].sum()
-                    return round(net_shares / 1000)
-    except Exception:
-        pass
-    return 0
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == 200 and data.get("data"):
+                    df = pd.DataFrame(data["data"])
+                    foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
+                    if not foreign_df.empty:
+                        latest_date = foreign_df.iloc[-1]['date']
+                        day_data = foreign_df[foreign_df['date'] == latest_date]
+                        net_shares = day_data['buy'].sum() - day_data['sell'].sum()
+                        return round(net_shares / 1000), True
+            time.sleep(1)
+        except Exception as e:
+            print(f"FinMind Foreign Retry ({stock_id}) [{attempt+1}]: {e}")
+            time.sleep(1)
+    return 0, False  # 回傳 False 代表需進重試佇列
 
 def get_tw_stock_revenue(stock_id):
+    """由 FinMind 取得月營收數據"""
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -261,43 +266,55 @@ def get_tw_stock_revenue(stock_id):
 
                     eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
                     return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"FinMind Revenue Error ({stock_id}): {e}")
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器
+# 4. 背景輪詢掃描器 (包含待重試佇列補掃)
 # ----------------------------------------------------
 def background_stock_scanner():
+    global RETRY_QUEUE
+    curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
+    
     try:
-        if len(STOCK_NAME_MAP) < 300:
+        if len(STOCK_NAME_MAP) < 10:
             load_all_taiwan_stocks()
 
         all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
         if not all_stocks:
             return
 
-        curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
-        name, code = all_stocks[curr_idx % len(all_stocks)]
-        next_idx = (curr_idx + 1) % len(all_stocks)
+        # 優先處理之前請求失敗、等待補掃的股票
+        is_retry = False
+        if RETRY_QUEUE:
+            code = RETRY_QUEUE.pop(0)
+            name = [k for k, v in STOCK_NAME_MAP.items() if v == code][0] if [k for k, v in STOCK_NAME_MAP.items() if v == code] else code
+            is_retry = True
+            print(f"🔄 正在重新補掃失敗股票: {name} ({code})")
+        else:
+            name, code = all_stocks[curr_idx % len(all_stocks)]
+
+        next_idx = curr_idx if is_retry else (curr_idx + 1) % len(all_stocks)
 
         if not code.startswith("00") and len(code) == 4:
-            df = get_tw_stock_data_finmind(code)
+            df = get_tw_stock_data(code)
 
             if df is not None and len(df) >= 20:
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', ''))
 
-                if saved_date != "" and fetched_date != saved_date:
-                    print(f"🚨 偵測到新資料上線 ({fetched_date})！自動清空榜單並從第 1 檔重新掃描。")
+                if saved_date != "" and fetched_date != saved_date and fetched_date != "":
+                    print(f"🚨 偵測到新資料上線 ({fetched_date})！自動重置掃描。")
                     curr_idx = 0
                     total_scanned = 0
                     leaderboard = {}
                     saved_date = fetched_date
+                    RETRY_QUEUE.clear()
                     update_scanner_state(0, 0, {}, saved_date)
                     return
 
-                if saved_date == "":
+                if saved_date == "" and fetched_date != "":
                     saved_date = fetched_date
 
                 df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -320,8 +337,17 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
+                # 階段一：嚴格技術面初篩
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
-                    foreign_val = get_tw_foreign_investor(code)
+                    # 階段二：籌碼面與重試機制
+                    foreign_val, success = get_tw_foreign_investor(code)
+                    
+                    if not success:
+                        # 查詢失敗，放入待補掃佇列，絕不遺漏！
+                        if code not in RETRY_QUEUE:
+                            RETRY_QUEUE.append(code)
+                            print(f"⚠️ {name}({code}) 籌碼暫時獲取失敗，已加入重試佇列 (現有 {len(RETRY_QUEUE)} 檔待重試)")
+                    
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
                     macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else "紅柱微幅擴張"
 
@@ -350,15 +376,17 @@ def background_stock_scanner():
             auto_execute_paper_buy(top5_list[:3], today_str, week_str)
 
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        update_scanner_state(next_idx, total_scanned + 1, leaderboard, saved_date)
+        
+        scanned_inc = 0 if is_retry else 1
+        update_scanner_state(next_idx, total_scanned + scanned_inc, leaderboard, saved_date)
 
-    except Exception:
-        curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
-        update_scanner_state(curr_idx + 1, total_scanned, leaderboard, saved_date)
+    except Exception as e:
+        print(f"Scanner Exception: {e}")
+        update_scanner_state(curr_idx + 1, total_scanned + 1, leaderboard, saved_date)
 
-# 啟動背景排程器 (頻率調整為 5 秒)
+# 啟動背景排程器 (維持 30 秒一檔)
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(background_stock_scanner, 'interval', seconds=5)
+scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
@@ -384,7 +412,6 @@ def handle_message(event):
         user_input = event.message.text.strip()
         clean_keyword = user_input.upper().replace(" ", "")
 
-        # 每次收到訊息時，被動觸發背景掃描，解決 Render 休眠問題
         try:
             background_stock_scanner()
         except Exception:
@@ -401,7 +428,7 @@ def handle_message(event):
                 reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260824"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
-        elif clean_keyword in ["模擬持股", "PAPER", "持股", "持倉"]:  # 👈 已加入 "持倉"
+        elif clean_keyword in ["模擬持股", "PAPER", "持股", "持倉"]:
             reply_text = get_paper_trades_status()
         elif clean_keyword in ["結算", "CLOSE", "週結算"]:
             reply_text = execute_paper_trades_settlement()
@@ -435,7 +462,7 @@ def get_ai_selected_stocks():
     curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
-    if total_scanned < 5 and not top_stocks:
+    if total_scanned < 3 and not top_stocks:
         return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
@@ -451,7 +478,7 @@ def get_ai_selected_stocks():
 # 6. 個股完整解析
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
-    if len(STOCK_NAME_MAP) < 300:
+    if len(STOCK_NAME_MAP) < 10:
         load_all_taiwan_stocks()
 
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace(" ", "").strip()
@@ -476,11 +503,11 @@ def analyze_stock(user_input):
         if not stock_code.isdigit() or len(stock_code) != 4:
             return f"⚠️ 找不到「{user_input}」的台股上市或上櫃資料。"
 
-        df = get_tw_stock_data_finmind(stock_code)
+        df = get_tw_stock_data(stock_code)
         if df is None or df.empty:
             return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後再試。"
 
-        foreign_net = get_tw_foreign_investor(stock_code)
+        foreign_net, _ = get_tw_foreign_investor(stock_code)
         revenue_info = get_tw_stock_revenue(stock_code)
 
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
