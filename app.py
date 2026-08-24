@@ -1,9 +1,9 @@
 import os
+import threading
 import requests
 import pandas as pd
 import datetime
-import re
-import sqlite3
+import psycopg2
 from flask import Flask, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -14,23 +14,34 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
-def get_history_from_db(date_str="LATEST"):
+def get_db_connection():
+    if not DATABASE_URL: return None
     try:
-        conn = sqlite3.connect("stock_cache.db")
+        url = DATABASE_URL
+        if "sslmode" not in url:
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}sslmode=require"
+        return psycopg2.connect(url, connect_timeout=10)
+    except Exception: return None
+
+def get_history_from_db(date_str="LATEST"):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
         cursor = conn.cursor()
-        cursor.execute('CREATE TABLE IF NOT EXISTS history (date TEXT PRIMARY KEY, content TEXT);')
-        cursor.execute('SELECT content FROM history WHERE date = ?;', (date_str,))
+        cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
         row = cursor.fetchone()
+        cursor.close()
         conn.close()
         return row[0] if row else None
-    except Exception:
-        return None
+    except Exception: return None
 
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -61,7 +72,7 @@ def get_tw_stock_data_finmind(stock_id):
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
         if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.0)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -131,7 +142,7 @@ def analyze_stock(user_input):
 
         df = get_tw_stock_data_finmind(stock_code)
         if df is None or df.empty:
-            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據。"
+            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後重試。"
 
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info = get_tw_stock_revenue(stock_code)
@@ -184,13 +195,13 @@ def analyze_stock(user_input):
         return f"⚠️ 分析發生錯誤: {str(e)}"
 
 @app.route("/", methods=['GET'])
-def index():
-    return "OK"
+def index(): return "OK"
 
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
-    res = run_precalculation()
-    return f"Execution Finished:\n{res}", 200
+    # 利用 Thread 啟動後台計算，防止 Render 30 秒 HTTP 超時斷線
+    threading.Thread(target=run_precalculation).start()
+    return "🚀 前 100 檔選股運算已在背景啟動！每 10 秒處理一檔（總耗時約 16 分鐘），完成後會自動存入 Supabase。", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -205,15 +216,13 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
-    if "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
+    if "選股" in clean_keyword or "AI" in clean_keyword:
         report = get_history_from_db("LATEST")
         if not report:
-            reply_text = "⚠️ 正在為您即時計算最新 Top 3，請稍等 10 秒後再傳一次「AI選股」！"
-            run_precalculation()
+            reply_text = "⚠️ 後台尚未完成今日統計，請稍後再試！"
         else:
             reply_text = report
     else:
-        # 輸入股票名稱（如 台積電）或代號（如 2330）直接進行個股分析
         reply_text = analyze_stock(user_input)
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
