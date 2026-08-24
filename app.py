@@ -269,9 +269,8 @@ def background_stock_scanner():
 
             if df is not None and len(df) >= 20:
                 latest = df.iloc[-1]
-                fetched_date = str(latest.get('date', '')) # 取得 API 實際資料日期
+                fetched_date = str(latest.get('date', ''))
 
-                # 🎯【核心邏輯】：只要 API 抓到的最新日期與資料庫紀錄的不同，代表新一天數據釋出，自動歸零並重新掃描
                 if saved_date != "" and fetched_date != saved_date:
                     print(f"🚨 偵測到新資料上線 ({fetched_date})！自動清空榜單並從第 1 檔重新掃描。")
                     curr_idx = 0
@@ -281,7 +280,6 @@ def background_stock_scanner():
                     update_scanner_state(0, 0, {}, saved_date)
                     return
 
-                # 若為初次啟動，自動寫入當前數據日期
                 if saved_date == "":
                     saved_date = fetched_date
 
@@ -331,7 +329,6 @@ def background_stock_scanner():
         today_str = now_dt.strftime("%Y%m%d")
         week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
 
-        # 🎯 條件：新數據完整掃描完一輪 (total_scanned >= 1800) 且為週一至週三，才自動寫入買進
         if total_scanned >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
             auto_execute_paper_buy(top5_list[:3], today_str, week_str)
 
@@ -342,7 +339,6 @@ def background_stock_scanner():
         curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard, saved_date)
 
-# 啟動背景排程 (每 30 秒執行一次)
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
@@ -500,3 +496,9 @@ def analyze_stock(user_input):
             vol_status = f"👇 下跌放量 ({price_change_pct:.1f}%)\n  👉 注意賣壓風險"
         else:
             vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)"
+
+        foreign_text = f"{foreign_net} 張" if foreign_net != 0 else "0 張/估算中"
+
+        if close < ma60 or diff_pct < -3.0:
+            signal = "🔴 【建議出場/觀望】跌破關鍵支撐或空頭走勢！"
+        elif close >= ma20 and hist_toda
