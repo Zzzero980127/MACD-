@@ -11,9 +11,10 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
+FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk".strip()
+
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
-FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
@@ -69,10 +70,10 @@ load_all_taiwan_stocks()
 def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4.0)
+        res = requests.get(url, headers=headers, timeout=5.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -85,10 +86,10 @@ def get_tw_stock_data_finmind(stock_id):
 def get_tw_foreign_investor(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.0)
+        res = requests.get(url, headers=headers, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
@@ -102,10 +103,10 @@ def get_tw_foreign_investor(stock_id):
 def get_tw_stock_revenue(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.0)
+        res = requests.get(url, headers=headers, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             if 'revenue' in df.columns and len(df) >= 13:
@@ -207,7 +208,7 @@ def run_with_logging():
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
     threading.Thread(target=run_with_logging).start()
-    return "🚀 前 100 檔選股運算已在背景啟動！耗時約 16 分鐘，完成後自動發送結果。", 200
+    return "🚀 前 100 档選股運算已在背景啟動！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
