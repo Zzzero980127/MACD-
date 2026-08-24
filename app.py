@@ -7,7 +7,6 @@ import psycopg2
 from flask import Flask, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from cron_job import run_precalculation
 
 app = Flask(__name__)
 
@@ -199,9 +198,9 @@ def index(): return "OK"
 
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
-    # 利用 Thread 啟動後台計算，防止 Render 30 秒 HTTP 超時斷線
+    from cron_job import run_precalculation
     threading.Thread(target=run_precalculation).start()
-    return "🚀 前 100 檔選股運算已在背景啟動！每 10 秒處理一檔（總耗時約 16 分鐘），完成後會自動存入 Supabase。", 200
+    return "🚀 前 100 檔選股運算已在背景啟動！每 10 秒處理一檔（總耗時約 16 分鐘），完成後會自動存入 Supabase 並推播到 LINE。", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -216,12 +215,24 @@ def handle_message(event):
     user_input = event.message.text.strip()
     clean_keyword = user_input.upper().replace(" ", "")
 
+    # 1. AI 選股（回傳最新資料）
     if "選股" in clean_keyword or "AI" in clean_keyword:
         report = get_history_from_db("LATEST")
-        if not report:
-            reply_text = "⚠️ 後台尚未完成今日統計，請稍後再試！"
-        else:
+        reply_text = report if report else "⚠️ 後台尚未完成今日統計，請稍後再試！"
+
+    # 2. 歷史日期查詢（如 20260823 或 0823）
+    elif user_input.replace("/", "").replace("-", "").isdigit() and len(user_input.replace("/", "").replace("-", "")) in [4, 8]:
+        clean_date = user_input.replace("/", "").replace("-", "")
+        query_date = f"{datetime.datetime.now().strftime('%Y')}{clean_date}" if len(clean_date) == 4 else clean_date
+
+        report = get_history_from_db(query_date)
+        if report:
             reply_text = report
+        else:
+            # 若不是歷史選股日期，自動轉去查詢個股（例如輸入 2330）
+            reply_text = analyze_stock(user_input)
+
+    # 3. 個股即時查詢（輸入股票名稱或代號，如 台積電、2317）
     else:
         reply_text = analyze_stock(user_input)
 
