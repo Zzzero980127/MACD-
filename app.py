@@ -55,12 +55,13 @@ def init_db():
                 id INT PRIMARY KEY,
                 current_index INT,
                 total_scanned INT,
-                leaderboard_json TEXT
+                leaderboard_json TEXT,
+                data_date VARCHAR(20)
             );
         ''')
         cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
         if cursor.fetchone()[0] == 0:
-            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, %s);', ("{}",))
+            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
         conn.commit()
         cursor.close()
         conn.close()
@@ -69,21 +70,21 @@ def init_db():
 
 def get_scanner_state():
     if not DATABASE_URL:
-        return 0, 0, {}
+        return 0, 0, {}, ""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT current_index, total_scanned, leaderboard_json FROM scanner_state WHERE id = 1;')
+        cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
         row = cursor.fetchone()
         cursor.close()
         conn.close()
         if row:
-            return row[0], row[1], json.loads(row[2])
+            return row[0], row[1], json.loads(row[2]), (row[3] or "")
     except Exception:
         pass
-    return 0, 0, {}
+    return 0, 0, {}, ""
 
-def update_scanner_state(current_index, total_scanned, leaderboard_dict):
+def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date):
     if not DATABASE_URL:
         return
     try:
@@ -91,9 +92,9 @@ def update_scanner_state(current_index, total_scanned, leaderboard_dict):
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE scanner_state
-            SET current_index = %s, total_scanned = %s, leaderboard_json = %s
+            SET current_index = %s, total_scanned = %s, leaderboard_json = %s, data_date = %s
             WHERE id = 1;
-        ''', (current_index, total_scanned, json.dumps(leaderboard_dict)))
+        ''', (current_index, total_scanned, json.dumps(leaderboard_dict), data_date))
         conn.commit()
         cursor.close()
         conn.close()
@@ -133,13 +134,12 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單 (優化抓取與去空白邏輯)
+# 2. 上市 + 上櫃 股票清單
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # 1. 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
@@ -152,7 +152,6 @@ def load_all_taiwan_stocks():
     except Exception:
         pass
 
-    # 2. 上櫃股票 (TPEx)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
@@ -250,7 +249,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (30 秒安全間隔 + 僅週一至週三買進 Top 3)
+# 4. 背景輪詢掃描器 (資料日期不一致自動重置)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -261,7 +260,7 @@ def background_stock_scanner():
         if not all_stocks:
             return
 
-        curr_idx, total_scanned, leaderboard = get_scanner_state()
+        curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
         next_idx = (curr_idx + 1) % len(all_stocks)
 
@@ -269,6 +268,23 @@ def background_stock_scanner():
             df = get_tw_stock_data_finmind(code)
 
             if df is not None and len(df) >= 20:
+                latest = df.iloc[-1]
+                fetched_date = str(latest.get('date', '')) # 取得 API 實際資料日期
+
+                # 🎯【核心邏輯】：只要 API 抓到的最新日期與資料庫紀錄的不同，代表新一天數據釋出，自動歸零並重新掃描
+                if saved_date != "" and fetched_date != saved_date:
+                    print(f"🚨 偵測到新資料上線 ({fetched_date})！自動清空榜單並從第 1 檔重新掃描。")
+                    curr_idx = 0
+                    total_scanned = 0
+                    leaderboard = {}
+                    saved_date = fetched_date
+                    update_scanner_state(0, 0, {}, saved_date)
+                    return
+
+                # 若為初次啟動，自動寫入當前數據日期
+                if saved_date == "":
+                    saved_date = fetched_date
+
                 df['MA20'] = df['Close'].rolling(window=20).mean()
                 exp1 = df['Close'].ewm(span=12, adjust=False).mean()
                 exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -276,7 +292,6 @@ def background_stock_scanner():
                 df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
                 df['Hist'] = df['DIF'] - df['MACD']
 
-                latest = df.iloc[-1]
                 prev = df.iloc[-2]
                 five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
 
@@ -304,7 +319,8 @@ def background_stock_scanner():
                         'gain_5d': gain_5d,
                         'foreign_net': foreign_val,
                         'macd_status': macd_status_text,
-                        'score': score
+                        'score': score,
+                        'data_date': fetched_date
                     }
 
         sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
@@ -315,18 +331,18 @@ def background_stock_scanner():
         today_str = now_dt.strftime("%Y%m%d")
         week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
 
-        # 🎯 只在週一至週三 (now_dt.weekday() <= 2) 且有資料時，才將 Top 3 寫入模擬持股
-        if len(top5_list) >= 3 and now_dt.weekday() <= 2:
+        # 🎯 條件：新數據完整掃描完一輪 (total_scanned >= 1800) 且為週一至週三，才自動寫入買進
+        if total_scanned >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
             auto_execute_paper_buy(top5_list[:3], today_str, week_str)
 
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        update_scanner_state(next_idx, total_scanned + 1, leaderboard)
+        update_scanner_state(next_idx, total_scanned + 1, leaderboard, saved_date)
 
     except Exception:
-        curr_idx, total_scanned, leaderboard = get_scanner_state()
-        update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
+        curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
+        update_scanner_state(curr_idx + 1, total_scanned, leaderboard, saved_date)
 
-# 啟動背景排程 (30 秒間隔)
+# 啟動背景排程 (每 30 秒執行一次)
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
@@ -336,7 +352,7 @@ scheduler.start()
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active with Supabase!"
+    return "TW Stock Bot Active with Robust Auto Reset!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -362,7 +378,7 @@ def handle_message(event):
             if history_report:
                 reply_text = f"📜【查閱 ({target_date}) 歷史 AI 選股紀錄】:\n\n" + history_report
             else:
-                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260823"
+                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260824"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
         elif clean_keyword in ["模擬持股", "PAPER", "持股"]:
@@ -383,8 +399,9 @@ def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
     results = []
     for item in top_stocks[:5]:
+        d_date = item.get('data_date', '')
         card = (
-            f"📈 {item['name']} ({item['code']})\n"
+            f"📈 {item['name']} ({item['code']}) 🗓️[{d_date}]\n"
             f"  • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
             f"  • 漲幅管控: 🛡️ 近5日 {item['gain_5d']:+.1f}%\n"
             f"  • 位階狀態: 🟢 低位階 (離月線 {item['bias_pct']:+.1f}%)\n"
@@ -395,14 +412,14 @@ def format_ai_report(top_stocks):
     return "\n\n".join(results)
 
 def get_ai_selected_stocks():
-    curr_idx, total_scanned, leaderboard = get_scanner_state()
+    curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 5 and not top_stocks:
         return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
-    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
+    scanned_info = f"(最新基準日期: {saved_date} | 已累計動態掃描 {total_scanned} 檔標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
@@ -411,7 +428,7 @@ def get_ai_selected_stocks():
     return f"🎯【{today_str} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 個股完整解析 (強化中文模糊搜尋與上櫃對應)
+# 6. 個股完整解析
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
@@ -419,16 +436,13 @@ def resolve_stock_symbol(user_input):
 
     clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace("　", "").strip()
 
-    # 1. 直接輸入 4 位數字代碼
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         return clean_input, name[0] if name else clean_input
 
-    # 2. 完全符合股票中文名稱
     if clean_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[clean_input], clean_input
 
-    # 3. 雙向模糊搜尋（防止使用者少打關鍵字或多打字）
     for name, code in STOCK_NAME_MAP.items():
         if clean_input in name or name in clean_input:
             return code, name
@@ -486,26 +500,3 @@ def analyze_stock(user_input):
             vol_status = f"👇 下跌放量 ({price_change_pct:.1f}%)\n  👉 注意賣壓風險"
         else:
             vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)"
-
-        foreign_text = f"{foreign_net:} 張" if foreign_net != 0 else "0 張/估算中"
-
-        if close < ma60 or diff_pct < -3.0:
-            signal = "🔴 【建議出場/觀望】跌破關鍵支撐或空頭走勢！"
-        elif close >= ma20 and hist_today > hist_yesterday:
-            signal = "🔥 【多頭控盤】站穩均線且 MACD 柱狀體升高，可持股或分批佈局。"
-        else:
-            signal = "🟡 【多短觀望】超越月線軌道，走勢偏溫。"
-
-        pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"低於月線 {abs(diff_pct):.2f}%"
-
-        return (
-            f"📊 [{display_name} ({stock_code})] 技術與籌碼分析 :\n"
-            f"--------------------\n"
-            f"最新收盤價: {close:.2f}\n"
-            f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
-            f"60日均線(季線): {ma60:.2f}\n"
-            f"布林通道上軌: {bb_upper:.2f}\n"
-            f"量價結構:\n  {vol_status}\n"
-            f"外資籌碼: {foreign_text}\n"
-            f"--------------------\n"
-        
