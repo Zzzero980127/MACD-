@@ -52,9 +52,6 @@ def init_db():
                 data_date VARCHAR(20)
             );
         ''')
-        cursor.execute('''
-            ALTER TABLE scanner_state ADD COLUMN IF NOT EXISTS data_date VARCHAR(20) DEFAULT '';
-        ''')
         cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
         if cursor.fetchone()[0] == 0:
             cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
@@ -134,7 +131,7 @@ init_db()
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -151,7 +148,7 @@ def load_all_taiwan_stocks():
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
+        if res.status_code == 200 and res.text.strip().startswith('['):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
                 s_name = str(item.get("CompanyName", "")).strip().replace(" ", "")
@@ -245,7 +242,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (平滑無縫重置)
+# 4. 背景輪詢掃描器 (修正日期判斷 Bug)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -265,14 +262,14 @@ def background_stock_scanner():
 
             if df is not None and len(df) >= 20:
                 latest = df.iloc[-1]
-                fetched_date = str(latest.get('date', ''))
+                fetched_date = str(latest.get('date', '')).strip()
 
-                # 💡 只有遇到「真正的新交易日 (日期更大)」時才重置排行榜
-                if fetched_date != "":
-                    if recorded_date == "":
+                # 💡 強制統一為 YYYY-MM-DD 格式比對
+                if fetched_date:
+                    if not recorded_date:
                         recorded_date = fetched_date
                     elif fetched_date > recorded_date:
-                        print(f"🔄 偵測到新交易日數據 ({fetched_date})，重置計數並開始新掃描！")
+                        print(f"🔄 偵測到新交易日數據 ({fetched_date})，重置排行榜！")
                         recorded_date = fetched_date
                         total_scanned = 0
                         leaderboard = {}
@@ -317,9 +314,10 @@ def background_stock_scanner():
         sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
         leaderboard = {x['code']: x for x in sorted_list[:5]}
 
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        if leaderboard:
-            save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
+        # 寫入歷史紀錄時統一轉為 YYYYMMDD
+        if leaderboard and recorded_date:
+            history_key = recorded_date.replace("-", "")
+            save_history_to_db(history_key, format_ai_report(list(leaderboard.values())))
 
         update_scanner_state(next_idx, total_scanned + 1, leaderboard, recorded_date)
 
@@ -366,7 +364,7 @@ def handle_message(event):
             if history_report:
                 reply_text = f"📜【查閱 ({target_date}) 歷史 AI 選股紀錄】:\n\n" + history_report
             else:
-                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260823"
+                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260824"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
         else:
@@ -402,7 +400,7 @@ def get_ai_selected_stocks():
         return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
     display_date = recorded_date.replace("-", "/") if recorded_date else datetime.datetime.now().strftime("%Y/%m/%d")
-    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
+    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 档標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
