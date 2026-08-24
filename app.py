@@ -131,20 +131,16 @@ def find_stock_id(user_input):
     """ 智慧辨識使用者輸入：支援 4 位數代號、完整名稱、簡稱模糊搜尋 """
     text = user_input.strip()
 
-    # 1. 檢查是否直接輸入 4 位數代號
     if len(text) == 4 and text.isdigit():
         return text
 
-    # 2. 精準名稱比對 (如: "台積電")
     if text in STOCK_NAME_TO_ID:
         return STOCK_NAME_TO_ID[text]
 
-    # 3. 模糊名稱搜尋 (如輸入 "台積" 可找到 "台積電")
     for name, code in STOCK_NAME_TO_ID.items():
         if text in name:
             return code
 
-    # 4. 文字中有包含 4 位數字代號
     match = re.search(r'\b\d{4}\b', text)
     if match:
         return match.group(0)
@@ -183,10 +179,8 @@ def analyze_stock(stock_id):
     ma5, ma20, ma60 = float(latest['MA5']), float(latest['MA20']), float(latest['MA60'])
     osc_today = float(latest['OSC'])
 
-    # 抓取籌碼
     today_foreign, prev_foreign = fetch_single_stock_foreign_public(stock_id)
 
-    # 外資籌碼標籤
     if today_foreign > 50 and prev_foreign <= 50:
         foreign_label = f"🔄 外資由賣轉買 (+{today_foreign} 張)"
     elif today_foreign > 200 and prev_foreign > 200:
@@ -198,7 +192,6 @@ def analyze_stock(stock_id):
     else:
         foreign_label = "➖ 外資觀望/無變化"
 
-    # 趨勢簡評
     if close > ma20 and ma20 >= ma60:
         trend_status = "🟢 多頭格局 (站穩均線之上)"
     elif close < ma20 and ma20 <= ma60:
@@ -224,7 +217,7 @@ def analyze_stock(stock_id):
 def index():
     return f"LINE Bot Webhook Server is Running! (Loaded {len(STOCK_NAME_TO_ID)} stocks)"
 
-# 配合你 cron-job.org 設定的專屬觸發入口
+# 對齊 cron-job.org 的自訂入口網址
 @app.route("/run-cron-job-secret", methods=['GET', 'POST'])
 def trigger_cron():
     """ 供 cron-job.org 呼叫的選股任務觸發點 """
@@ -249,16 +242,13 @@ def callback():
 def handle_message(event):
     user_msg = event.message.text.strip()
 
-    # 1. 查詢選股報告指令
     if user_msg in ["選股", "AI", "AI選股", "今日選股"]:
         report = get_latest_report_from_db()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
         return
 
-    # 2. 自動匹配股票代號 (支援名稱、簡稱與 4 位數代號)
     stock_id = find_stock_id(user_msg)
 
-    # 3. 執行個股查詢或預設回覆
     if stock_id:
         report = analyze_stock(stock_id)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
