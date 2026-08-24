@@ -8,6 +8,7 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from cron_job import run_precalculation
 
 app = Flask(__name__)
 
@@ -197,7 +198,16 @@ def analyze_stock(user_input):
 
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active - Standard Fast Version"
+    return "TW Stock Bot Active - Fast Sync Version"
+
+# ✅ 修正為同步執行，確保 Render 不會在背景把流程掐斷
+@app.route('/run-cron-job-secret', methods=['GET'])
+def trigger_cron():
+    try:
+        run_precalculation()
+        return "Cron job executed and pushed successfully!", 200
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -230,14 +240,3 @@ def handle_message(event):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-import subprocess
-
-@app.route('/run-cron-job-secret', methods=['GET'])
-def trigger_cron():
-    try:
-        # 在背景執行 cron_job.py
-        subprocess.Popen(["python", "cron_job.py"])
-        return "Cron job triggered successfully!", 200
-    except Exception as e:
-        return f"Error: {str(e)}", 500
