@@ -7,10 +7,8 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 優先讀取環境變數，若無則備用安全預設 Token
-ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk"
-FINMIND_TOKEN = ENV_TOKEN if ENV_TOKEN else DEFAULT_TOKEN
+# 讀取環境變數中的 Token，請確保在 Render 的 Environment 填入正確無誤的 FINMIND_TOKEN
+FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
@@ -90,12 +88,17 @@ def save_to_db(report_text, date_str="LATEST"):
         print(f"❌ 寫入資料庫失敗: {e}", flush=True)
 
 def fetch_stock_price_with_retry(stock_id):
-    """ 強制帶 Token 抓取日 K 價量 """
+    """ 抓取日 K 價量數據 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    url_token = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    
+    # 判斷是否有 Token，若有帶入 Token，無則走公用通道
+    if FINMIND_TOKEN:
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    else:
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
     
     try:
-        res = http.get(url_token, timeout=8.0)
+        res = http.get(url, timeout=8.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -104,19 +107,23 @@ def fetch_stock_price_with_retry(stock_id):
             if len(df) >= 35: 
                 return df
         else:
-            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
+            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code}, Msg: {res.text[:50]})", flush=True)
     except Exception as e:
         print(f"⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
 
     return None
 
 def fetch_foreign_investor_with_retry(stock_id):
-    """ 強制帶 Token 抓取外資籌碼 """
+    """ 抓取外資籌碼數據 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-    url_token = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    
+    if FINMIND_TOKEN:
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    else:
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
     
     try:
-        res = http.get(url_token, timeout=8.0)
+        res = http.get(url, timeout=8.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
@@ -143,7 +150,6 @@ def fetch_foreign_investor_with_retry(stock_id):
     return False, 0, ""
 
 def analyze_single_stock(stock_id):
-    """ 分析單一個股 (技術面不通過就不抓外資 API) """
     df = fetch_stock_price_with_retry(stock_id)
     if df is None: return None
 
@@ -170,14 +176,12 @@ def analyze_single_stock(stock_id):
     osc_today = float(latest['OSC'])
     bb_upper = float(latest['BB_Upper'])
 
-    # 技術面篩選
     is_bull_trend = (close > ma20) and (ma20 >= ma60)
     is_macd_good = (osc_today > 0)
     is_vol_surge = (vol_today >= vol_ma5 * 1.1)
     not_overheated = (close < bb_upper * 0.99)
 
     if is_bull_trend and is_macd_good and is_vol_surge and not_overheated:
-        # 技術面通過，間隔 2 秒抓外資籌碼
         time.sleep(2.0)
         has_foreign_signal, foreign_shares, foreign_label = fetch_foreign_investor_with_retry(stock_id)
         
@@ -193,19 +197,18 @@ def analyze_single_stock(stock_id):
     return None
 
 def run_precalculation():
-    print(f"🚀 開始選股任務！(Token狀態: {FINMIND_TOKEN[:10]}...)", flush=True)
+    token_status = "有帶入" if FINMIND_TOKEN else "未帶入(走無Token模式)"
+    print(f"🚀 開始選股任務！(FINMIND_TOKEN 狀態: {token_status})", flush=True)
     
     target_stocks = get_top_100_volume_stocks()
     selected_stocks = []
     
-    # 每檔間隔 10 秒，嚴格防禦 API 限流暴沖
     for i, stock_id in enumerate(target_stocks, 1):
         print(f"[{i}/{len(target_stocks)}] 正在分析個股 {stock_id}...", flush=True)
         res = analyze_single_stock(stock_id)
         if res:
             selected_stocks.append(res)
         
-        # 強制休息 10 秒
         time.sleep(10.0)
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
