@@ -220,7 +220,7 @@ def handle_message(event):
         report = get_history_from_db("LATEST")
         reply_text = report if report else "⚠️ 後台尚未完成今日統計，請稍後再試！"
 
-    # 2. 歷史日期查詢（如 20260823 或 0823）
+    # 2. 歷史日期查詢（如 20260824 或 0824）
     elif user_input.replace("/", "").replace("-", "").isdigit() and len(user_input.replace("/", "").replace("-", "")) in [4, 8]:
         clean_date = user_input.replace("/", "").replace("-", "")
         query_date = f"{datetime.datetime.now().strftime('%Y')}{clean_date}" if len(clean_date) == 4 else clean_date
