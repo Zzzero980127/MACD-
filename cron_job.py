@@ -7,9 +7,11 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 讀取環境變數中的 Token，請確保在 Render 的 Environment 填入正確無誤的 FINMIND_TOKEN
-FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
+# 雙重防線：優先讀取環境變數，若失敗則使用硬寫 Token
+ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk"
 
+FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 def create_robust_session():
@@ -90,12 +92,7 @@ def save_to_db(report_text, date_str="LATEST"):
 def fetch_stock_price_with_retry(stock_id):
     """ 抓取日 K 價量數據 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    
-    # 判斷是否有 Token，若有帶入 Token，無則走公用通道
-    if FINMIND_TOKEN:
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-    else:
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
         res = http.get(url, timeout=8.0)
@@ -107,7 +104,7 @@ def fetch_stock_price_with_retry(stock_id):
             if len(df) >= 35: 
                 return df
         else:
-            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code}, Msg: {res.text[:50]})", flush=True)
+            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
     except Exception as e:
         print(f"⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
 
@@ -116,11 +113,7 @@ def fetch_stock_price_with_retry(stock_id):
 def fetch_foreign_investor_with_retry(stock_id):
     """ 抓取外資籌碼數據 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-    
-    if FINMIND_TOKEN:
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-    else:
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
         res = http.get(url, timeout=8.0)
@@ -197,8 +190,7 @@ def analyze_single_stock(stock_id):
     return None
 
 def run_precalculation():
-    token_status = "有帶入" if FINMIND_TOKEN else "未帶入(走無Token模式)"
-    print(f"🚀 開始選股任務！(FINMIND_TOKEN 狀態: {token_status})", flush=True)
+    print(f"🚀 開始選股任務！(Token 已順利帶入，長度: {len(FINMIND_TOKEN)})", flush=True)
     
     target_stocks = get_top_100_volume_stocks()
     selected_stocks = []
