@@ -1,11 +1,10 @@
 import os
-import sqlite3
 import requests
 import pandas as pd
 import datetime
 import re
 import json
-import time
+import psycopg2
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -14,51 +13,62 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# LINE 憑證設定
+# LINE 與 API 設定
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
+FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-DB_FILE = 'stock_history.db'
 STOCK_NAME_MAP = {}
 
 # ----------------------------------------------------
-# 1. SQLite 資料庫初始化與操作
+# 1. Supabase (PostgreSQL) 資料庫操作
 # ----------------------------------------------------
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
+    if not DATABASE_URL:
+        print("⚠️ 未偵測到 DATABASE_URL，請於 Render 設定環境變數！")
+        return
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS history (
-                date TEXT PRIMARY KEY,
+                date VARCHAR(20) PRIMARY KEY,
                 content TEXT
-            )
+            );
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scanner_state (
-                id INTEGER PRIMARY KEY,
-                current_index INTEGER,
-                total_scanned INTEGER,
+                id INT PRIMARY KEY,
+                current_index INT,
+                total_scanned INT,
                 leaderboard_json TEXT
-            )
+            );
         ''')
-        cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1')
+        cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
         if cursor.fetchone()[0] == 0:
-            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, "{}")')
+            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, %s);', ("{}",))
         conn.commit()
+        cursor.close()
         conn.close()
     except Exception as e:
-        print(f"DB Init Error: {e}")
+        print(f"Supabase Init Error: {e}")
 
 def get_scanner_state():
+    if not DATABASE_URL:
+        return 0, 0, {}
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT current_index, total_scanned, leaderboard_json FROM scanner_state WHERE id = 1')
+        cursor.execute('SELECT current_index, total_scanned, leaderboard_json FROM scanner_state WHERE id = 1;')
         row = cursor.fetchone()
+        cursor.close()
         conn.close()
         if row:
             return row[0], row[1], json.loads(row[2])
@@ -67,35 +77,47 @@ def get_scanner_state():
     return 0, 0, {}
 
 def update_scanner_state(current_index, total_scanned, leaderboard_dict):
+    if not DATABASE_URL:
+        return
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE scanner_state
-            SET current_index = ?, total_scanned = ?, leaderboard_json = ?
-            WHERE id = 1
+            SET current_index = %s, total_scanned = %s, leaderboard_json = %s
+            WHERE id = 1;
         ''', (current_index, total_scanned, json.dumps(leaderboard_dict)))
         conn.commit()
+        cursor.close()
         conn.close()
     except Exception:
         pass
 
 def save_history_to_db(date_str, content_str):
+    if not DATABASE_URL:
+        return
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('INSERT OR REPLACE INTO history (date, content) VALUES (?, ?)', (date_str, content_str))
+        cursor.execute('''
+            INSERT INTO history (date, content) VALUES (%s, %s)
+            ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;
+        ''', (date_str, content_str))
         conn.commit()
+        cursor.close()
         conn.close()
     except Exception:
         pass
 
 def get_history_from_db(date_str):
+    if not DATABASE_URL:
+        return None
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT content FROM history WHERE date = ?', (date_str,))
+        cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
         row = cursor.fetchone()
+        cursor.close()
         conn.close()
         return row[0] if row else None
     except Exception:
@@ -143,6 +165,9 @@ def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+        if FINMIND_TOKEN:
+            url += f"&token={FINMIND_TOKEN}"
+        
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
@@ -162,6 +187,9 @@ def get_tw_foreign_investor(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+        if FINMIND_TOKEN:
+            url += f"&token={FINMIND_TOKEN}"
+
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
@@ -181,6 +209,9 @@ def get_tw_stock_revenue(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
+        if FINMIND_TOKEN:
+            url += f"&token={FINMIND_TOKEN}"
+
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
         if res.status_code == 200:
             data = res.json()
@@ -210,7 +241,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器
+# 4. 背景輪詢掃描器 (30 秒安全間隔)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -274,13 +305,13 @@ def background_stock_scanner():
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
         update_scanner_state(next_idx, total_scanned + 1, leaderboard)
 
-    except Exception as e:
+    except Exception:
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
 
-# 啟動背景排程 (每 3 秒觸發 1 檔)
+# 啟動背景排程 (30 秒間隔)
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(background_stock_scanner, 'interval', seconds=3)
+scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
@@ -288,7 +319,7 @@ scheduler.start()
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active!"
+    return "TW Stock Bot Active with Supabase!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -346,8 +377,8 @@ def get_ai_selected_stocks():
     curr_idx, total_scanned, leaderboard = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
-    if total_scanned < 10 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 2~3 分鐘後重新點選！"
+    if total_scanned < 5 and not top_stocks:
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
