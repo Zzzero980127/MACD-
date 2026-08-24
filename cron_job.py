@@ -16,16 +16,25 @@ LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        return None
+    url = DATABASE_URL
+    # 強制加上 sslmode=require 防範 Supabase 拒絕連線
+    if "sslmode" not in url:
+        sep = "&" if "?" in url else "?"
+        url += f"{sep}sslmode=require"
+    return psycopg2.connect(url, connect_timeout=10)
 
 def save_history_to_db(date_str, content_str):
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
+        if not conn:
+            return
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS history (
@@ -40,11 +49,12 @@ def save_history_to_db(date_str, content_str):
         conn.commit()
         cursor.close()
         conn.close()
+        print(f"✅ 已成功將 {date_str} 報告存入 Supabase 資料庫！")
     except Exception as e:
         print(f"❌ DB Save Error: {e}")
 
 # ----------------------------------------------------
-# 資料抓取 (防 API 超限延遲)
+# 資料抓取 (API 延遲保護)
 # ----------------------------------------------------
 def get_tw_stock_data(stock_id):
     try:
@@ -73,7 +83,7 @@ def get_tw_foreign_investor_history(stock_id):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
             if not foreign_df.empty:
-                # ✅ 修正 Groupby 語法，避開 Pandas Deprecation Warning
+                # ✅ 正確寫法避開 Warning
                 daily_summary = foreign_df.groupby('date', as_index=False).agg({'buy': 'sum', 'sell': 'sum'})
                 daily_summary['net'] = daily_summary['buy'] - daily_summary['sell']
                 daily_summary = daily_summary.sort_values('date')
@@ -87,19 +97,16 @@ def get_tw_foreign_investor_history(stock_id):
     except Exception: pass
     return 0, 0
 
-# ----------------------------------------------------
-# 防追高 + 防隔日沖 + 外資轉買演算法
-# ----------------------------------------------------
 def analyze_candidate(item):
     try:
         code, name = item['code'], item['name']
         
         df = get_tw_stock_data(code)
-        time.sleep(0.6)  # ⏱️ 微延遲保護 API
+        time.sleep(0.5)
 
         if df is not None and len(df) >= 20:
             foreign_today, foreign_yesterday = get_tw_foreign_investor_history(code)
-            time.sleep(0.6)
+            time.sleep(0.5)
 
             latest = df.iloc[-1]
             trade_date = str(latest.get('date', '')).strip()
@@ -171,7 +178,6 @@ def run_precalculation():
     leaderboard = []
     trade_date = ""
 
-    # 使用 2 個平行線程推進
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(analyze_candidate, top_100))
 
@@ -207,7 +213,7 @@ def run_precalculation():
         save_history_to_db(date_key, final_content)
         save_history_to_db("LATEST", final_content)
 
-        if LINE_USER_ID:
+        if line_bot_api and LINE_USER_ID:
             try:
                 line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
                 print("✅ 08:00 精選 Top 3 推播已送達！")
