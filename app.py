@@ -35,16 +35,8 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
-# 全域記憶體快取（確保背景掃描順暢推進，防止資料庫卡死）
-RUNTIME_CACHE = {
-    "current_index": 0,
-    "total_scanned": 0,
-    "leaderboard": {},
-    "data_date": ""
-}
-
 # ----------------------------------------------------
-# 1. Supabase 資料庫操作 (包含自動自動修復欄位)
+# 1. Supabase 資料庫操作與自動修復機制
 # ----------------------------------------------------
 def get_db_connection():
     if not DATABASE_URL:
@@ -57,12 +49,14 @@ def init_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
+                # 建立歷史紀錄表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS history (
                         date VARCHAR(20) PRIMARY KEY,
                         content TEXT
                     );
                 ''')
+                # 建立掃描器狀態表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS scanner_state (
                         id INT PRIMARY KEY,
@@ -72,11 +66,12 @@ def init_db():
                         data_date VARCHAR(20)
                     );
                 ''')
-                # 🛠️ 自動補強：防止舊版資料庫缺乏 data_date 欄位而報錯
+                # 自動補強欄位（防止缺少 data_date 報錯）
                 cursor.execute('''
                     ALTER TABLE scanner_state 
                     ADD COLUMN IF NOT EXISTS data_date VARCHAR(20);
                 ''')
+                # 建立模擬交易表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS paper_trades (
                         trade_date VARCHAR(20) PRIMARY KEY,
@@ -93,15 +88,33 @@ def init_db():
     except Exception as e:
         print(f"DB Init Error: {e}")
 
+# 從資料庫安全讀取（防止 Render 重啟資料遺失）
 def get_scanner_state():
-    return RUNTIME_CACHE["current_index"], RUNTIME_CACHE["total_scanned"], RUNTIME_CACHE["leaderboard"], RUNTIME_CACHE["data_date"]
+    if not DATABASE_URL:
+        return 0, 0, {}, ""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
+                row = cursor.fetchone()
+                if row:
+                    c_idx = row[0] if row[0] is not None else 0
+                    t_scan = row[1] if row[1] is not None else 0
+                    d_date = row[3] if row[3] is not None else ""
+                    
+                    # 安全解析排行榜 JSON
+                    try:
+                        leaderboard = json.loads(row[2]) if row[2] else {}
+                    except Exception:
+                        leaderboard = {}
 
+                    return c_idx, t_scan, leaderboard, d_date
+    except Exception as e:
+        print(f"DB Read Warning: {e}")
+    return 0, 0, {}, ""
+
+# 更新回 Supabase（保存記憶體暫存）
 def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date):
-    RUNTIME_CACHE["current_index"] = current_index
-    RUNTIME_CACHE["total_scanned"] = total_scanned
-    RUNTIME_CACHE["leaderboard"] = leaderboard_dict
-    RUNTIME_CACHE["data_date"] = data_date
-
     if not DATABASE_URL:
         return
     try:
@@ -260,7 +273,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景掃描邏輯
+# 4. 背景掃描邏輯（整合完整 Supabase 同步）
 # ----------------------------------------------------
 def background_stock_scanner():
     curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
@@ -283,13 +296,9 @@ def background_stock_scanner():
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', ''))
 
-                # 日期不同時歸零重新計算
+                # 新交易日重置
                 if saved_date != "" and fetched_date != saved_date and fetched_date != "":
-                    curr_idx = 0
-                    total_scanned = 0
-                    leaderboard = {}
-                    saved_date = fetched_date
-                    update_scanner_state(0, 0, {}, saved_date)
+                    update_scanner_state(0, 0, {}, fetched_date)
                     return
 
                 if saved_date == "" and fetched_date != "":
@@ -315,6 +324,7 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
+                # 篩選指標條件
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
@@ -333,7 +343,8 @@ def background_stock_scanner():
                         'data_date': fetched_date
                     }
 
-        sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
+        # 動態取 Top 5 排序
+        sorted_list = sorted(leaderboard.values(), key=lambda x: x.get('score', 0), reverse=True)
         top5_list = sorted_list[:5]
         leaderboard = {x['code']: x for x in top5_list}
 
@@ -341,7 +352,7 @@ def background_stock_scanner():
         today_str = now_dt.strftime("%Y%m%d")
         week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
 
-        # 模擬倉隔離機制
+        # 模擬倉機制
         if PAPER_TRADING_AVAILABLE and total_scanned >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
             try:
                 auto_execute_paper_buy(top5_list[:3], today_str, week_str)
@@ -356,14 +367,14 @@ def background_stock_scanner():
         update_scanner_state(curr_idx + 1, total_scanned + 1, leaderboard, saved_date)
 
 # ----------------------------------------------------
-# 5. 排程器（30 秒一檔）
+# 5. 排程器 (30 秒安全間隔)
 # ----------------------------------------------------
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
-# 6. LINE Bot 路由與訊息 (完全還原舊版格式與圖示)
+# 6. LINE Bot 訊息觸發邏輯
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
@@ -410,9 +421,9 @@ def handle_message(event):
     except Exception as e:
         print(f"Handle Error: {e}")
 
-# 舊版選股卡片圖示與排版
+# 卡片格式
 def format_ai_report(top_stocks):
-    top_stocks.sort(key=lambda x: x['score'], reverse=True)
+    top_stocks.sort(key=lambda x: x.get('score', 0), reverse=True)
     results = []
     for item in top_stocks[:5]:
         card = (
@@ -426,12 +437,11 @@ def format_ai_report(top_stocks):
         results.append(card)
     return "\n\n".join(results)
 
-# 舊版 Header 標題排版
+# LINE 顯示輸出
 def get_ai_selected_stocks():
     curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
-    # 格式化日期：YYYY/MM/DD
     if len(saved_date) == 8:
         formatted_date = f"{saved_date[:4]}/{saved_date[4:6]}/{saved_date[6:]}"
     elif "-" in saved_date:
@@ -439,10 +449,8 @@ def get_ai_selected_stocks():
     else:
         formatted_date = datetime.datetime.now().strftime("%Y/%m/%d")
 
-    # 舊版準確括號文案
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
 
-    # 完全無資料時才顯示舊版暖機文字
     if total_scanned == 0 and not top_stocks:
         return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
