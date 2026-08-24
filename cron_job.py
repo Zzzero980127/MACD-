@@ -7,9 +7,12 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 雙重防線：優先讀取環境變數，若失敗則使用硬寫 Token
+# 讀取環境變數中的 Token，請確保在 Render Environment 填入新申請的 Token
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk"
+
+# 備援 Token (若 Render 沒讀到環境變數時使用)
+# ⚠️ 請把下方引號內的文字，替換成你在 FinMind 官網「新刷新」的完整 Token
+HARDCODED_TOKEN = "貼上你新刷新的FinMind_Token"
 
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -102,10 +105,14 @@ def fetch_stock_price_with_retry(stock_id):
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
             if len(df) >= 35: 
-                print(f"  └─ 🟢 [{stock_id}] 成功取得 90 天日 K 數據 ({len(df)}筆)", flush=True)
+                print(f"  └─ 🟢 [{stock_id}] 成功取得日 K 數據 ({len(df)}筆)", flush=True)
                 return df
         else:
-            print(f"  └─ ⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
+            try:
+                err_msg = res.json().get("msg", res.text[:50])
+            except Exception:
+                err_msg = res.text[:50]
+            print(f"  └─ ⚠️ [{stock_id}] 價量 API 異常 (Code: {res.status_code}, Msg: {err_msg})", flush=True)
     except Exception as e:
         print(f"  └─ ⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
 
@@ -193,7 +200,7 @@ def analyze_single_stock(stock_id):
 
 def run_precalculation():
     token_preview = FINMIND_TOKEN[:10] + "..." if len(FINMIND_TOKEN) > 10 else "無"
-    print(f"🚀 開始選股任務！(Token 強制帶入中: {token_preview})", flush=True)
+    print(f"🚀 開始選股任務！(Token 帶入中: {token_preview})", flush=True)
     
     target_stocks = get_top_100_volume_stocks()
     selected_stocks = []
