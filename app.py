@@ -11,6 +11,13 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# 匯入模擬交易模組 (paper_trading.py)
+from paper_trading import (
+    auto_execute_paper_buy,
+    get_paper_trades_status,
+    execute_paper_trades_settlement
+)
+
 app = Flask(__name__)
 
 # LINE 與 API 設定
@@ -243,7 +250,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (30 秒安全間隔)
+# 4. 背景輪詢掃描器 (30 秒安全間隔 + 僅週一至週三買進 Top 3)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -301,9 +308,17 @@ def background_stock_scanner():
                     }
 
         sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
-        leaderboard = {x['code']: x for x in sorted_list[:5]}
+        top5_list = sorted_list[:5]
+        leaderboard = {x['code']: x for x in top5_list}
 
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
+        now_dt = datetime.datetime.now()
+        today_str = now_dt.strftime("%Y%m%d")
+        week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
+
+        # 🎯 只在週一至週三 (now_dt.weekday() <= 2) 且有資料時，才將 Top 3 寫入模擬持股
+        if len(top5_list) >= 3 and now_dt.weekday() <= 2:
+            auto_execute_paper_buy(top5_list[:3], today_str, week_str)
+
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
         update_scanner_state(next_idx, total_scanned + 1, leaderboard)
 
@@ -350,6 +365,10 @@ def handle_message(event):
                 reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260823"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
+        elif clean_keyword in ["模擬持股", "PAPER", "持股"]:
+            reply_text = get_paper_trades_status()
+        elif clean_keyword in ["結算", "CLOSE", "週結算"]:
+            reply_text = execute_paper_trades_settlement()
         else:
             reply_text = analyze_stock(user_input)
 
@@ -489,12 +508,4 @@ def analyze_stock(user_input):
             f"量價結構:\n  {vol_status}\n"
             f"外資籌碼: {foreign_text}\n"
             f"--------------------\n"
-            f"📈 基本面與營收 :\n  {revenue_info}\n"
-            f"--------------------\n"
-            f"💡 操作建議 :\n{signal}"
-        )
-    except Exception as e:
-        return f"⚠️ 分析發生錯誤: {str(e)}"
-
-if __name__ == "__main__":
-    app.run(port=5000)
+        
