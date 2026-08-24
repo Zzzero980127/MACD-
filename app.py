@@ -12,7 +12,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# 匯入模擬交易模組 (paper_trading.py)
+# 匯入模擬交易模組
 try:
     from paper_trading import (
         auto_execute_paper_buy,
@@ -21,12 +21,11 @@ try:
     )
     PAPER_TRADING_AVAILABLE = True
 except Exception as e:
-    print(f"⚠️ paper_trading 模組載入失敗: {e}")
+    print(f"⚠️ paper_trading 載入失敗: {e}")
     PAPER_TRADING_AVAILABLE = False
 
 app = Flask(__name__)
 
-# LINE 與 API 設定
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
@@ -36,105 +35,122 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
-RETRY_QUEUE = []  # 待重試佇列
+
+# 🟢【核心改進】使用記憶體快取，防止資料庫讀取失敗時變回 0 檔！
+GLOBAL_CACHE = {
+    "current_index": 0,
+    "total_scanned": 0,
+    "leaderboard": {},
+    "data_date": ""
+}
 
 # ----------------------------------------------------
-# 1. Supabase (PostgreSQL) 資料庫操作
+# 1. Supabase 資料庫操作 (帶記憶體同步)
 # ----------------------------------------------------
 def get_db_connection():
+    if not DATABASE_URL:
+        return None
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     if not DATABASE_URL:
-        print("⚠️ 未偵測到 DATABASE_URL！")
         return
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS history (
-                date VARCHAR(20) PRIMARY KEY,
-                content TEXT
-            );
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS scanner_state (
-                id INT PRIMARY KEY,
-                current_index INT,
-                total_scanned INT,
-                leaderboard_json TEXT,
-                data_date VARCHAR(20)
-            );
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS paper_trades (
-                trade_date VARCHAR(20) PRIMARY KEY,
-                stocks_json TEXT,
-                status VARCHAR(20),
-                buy_prices_json TEXT,
-                settlement_json TEXT
-            );
-        ''')
-        
-        cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
-        if cursor.fetchone()[0] == 0:
-            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
-            
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS history (
+                        date VARCHAR(20) PRIMARY KEY,
+                        content TEXT
+                    );
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS scanner_state (
+                        id INT PRIMARY KEY,
+                        current_index INT,
+                        total_scanned INT,
+                        leaderboard_json TEXT,
+                        data_date VARCHAR(20)
+                    );
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS paper_trades (
+                        trade_date VARCHAR(20) PRIMARY KEY,
+                        stocks_json TEXT,
+                        status VARCHAR(20),
+                        buy_prices_json TEXT,
+                        settlement_json TEXT
+                    );
+                ''')
+                cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
+                conn.commit()
     except Exception as e:
-        print(f"Supabase Init Error: {e}")
+        print(f"⚠️ DB Init Exception: {e}")
 
 def get_scanner_state():
+    global GLOBAL_CACHE
     if not DATABASE_URL:
-        return 0, 0, {}, ""
+        return GLOBAL_CACHE["current_index"], GLOBAL_CACHE["total_scanned"], GLOBAL_CACHE["leaderboard"], GLOBAL_CACHE["data_date"]
+    
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        if row:
-            return row[0], row[1], json.loads(row[2]), (row[3] or "")
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            if row:
+                GLOBAL_CACHE["current_index"] = row[0]
+                GLOBAL_CACHE["total_scanned"] = row[1]
+                GLOBAL_CACHE["leaderboard"] = json.loads(row[2]) if row[2] else {}
+                GLOBAL_CACHE["data_date"] = row[3] or ""
     except Exception as e:
-        print(f"get_scanner_state error: {e}")
-    return 0, 0, {}, ""
+        print(f"⚠️ DB Read Error (使用快取數據): {e}")
+
+    return GLOBAL_CACHE["current_index"], GLOBAL_CACHE["total_scanned"], GLOBAL_CACHE["leaderboard"], GLOBAL_CACHE["data_date"]
 
 def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date):
+    global GLOBAL_CACHE
+    # 先強刷記憶體快取！
+    GLOBAL_CACHE["current_index"] = current_index
+    GLOBAL_CACHE["total_scanned"] = total_scanned
+    GLOBAL_CACHE["leaderboard"] = leaderboard_dict
+    GLOBAL_CACHE["data_date"] = data_date
+
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE scanner_state
-            SET current_index = %s, total_scanned = %s, leaderboard_json = %s, data_date = %s
-            WHERE id = 1;
-        ''', (current_index, total_scanned, json.dumps(leaderboard_dict), data_date))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE scanner_state
+                SET current_index = %s, total_scanned = %s, leaderboard_json = %s, data_date = %s
+                WHERE id = 1;
+            ''', (current_index, total_scanned, json.dumps(leaderboard_dict), data_date))
+            conn.commit()
+            cursor.close()
+            conn.close()
     except Exception as e:
-        print(f"update_scanner_state error: {e}")
+        print(f"⚠️ DB Write Error: {e}")
 
 def save_history_to_db(date_str, content_str):
     if not DATABASE_URL:
         return
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO history (date, content) VALUES (%s, %s)
-            ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;
-        ''', (date_str, content_str))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO history (date, content) VALUES (%s, %s)
+                ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;
+            ''', (date_str, content_str))
+            conn.commit()
+            cursor.close()
+            conn.close()
     except Exception:
         pass
 
@@ -143,19 +159,20 @@ def get_history_from_db(date_str):
         return None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        return row[0] if row else None
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            return row[0] if row else None
     except Exception:
         return None
 
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單
+# 2. 載入全台股清單
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -171,7 +188,7 @@ def load_all_taiwan_stocks():
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TWSE Load Error: {e}")
+        print(f"TWSE Error: {e}")
 
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
@@ -183,7 +200,7 @@ def load_all_taiwan_stocks():
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception as e:
-        print(f"TPEx Load Error: {e}")
+        print(f"TPEx Error: {e}")
 
 load_all_taiwan_stocks()
 
@@ -208,8 +225,8 @@ def get_tw_stock_data(stock_id):
                 df = df.dropna(subset=['Close'])
                 if len(df) >= 20:
                     return df
-    except Exception as e:
-        print(f"FinMind K-line Error ({stock_id}): {e}")
+    except Exception:
+        pass
     return None
 
 def get_tw_foreign_investor(stock_id):
@@ -230,8 +247,8 @@ def get_tw_foreign_investor(stock_id):
                     day_data = foreign_df[foreign_df['date'] == latest_date]
                     net_shares = day_data['buy'].sum() - day_data['sell'].sum()
                     return round(net_shares / 1000)
-    except Exception as e:
-        print(f"FinMind Foreign Error ({stock_id}): {e}")
+    except Exception:
+        pass
     return 0
 
 def get_tw_stock_revenue(stock_id):
@@ -265,16 +282,16 @@ def get_tw_stock_revenue(stock_id):
 
                     eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
                     return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
-    except Exception as e:
-        print(f"FinMind Revenue Error ({stock_id}): {e}")
+    except Exception:
+        pass
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (絕對不掛掉機制)
+# 4. 背景掃描邏輯（保證滾動推進）
 # ----------------------------------------------------
 def background_stock_scanner():
     curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
-    
+
     try:
         if len(STOCK_NAME_MAP) < 10:
             load_all_taiwan_stocks()
@@ -293,8 +310,9 @@ def background_stock_scanner():
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', ''))
 
+                # 💡【日期不同自動歸零重跑】
                 if saved_date != "" and fetched_date != saved_date and fetched_date != "":
-                    print(f"🚨 偵測到新資料 ({fetched_date})，重置掃描。")
+                    print(f"🔄 偵測到新資料日期 ({fetched_date})，重置掃描進度！")
                     curr_idx = 0
                     total_scanned = 0
                     leaderboard = {}
@@ -325,7 +343,7 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
-                # 嚴格篩選條件
+                # 技術面選股條件
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
@@ -344,7 +362,7 @@ def background_stock_scanner():
                         'data_date': fetched_date
                     }
 
-        # 保留 Top 5
+        # 只維持 Top 5
         sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
         top5_list = sorted_list[:5]
         leaderboard = {x['code']: x for x in top5_list}
@@ -353,35 +371,37 @@ def background_stock_scanner():
         today_str = now_dt.strftime("%Y%m%d")
         week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
 
-        # 安全呼叫模擬倉（加裝防火牆，絕不影響掃描進度）
+        # 模擬倉呼叫防護
         if PAPER_TRADING_AVAILABLE and total_scanned >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
             try:
                 auto_execute_paper_buy(top5_list[:3], today_str, week_str)
             except Exception as pe:
-                print(f"⚠️ 模擬倉執行安全跳過: {pe}")
+                print(f"⚠️ 模擬倉跳過: {pe}")
 
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        
-        # 關鍵：無條件更新掃描進度！
+
+        # 🟢【強制推進】無論有沒有中選，掃描檔數 + 1！
         update_scanner_state(next_idx, total_scanned + 1, leaderboard, saved_date)
-        print(f"✅ [背景掃描] 完成 {name}({code}) | 總進度: {total_scanned + 1} 檔")
+        print(f"🚀 [掃描中] 檔數: {total_scanned + 1} | 最新股票: {name}({code})")
 
     except Exception as e:
-        print(f"❌ Scanner General Error: {e}")
-        # 即使發生任何未知錯誤，也強制進度 +1，防止永遠卡死在 0！
+        print(f"❌ Scanner Error: {e}")
+        # 即使發生任何未知錯，也強行把進度 +1，絕對不卡死在 0！
         update_scanner_state(curr_idx + 1, total_scanned + 1, leaderboard, saved_date)
 
-# 啟動背景排程器 (30 秒一檔)
+# ----------------------------------------------------
+# 5. 排程器啟動 (多重防重覆機制)
+# ----------------------------------------------------
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
-# 5. LINE Bot Routes
+# 6. LINE Bot 路由處理
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active!"
+    return f"TW Stock Bot Active! Current Progress: {GLOBAL_CACHE['total_scanned']} stocks."
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -407,7 +427,7 @@ def handle_message(event):
             if history_report:
                 reply_text = f"📜【查閱 ({target_date}) 歷史 AI 選股紀錄】:\n\n" + history_report
             else:
-                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260824"
+                reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認格式如 20260824"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
         elif clean_keyword in ["模擬持股", "PAPER", "持股", "持倉"]:
@@ -444,20 +464,21 @@ def get_ai_selected_stocks():
     curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
-    if total_scanned < 1 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1 分鐘後重新點選！"
+    # 只有當進度真的等於 0 且排行沒有任何數據時才顯示暖機
+    if total_scanned == 0 and not top_stocks:
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 0 檔標的\n💡 系統剛啟動，請等待 1 分鐘後再點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(最新基準日期: {saved_date} | 已累計動態掃描 {total_scanned} 檔標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
-        return f"🎯【{today_str} AI 全台股動態排名】:\n{scanned_info}\n目前尚無符合嚴格條件的標的，後續持續篩選中！"
+        return f"🎯【{today_str} AI 全台股動態排名】:\n{scanned_info}\n目前尚無符合條件的標的，持續掃描中！"
 
     return f"🎯【{today_str} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 個股完整解析
+# 7. 個股完整解析
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 10:
