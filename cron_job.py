@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import datetime
 import psycopg2
+import gc  # 導入垃圾回收模組，防止記憶體爆掉
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
@@ -101,7 +102,7 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 【v2.0 嚴格控速版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
+    print("🚀 【防爆優化版】後台啟動：開始運算全台股成交量前 100 档指標...", flush=True)
     headers = {'User-Agent': 'Mozilla/5.0'}
     raw_list = []
 
@@ -123,15 +124,16 @@ def run_precalculation():
     leaderboard = []
     trade_date = ""
 
-    # 前 100 檔逐一計算，每檔精準間隔 10 秒
     for idx, item in enumerate(top_100, 1):
+        # flush=True 確保每秒即時顯示在 Log，不再被暫存封鎖
         print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
         res = analyze_candidate(item)
         if res is not None:
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
-        # ⚠️ 強制每單次迴圈結束必等 10 秒
+        # 釋放記憶體避免 Render 重啟
+        gc.collect()
         time.sleep(10)
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
