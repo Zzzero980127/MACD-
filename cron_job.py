@@ -131,6 +131,7 @@ def run_precalculation():
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
+        # 強制每處理一檔停頓 10 秒，避免請求太頻繁
         time.sleep(10)
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
@@ -154,7 +155,7 @@ def run_precalculation():
 
         final_content = header_title + "\n\n".join(report_cards)
 
-        # 1. 寫入 Supabase 快取（同時寫入多種日期 key，確保使用者輸入 20260824 或 0824 都能查到）
+        # 1. 寫入 Supabase 快取（同時寫入多種日期 key）
         save_history_to_db("LATEST", final_content)
         save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%m%d"), final_content)
