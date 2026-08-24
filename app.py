@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import pandas as pd
 import datetime
@@ -127,7 +128,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單 (防 API 格式錯誤)
+# 2. 上市 + 上櫃 股票清單 (從官方 Open Data 免費載入)
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -160,7 +161,7 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 數據抓取
+# 3. FinMind 數據抓取 (含異常處理)
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
@@ -169,7 +170,7 @@ def get_tw_stock_data_finmind(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -180,8 +181,8 @@ def get_tw_stock_data_finmind(stock_id):
                 df = df.dropna(subset=['Close'])
                 if len(df) >= 20:
                     return df
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"FinMind Data Error ({stock_id}): {e}")
     return None
 
 def get_tw_foreign_investor(stock_id):
@@ -191,7 +192,7 @@ def get_tw_foreign_investor(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -213,7 +214,7 @@ def get_tw_stock_revenue(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -242,7 +243,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (修復重啟歸零問題)
+# 4. 背景輪詢掃描器 (精確控速版：絕不超過 600 次/小時)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -253,19 +254,26 @@ def background_stock_scanner():
         if not all_stocks:
             return
 
-        # 每次輪詢都向 Supabase 讀取最新狀態，防範休眠重啟影響
         curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
-        name, code = all_stocks[curr_idx % len(all_stocks)]
-        next_idx = (curr_idx + 1) % len(all_stocks)
 
-        if not code.startswith("00") and len(code) == 4:
+        # 🔒 安全控速：每 30 秒執行一次，每次處理 3 檔股票
+        # 一小時最多 360 次 API 請求，遠小於免費額度 600 次！
+        BATCH_SIZE = 3
+        
+        for i in range(BATCH_SIZE):
+            idx = (curr_idx + i) % len(all_stocks)
+            name, code = all_stocks[idx]
+
+            if code.startswith("00") or len(code) != 4:
+                continue
+
             df = get_tw_stock_data_finmind(code)
+            time.sleep(0.3)  # 防護延遲，避免短時間過多連線
 
             if df is not None and len(df) >= 20:
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', '')).strip()
 
-                # 遇到真正的跨日交易才重置
                 if fetched_date:
                     if not recorded_date:
                         recorded_date = fetched_date
@@ -295,9 +303,11 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
-                # 技術面條件過濾
+                # 只有技術面通過才去消耗第二支籌碼 API
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
+                    time.sleep(0.3)
+
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
                     macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else "紅柱微幅擴張"
 
@@ -320,8 +330,8 @@ def background_stock_scanner():
             history_key = recorded_date.replace("-", "")
             save_history_to_db(history_key, format_ai_report(list(leaderboard.values())))
 
-        # 將進度存回 DB
-        update_scanner_state(next_idx, total_scanned + 1, leaderboard, recorded_date)
+        next_idx = (curr_idx + BATCH_SIZE) % len(all_stocks)
+        update_scanner_state(next_idx, total_scanned + BATCH_SIZE, leaderboard, recorded_date)
 
     except Exception as e:
         print(f"Scanner Loop Catch: {e}")
@@ -331,7 +341,7 @@ scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
-# 5. LINE Bot Routes
+# 5. LINE Bot 路由與事件處理
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
@@ -507,3 +517,4 @@ def analyze_stock(user_input):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
