@@ -69,28 +69,40 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 def get_tw_stock_data_finmind(stock_id):
+    """ 單股查詢優先嘗試 Token，若失敗（如限流）自動切換成公用免 Token 模式 """
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+    
+    # 第一次試帶 Token
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
-        
-        res = requests.get(url, headers=headers, timeout=8.0)
+        res = requests.get(url, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
-            if len(df) >= 5: return df # 放寬為大於等於 5 天即可分析
+            if len(df) >= 5: return df
     except Exception: pass
+
+    # 第二次備援：不帶 Token（分流避開 Token 頻率限制）
+    url_public = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+    try:
+        res = requests.get(url_public, timeout=4.0)
+        if res.status_code == 200 and res.json().get("data"):
+            df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+            df = df.dropna(subset=['Close'])
+            if len(df) >= 5: return df
+    except Exception: pass
+
     return None
 
 def get_tw_foreign_investor(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
-
-        res = requests.get(url, headers=headers, timeout=5.0)
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
+        res = requests.get(url, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
@@ -104,10 +116,8 @@ def get_tw_foreign_investor(stock_id):
 def get_tw_stock_revenue(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
-
-        res = requests.get(url, headers=headers, timeout=5.0)
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
+        res = requests.get(url, timeout=4.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             if 'revenue' in df.columns and len(df) >= 13:
