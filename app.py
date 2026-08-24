@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import datetime
 import psycopg2
+import threading
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -60,7 +61,7 @@ def update_stock_symbol_map():
     except Exception as e:
         print(f"⚠️ 動態抓取證交所名單失敗: {e}", flush=True)
 
-# 伺服器啟動時立即執行一次名單更新
+# 伺服器啟動時執行一次名單更新
 update_stock_symbol_map()
 
 def get_db_connection():
@@ -222,6 +223,17 @@ def analyze_stock(stock_id):
 @app.route("/", methods=['GET'])
 def index():
     return f"LINE Bot Webhook Server is Running! (Loaded {len(STOCK_NAME_TO_ID)} stocks)"
+
+# cron-job.org 觸發進入點
+@app.route("/run_cron", methods=['GET', 'POST'])
+def trigger_cron():
+    """ 供 cron-job.org 呼叫的選股任務觸發點 """
+    try:
+        from cron_job import run_precalculation
+        threading.Thread(target=run_precalculation).start()
+        return "🚀 AI 選股背景任務已成功啟動！", 200
+    except Exception as e:
+        return f"❌ 觸發任務失敗: {e}", 500
 
 @app.route("/callback", methods=['POST'])
 def callback():
