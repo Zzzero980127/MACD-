@@ -5,6 +5,7 @@ import pandas as pd
 import datetime
 import re
 import psycopg2
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -26,7 +27,7 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_NAME_MAP = {}
 
 # ----------------------------------------------------
-# 1. Supabase (PostgreSQL) 資料庫（儲存歷史選股紀錄）
+# 1. Supabase (PostgreSQL) 資料庫
 # ----------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -82,7 +83,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 / 上櫃 股票名稱地圖（Open Data 免費載入）
+# 2. 上市 / 上櫃 股票名稱地圖
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -90,7 +91,7 @@ def load_all_taiwan_stocks():
 
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=5)
+        res = requests.get(url_twse, headers=headers, timeout=3)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
@@ -102,7 +103,7 @@ def load_all_taiwan_stocks():
 
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-        res = requests.get(url_tpex, headers=headers, timeout=5)
+        res = requests.get(url_tpex, headers=headers, timeout=3)
         if res.status_code == 200 and res.text.strip().startswith('['):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
@@ -115,7 +116,7 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 技術面、外資與營收抓取 (少量精準呼叫)
+# 3. FinMind 技術面與籌碼 API
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
@@ -124,7 +125,7 @@ def get_tw_stock_data_finmind(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -146,7 +147,7 @@ def get_tw_foreign_investor(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -168,7 +169,7 @@ def get_tw_stock_revenue(stock_id):
         if FINMIND_TOKEN:
             url += f"&token={FINMIND_TOKEN}"
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=2.5)
         if res.status_code == 200:
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
@@ -197,68 +198,17 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 全台股 Open Data 快照極速雙階篩選器 (3 秒產出)
+# 4. 單檔股票分析作業（多線程平行計算）
 # ----------------------------------------------------
-def fast_scan_all_stocks():
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    candidates = []
-
-    # 第一階段：1 秒內取得全上市股當日快照
+def analyze_candidate(item):
     try:
-        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                code = str(item.get("Code", "")).strip()
-                name = str(item.get("Name", "")).strip().replace(" ", "")
-                if code.isdigit() and len(code) == 4 and not code.startswith("00"):
-                    try:
-                        close = float(item.get("ClosingPrice", 0))
-                        vol = float(item.get("TradeVolume", 0)) / 1000 # 換算張數
-                        # 初篩：成交量 > 500 張、股價 10~600 元
-                        if 10 <= close <= 600 and vol >= 500:
-                            candidates.append({'code': code, 'name': name, 'close': close, 'vol': vol})
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    # 取得全上櫃股當日快照
-    try:
-        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
-        res = requests.get(url_tpex, headers=headers, timeout=5)
-        if res.status_code == 200 and res.text.strip().startswith('['):
-            for item in res.json():
-                code = str(item.get("SecuritiesCompanyCode", "")).strip()
-                name = str(item.get("CompanyName", "")).strip().replace(" ", "")
-                if code.isdigit() and len(code) == 4 and not code.startswith("00"):
-                    try:
-                        close = float(item.get("Close", 0))
-                        vol = float(item.get("TradingShares", 0)) / 1000
-                        if 10 <= close <= 600 and vol >= 500:
-                            candidates.append({'code': code, 'name': name, 'close': close, 'vol': vol})
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    # 排序取流動性最佳的前 30 檔熱門候選標的
-    candidates.sort(key=lambda x: x['vol'], reverse=True)
-    top_candidates = candidates[:30]
-
-    leaderboard = []
-    trade_date = ""
-
-    # 第二階段：對這 30 檔進一步進行低位階 MACD 及籌碼分析
-    for item in top_candidates:
         code = item['code']
         name = item['name']
         df = get_tw_stock_data_finmind(code)
 
         if df is not None and len(df) >= 20:
             latest = df.iloc[-1]
-            if not trade_date:
-                trade_date = str(latest.get('date', '')).strip()
+            trade_date = str(latest.get('date', '')).strip()
 
             df['MA20'] = df['Close'].rolling(window=20).mean()
             exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -280,16 +230,13 @@ def fast_scan_all_stocks():
             gain_5d = ((close - close_5d) / close_5d) * 100
             bias_pct = ((close - ma20) / ma20) * 100
 
-            # 🛡️ 嚴格防追高 + 低位階條件過濾：
-            # 1. 近 5 日漲幅 <= 15% (拒絕飆高追高)
-            # 2. 月線乖離率在 -10% ~ +10% (緊貼月線附近整理)
-            # 3. MACD 柱狀體上升 (空方衰退或多頭啟動)
+            # 防追高與低位階指標卡關條件
             if (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                 foreign_val = get_tw_foreign_investor(code)
                 score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
                 macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else "紅柱微幅擴張"
 
-                leaderboard.append({
+                return {
                     'code': code,
                     'name': name,
                     'close': close,
@@ -298,13 +245,98 @@ def fast_scan_all_stocks():
                     'gain_5d': gain_5d,
                     'foreign_net': foreign_val,
                     'macd_status': macd_status_text,
-                    'score': score
-                })
+                    'score': score,
+                    'trade_date': trade_date
+                }
+    except Exception:
+        pass
+    return None
+
+# ----------------------------------------------------
+# 5. 多線程超高速選股引擎 (帶完全防空值機制)
+# ----------------------------------------------------
+def fast_scan_all_stocks():
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    candidates = []
+
+    # 1. 抓取上市快照
+    try:
+        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res = requests.get(url_twse, headers=headers, timeout=3)
+        if res.status_code == 200 and isinstance(res.json(), list):
+            for item in res.json():
+                code = str(item.get("Code", "")).strip()
+                name = str(item.get("Name", "")).strip().replace(" ", "")
+                raw_close = str(item.get("ClosingPrice", "")).replace(",", "").strip()
+                raw_vol = str(item.get("TradeVolume", "")).replace(",", "").strip()
+
+                if code.isdigit() and len(code) == 4 and not code.startswith("00") and raw_close and raw_close != "--":
+                    try:
+                        close = float(raw_close)
+                        vol = float(raw_vol) / 1000
+                        if 10 <= close <= 600 and vol >= 1000:
+                            candidates.append({'code': code, 'name': name, 'close': close, 'vol': vol})
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"TWSE Fetch Error: {e}")
+
+    # 2. 抓取上櫃快照
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
+        res = requests.get(url_tpex, headers=headers, timeout=3)
+        if res.status_code == 200 and res.text.strip().startswith('['):
+            for item in res.json():
+                code = str(item.get("SecuritiesCompanyCode", "")).strip()
+                name = str(item.get("CompanyName", "")).strip().replace(" ", "")
+                raw_close = str(item.get("Close", "")).replace(",", "").strip()
+                raw_vol = str(item.get("TradingShares", "")).replace(",", "").strip()
+
+                if code.isdigit() and len(code) == 4 and not code.startswith("00") and raw_close and raw_close != "---":
+                    try:
+                        close = float(raw_close)
+                        vol = float(raw_vol) / 1000
+                        if 10 <= close <= 600 and vol >= 1000:
+                            candidates.append({'code': code, 'name': name, 'close': close, 'vol': vol})
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"TPEX Fetch Error: {e}")
+
+    # 3. 備援防空值機制：若全無資料，切換為熱門指標權值庫
+    if not candidates:
+        top_candidates = [
+            {'code': '2330', 'name': '台積電'},
+            {'code': '2317', 'name': '鴻海'},
+            {'code': '2454', 'name': '聯發科'},
+            {'code': '2382', 'name': '廣達'},
+            {'code': '3231', 'name': '緯創'},
+            {'code': '2308', 'name': '台達電'},
+            {'code': '2356', 'name': '英業達'},
+            {'code': '6669', 'name': '緯穎'},
+            {'code': '3017', 'name': '奇鋐'},
+            {'code': '2376', 'name': '技嘉'}
+        ]
+    else:
+        candidates.sort(key=lambda x: x['vol'], reverse=True)
+        top_candidates = candidates[:15]
+
+    leaderboard = []
+    trade_date = ""
+
+    # 4. 8 個 Thread 多線程平行計算
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(analyze_candidate, top_candidates))
+
+    for r in results:
+        if r is not None:
+            leaderboard.append(r)
+            if not trade_date and r.get('trade_date'):
+                trade_date = r['trade_date']
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
     top_5 = leaderboard[:5]
 
-    # 保存當天選股歷史至 Supabase
     if top_5 and trade_date:
         history_key = trade_date.replace("-", "")
         save_history_to_db(history_key, format_ai_report(top_5))
@@ -312,11 +344,11 @@ def fast_scan_all_stocks():
     return top_5, trade_date
 
 # ----------------------------------------------------
-# 5. LINE Bot 路由與訊息回應
+# 6. LINE Bot 路由與事件
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active with Realtime OpenData Engine!"
+    return "TW Stock Bot Active with Multithreaded Engine!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -360,6 +392,13 @@ def handle_message(event):
         )
     except Exception as e:
         print(f"Handle Error: {e}")
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="⚠️ 系統選股計算逾時或發生錯誤，請再試一次！")
+            )
+        except Exception:
+            pass
 
 def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
@@ -377,7 +416,7 @@ def format_ai_report(top_stocks):
     return "\n\n".join(results)
 
 # ----------------------------------------------------
-# 6. 個股單獨查詢解析
+# 7. 個股單獨查詢
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
