@@ -48,12 +48,17 @@ def init_db():
                 id INT PRIMARY KEY,
                 current_index INT,
                 total_scanned INT,
-                leaderboard_json TEXT
+                leaderboard_json TEXT,
+                data_date VARCHAR(20)
             );
+        ''')
+        # 擴充欄位檢查
+        cursor.execute('''
+            ALTER TABLE scanner_state ADD COLUMN IF NOT EXISTS data_date VARCHAR(20) DEFAULT '';
         ''')
         cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
         if cursor.fetchone()[0] == 0:
-            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json) VALUES (1, 0, 0, %s);', ("{}",))
+            cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
         conn.commit()
         cursor.close()
         conn.close()
@@ -62,21 +67,21 @@ def init_db():
 
 def get_scanner_state():
     if not DATABASE_URL:
-        return 0, 0, {}
+        return 0, 0, {}, ""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT current_index, total_scanned, leaderboard_json FROM scanner_state WHERE id = 1;')
+        cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
         row = cursor.fetchone()
         cursor.close()
         conn.close()
         if row:
-            return row[0], row[1], json.loads(row[2])
+            return row[0] or 0, row[1] or 0, json.loads(row[2]) if row[2] else {}, row[3] or ""
     except Exception:
         pass
-    return 0, 0, {}
+    return 0, 0, {}, ""
 
-def update_scanner_state(current_index, total_scanned, leaderboard_dict):
+def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date=""):
     if not DATABASE_URL:
         return
     try:
@@ -84,9 +89,9 @@ def update_scanner_state(current_index, total_scanned, leaderboard_dict):
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE scanner_state
-            SET current_index = %s, total_scanned = %s, leaderboard_json = %s
+            SET current_index = %s, total_scanned = %s, leaderboard_json = %s, data_date = %s
             WHERE id = 1;
-        ''', (current_index, total_scanned, json.dumps(leaderboard_dict)))
+        ''', (current_index, total_scanned, json.dumps(leaderboard_dict), data_date))
         conn.commit()
         cursor.close()
         conn.close()
@@ -126,33 +131,31 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單 (優化抓取與去空白邏輯)
+# 2. 上市 + 上櫃 股票清單
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # 1. 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
-                s_name = str(item.get("Name", "")).strip().replace(" ", "").replace(" ", "")
+                s_name = str(item.get("Name", "")).strip().replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
         pass
 
-    # 2. 上櫃股票 (TPEx)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "").replace(" ", "")
+                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
@@ -237,13 +240,13 @@ def get_tw_stock_revenue(stock_id):
                     mom_val = ((rev_latest - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0.0
 
                     eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
-                    return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n   評價: {eval_text}"
+                    return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n    評價: {eval_text}"
     except Exception:
         pass
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (30 秒安全間隔)
+# 4. 背景輪詢掃描器 (含跨日收盤新資料自動重置邏輯)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -254,7 +257,7 @@ def background_stock_scanner():
         if not all_stocks:
             return
 
-        curr_idx, total_scanned, leaderboard = get_scanner_state()
+        curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
         next_idx = (curr_idx + 1) % len(all_stocks)
 
@@ -262,6 +265,17 @@ def background_stock_scanner():
             df = get_tw_stock_data_finmind(code)
 
             if df is not None and len(df) >= 20:
+                latest = df.iloc[-1]
+                fetched_date = str(latest.get('date', ''))
+
+                # 💡 核心重點：當偵測到 API 釋出全新交易日資料，歸零重新開始掃描！
+                if recorded_date != "" and fetched_date != recorded_date and fetched_date != "":
+                    update_scanner_state(0, 0, {}, fetched_date)
+                    return
+
+                if recorded_date == "" and fetched_date != "":
+                    recorded_date = fetched_date
+
                 df['MA20'] = df['Close'].rolling(window=20).mean()
                 exp1 = df['Close'].ewm(span=12, adjust=False).mean()
                 exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -269,7 +283,6 @@ def background_stock_scanner():
                 df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
                 df['Hist'] = df['DIF'] - df['MACD']
 
-                latest = df.iloc[-1]
                 prev = df.iloc[-2]
                 five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
 
@@ -304,12 +317,14 @@ def background_stock_scanner():
         leaderboard = {x['code']: x for x in sorted_list[:5]}
 
         today_str = datetime.datetime.now().strftime("%Y%m%d")
-        save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        update_scanner_state(next_idx, total_scanned + 1, leaderboard)
+        if leaderboard:
+            save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
+        
+        update_scanner_state(next_idx, total_scanned + 1, leaderboard, recorded_date)
 
     except Exception:
-        curr_idx, total_scanned, leaderboard = get_scanner_state()
-        update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
+        curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
+        update_scanner_state(curr_idx + 1, total_scanned, leaderboard, recorded_date)
 
 # 啟動背景排程 (30 秒間隔)
 scheduler = BackgroundScheduler(daemon=True)
@@ -376,40 +391,37 @@ def format_ai_report(top_stocks):
     return "\n\n".join(results)
 
 def get_ai_selected_stocks():
-    curr_idx, total_scanned, leaderboard = get_scanner_state()
+    curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 5 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 档標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
-    today_str = datetime.datetime.now().strftime("%Y/%m/%d")
+    display_date = recorded_date.replace("-", "/") if recorded_date else datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
-        return f"🎯【{today_str} AI 全台股動態排名】:\n{scanned_info}\n目前尚無符合嚴格條件的標的，後續持續篩選中！"
+        return f"🎯【{display_date} AI 全台股動態排名】:\n{scanned_info}\n目前尚無符合嚴格條件的標的，後續持續篩選中！"
 
-    return f"🎯【{today_str} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
+    return f"🎯【{display_date} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 個股完整解析 (強化中文模糊搜尋與上櫃對應)
+# 6. 個股完整解析
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
         load_all_taiwan_stocks()
 
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace(" ", "").strip()
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
 
-    # 1. 直接輸入 4 位數字代碼
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         return clean_input, name[0] if name else clean_input
 
-    # 2. 完全符合股票中文名稱
     if clean_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[clean_input], clean_input
 
-    # 3. 雙向模糊搜尋（防止使用者少打關鍵字或多打字）
     for name, code in STOCK_NAME_MAP.items():
         if clean_input in name or name in clean_input:
             return code, name
@@ -497,4 +509,5 @@ def analyze_stock(user_input):
         return f"⚠️ 分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
