@@ -12,7 +12,7 @@ ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 
 # 備援 Token (若 Render 沒讀到環境變數時使用)
 # ⚠️ 請把下方引號內的文字，替換成你在 FinMind 官網「新刷新」的完整 Token
-HARDCODED_TOKEN = "貼上你新刷新的FinMind_Token"
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
 
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
