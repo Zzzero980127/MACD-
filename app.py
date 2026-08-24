@@ -126,31 +126,33 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單
+# 2. 上市 + 上櫃 股票清單 (優化抓取與去空白邏輯)
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
 
+    # 1. 上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url_twse, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
-                s_name = str(item.get("Name", "")).strip()
+                s_name = str(item.get("Name", "")).strip().replace(" ", "").replace("　", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
         pass
 
+    # 2. 上櫃股票 (TPEx)
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
         res = requests.get(url_tpex, headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip()
+                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "").replace("　", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
@@ -337,7 +339,7 @@ def handle_message(event):
         user_input = event.message.text.strip()
         clean_keyword = user_input.upper().replace(" ", "")
 
-        date_match = re.search(r'^(\20\d{6})$', clean_keyword)
+        date_match = re.search(r'^(20\d{6})$', clean_keyword)
 
         if date_match:
             target_date = date_match.group(1)
@@ -390,21 +392,24 @@ def get_ai_selected_stocks():
     return f"🎯【{today_str} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
 # ----------------------------------------------------
-# 6. 個股完整解析
+# 6. 個股完整解析 (強化中文模糊搜尋與上櫃對應)
 # ----------------------------------------------------
 def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
         load_all_taiwan_stocks()
 
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace("　", "").strip()
 
+    # 1. 直接輸入 4 位數字代碼
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
         return clean_input, name[0] if name else clean_input
 
+    # 2. 完全符合股票中文名稱
     if clean_input in STOCK_NAME_MAP:
         return STOCK_NAME_MAP[clean_input], clean_input
 
+    # 3. 雙向模糊搜尋（防止使用者少打關鍵字或多打字）
     for name, code in STOCK_NAME_MAP.items():
         if clean_input in name or name in clean_input:
             return code, name
