@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import pandas as pd
 import datetime
@@ -11,7 +12,7 @@ from linebot.models import TextSendMessage
 # 環境變數設定
 # ----------------------------------------------------
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
-LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()  # 你的 U6a3217c...
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()  # 你的 LINE User ID (U6a3217c...)
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
@@ -43,7 +44,7 @@ def save_history_to_db(date_str, content_str):
         print(f"❌ DB Save Error: {e}")
 
 # ----------------------------------------------------
-# 技術面與外資籌碼抓取 (含近兩日外資數據)
+# 資料抓取 (含 API 自動限速機制)
 # ----------------------------------------------------
 def get_tw_stock_data(stock_id):
     try:
@@ -62,7 +63,6 @@ def get_tw_stock_data(stock_id):
     return None
 
 def get_tw_foreign_investor_history(stock_id):
-    """取得最近兩天的外資買賣超張數"""
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
@@ -73,7 +73,6 @@ def get_tw_foreign_investor_history(stock_id):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
             if not foreign_df.empty:
-                # 依日期群組計算每日淨買賣超
                 daily_summary = foreign_df.groupby('date').apply(lambda x: x['buy'].sum() - x['sell'].sum()).reset_index(name='net')
                 daily_summary = daily_summary.sort_values('date')
                 if len(daily_summary) >= 2:
@@ -86,14 +85,21 @@ def get_tw_foreign_investor_history(stock_id):
     return 0, 0
 
 # ----------------------------------------------------
-# 防追高 + 防隔日沖 + 外資轉買演算法
+# 防追高 + 防隔日沖 + 外資轉買動態評分演算法
 # ----------------------------------------------------
 def analyze_candidate(item):
     try:
         code, name = item['code'], item['name']
+        
+        # 1. 抓取 K 線資料
         df = get_tw_stock_data(code)
+        time.sleep(0.8)  # ⏱️ 延遲 0.8 秒，防止 API 請求頻率過高
 
         if df is not None and len(df) >= 20:
+            # 2. 抓取籌碼資料
+            foreign_today, foreign_yesterday = get_tw_foreign_investor_history(code)
+            time.sleep(0.8)  # ⏱️ 延遲 0.8 秒，保護 API
+
             latest = df.iloc[-1]
             trade_date = str(latest.get('date', '')).strip()
 
@@ -114,27 +120,23 @@ def analyze_candidate(item):
             hist_today, hist_yesterday = float(latest['Hist']), float(prev['Hist'])
             gain_5d = ((close - close_5d) / close_5d) * 100
             bias_pct = ((close - ma20) / ma20) * 100
-            
-            # 外資昨日與今日動態
-            foreign_today, foreign_yesterday = get_tw_foreign_investor_history(code)
 
             score = 100.0
 
-            # 1. 籌碼動態判斷 (外資由賣轉買加分 / 爆量急買避開隔日沖)
+            # --- 籌碼邏輯：獎勵溫和轉買，扣重分避開隔日沖 ---
             if foreign_yesterday < 0 and foreign_today > 200:
-                score += 15.0  # 外資溫和由賣轉買，起漲訊號
+                score += 15.0  # 外資由賣轉買，起漲安全訊號
             elif foreign_today > 3000 and gain_5d > 8.0:
-                score -= 40.0  # 警告：短線爆買 + 大漲，極可能是隔日沖高檔倒貨！
+                score -= 40.0  # 警告：爆量急買 + 大漲，高機率為隔日沖高檔倒貨！
             elif foreign_today < 0:
                 score -= abs(foreign_today) * 0.1  # 外資賣超扣分
 
-            # 2. 防追高重罰機制 (位階過高直接剔除前三名)
+            # --- 防追高一票否決機制 ---
             if gain_5d > 10.0:
-                score -= (gain_5d - 10.0) * 8.0  # 5日漲幅 > 10% 快速重扣
+                score -= (gain_5d - 10.0) * 8.0  # 近 5 日漲幅 > 10% 快速重扣
             if bias_pct > 6.0:
                 score -= (bias_pct - 6.0) * 10.0 # 乖離率 > 6% 重扣
 
-            # 3. 價量與 MACD 狀態
             if close < prev_close: score -= 20.0
             score += 10.0 if hist_today > hist_yesterday else -10.0
 
@@ -148,10 +150,11 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 開始執行全台股大數據分析 (精準極致 Top 3)...")
+    print("🚀 開始執行全台股大數據分析 (安全防超限版 Top 3)...")
     headers = {'User-Agent': 'Mozilla/5.0'}
     raw_list = []
 
+    # 政府開放資料 (不計入 FinMind 額度)
     for url in ["https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
                 "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"]:
         try:
@@ -166,13 +169,15 @@ def run_precalculation():
                         except Exception: pass
         except Exception: pass
 
-    # 抓取前 100 大成交量
+    # 前 100 大成交量
     raw_list.sort(key=lambda x: x['vol'], reverse=True)
     top_100 = raw_list[:100]
 
     leaderboard = []
     trade_date = ""
-    with ThreadPoolExecutor(max_workers=8) as executor:
+
+    # 使用 2 個平行線程，穩定推進，完全不爆 API 頻率
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(analyze_candidate, top_100))
 
     for r in results:
@@ -181,7 +186,7 @@ def run_precalculation():
             if not trade_date and r.get('trade_date'):
                 trade_date = r['trade_date']
 
-    # 排名後只保留最精準的 Top 3
+    # 排序並截取 Top 3
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
     top_3 = leaderboard[:3]
 
@@ -193,7 +198,7 @@ def run_precalculation():
         
         report_cards = []
         for idx, item in enumerate(top_3, 1):
-            chip_note = "🟢 外資轉買" if (item['foreign_prev'] < 0 and item['foreign_net'] > 0) else f"外資 {item['foreign_net']} 張"
+            chip_note = "🟢 外資轉買" if (item['foreign_prev'] < 0 and item['foreign_net'] > 0) else f"外资 {item['foreign_net']} 張"
             card = (
                 f"🔥 No.{idx} {item['name']} ({item['code']})\n"
                 f"  • 收盤價: ${item['close']:.2f} (月線 ${item['ma20']:.1f})\n"
