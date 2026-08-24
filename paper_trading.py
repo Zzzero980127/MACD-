@@ -1,237 +1,242 @@
 import os
 import json
+import requests
 import datetime
+import pandas as pd
 import psycopg2
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 
 def get_db_connection():
+    if not DATABASE_URL:
+        return None
     return psycopg2.connect(DATABASE_URL)
 
-def init_paper_db():
-    if not DATABASE_URL:
-        return
+def get_latest_price(stock_id):
+    """取得個股最新收盤價 (FinMind API)"""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # 建立模擬交易紀錄表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS paper_trades (
-                week_id VARCHAR(20) PRIMARY KEY,
-                trade_date VARCHAR(20),
-                stocks_json TEXT,
-                status VARCHAR(10) DEFAULT 'HOLDING',
-                buy_budget_per_stock NUMERIC DEFAULT 100000,
-                settle_date VARCHAR(20),
-                total_pnl NUMERIC DEFAULT 0,
-                total_return_pct NUMERIC DEFAULT 0
-            );
-        ''')
-        conn.commit()
-        cursor.close()
-        conn.close()
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+        if FINMIND_TOKEN:
+            url += f"&token={FINMIND_TOKEN}"
+        
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == 200 and data.get("data"):
+                df = pd.DataFrame(data["data"])
+                if not df.empty and 'close' in df.columns:
+                    return float(df.iloc[-1]['close'])
     except Exception as e:
-        print(f"Paper DB Init Error: {e}")
+        print(f"Paper Trading Get Price Error ({stock_id}): {e}")
+    return 0.0
 
-init_paper_db()
-
-# ----------------------------------------------------
-# 1. 自動執行模擬買入 (週一至週三，且全台股掃完一輪後)
-# ----------------------------------------------------
-def auto_execute_paper_buy(top3_stocks, today_str, week_str):
+def auto_execute_paper_buy(top3_stocks, trade_date_str, week_str):
+    """
+    自動記錄模擬倉買入標的 (每週/每日觸發)
+    """
     if not DATABASE_URL or not top3_stocks:
         return
 
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
+        if not conn:
+            return
         
-        # 檢查本週是否已經建立過模擬買單
-        cursor.execute('SELECT week_id FROM paper_trades WHERE week_id = %s;', (week_str,))
+        cursor = conn.cursor()
+
+        # 檢查今天或本週是否已經建立過買入紀錄
+        cursor.execute("SELECT trade_date FROM paper_trades WHERE trade_date = %s;", (trade_date_str,))
         if cursor.fetchone():
             cursor.close()
             conn.close()
-            return  # 本週已有紀錄，不重複建倉
+            return  # 今日已記錄過，自動跳過
 
-        buy_records = []
-        budget = 100000  # 每一檔預算 10 萬台幣
+        # 整理買入股票清單與價格
+        stocks_data = []
+        buy_prices = {}
 
-        for item in top3_stocks[:3]:
-            close_price = float(item['close'])
-            if close_price > 0:
-                shares = int((budget / close_price) // 1000) * 1000  # 優先買整張 (1,000股)
-                if shares == 0:
-                    shares = int(budget // close_price)  # 若不滿一張則買零股
-                
-                cost = round(shares * close_price)
-                buy_records.append({
-                    'code': item['code'],
-                    'name': item['name'],
-                    'buy_price': close_price,
-                    'shares': shares,
-                    'cost': cost
-                })
+        for item in top3_stocks:
+            code = item.get('code')
+            name = item.get('name')
+            price = item.get('close', 0.0)
+            
+            # 如果傳入價格為 0，嘗試即時抓取
+            if price == 0.0:
+                price = get_latest_price(code)
 
-        if buy_records:
-            cursor.execute('''
-                INSERT INTO paper_trades (week_id, trade_date, stocks_json, status, buy_budget_per_stock)
-                VALUES (%s, %s, %s, 'HOLDING', %s);
-            ''', (week_str, today_str, json.dumps(buy_records), budget))
-            conn.commit()
-            print(f"✅ [模擬交易] 已成功自動為本週 ({week_str}) 建倉 Top 3 標的！")
+            stocks_data.append({
+                'code': code,
+                'name': name,
+                'buy_price': price
+            })
+            buy_prices[code] = price
 
+        stocks_json = json.dumps(stocks_data, ensure_ascii=False)
+        buy_prices_json = json.dumps(buy_prices, ensure_ascii=False)
+
+        cursor.execute('''
+            INSERT INTO paper_trades (trade_date, stocks_json, status, buy_prices_json, settlement_json)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (trade_date) DO NOTHING;
+        ''', (trade_date_str, stocks_json, 'OPEN', buy_prices_json, '{}'))
+
+        conn.commit()
         cursor.close()
         conn.close()
+        print(f"✅ [模擬倉] 已成功紀錄買入組合 ({trade_date_str})！")
     except Exception as e:
-        print(f"Auto Paper Buy Error: {e}")
+        print(f"❌ auto_execute_paper_buy Error: {e}")
 
-# ----------------------------------------------------
-# 2. 查詢當前模擬持倉狀態 (LINE 指令: 持股 / PAPER)
-# ----------------------------------------------------
 def get_paper_trades_status():
+    """
+    LINE 指令：「模擬持股」或「持倉」
+    查詢最新一期的模擬倉持股與當前即時損益
+    """
     if not DATABASE_URL:
-        return "⚠️ 未連接資料庫，無法查詢模擬持倉。"
+        return "⚠️ 未設定資料庫，無法讀取模擬持股。"
 
     try:
-        # 取得當前週別
-        now_dt = datetime.datetime.now()
-        week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
-
         conn = get_db_connection()
+        if not conn:
+            return "⚠️ 資料庫連線失敗。"
+
         cursor = conn.cursor()
-        cursor.execute('SELECT trade_date, stocks_json, status FROM paper_trades WHERE week_id = %s;', (week_str,))
+        cursor.execute('''
+            SELECT trade_date, stocks_json, status, buy_prices_json, settlement_json
+            FROM paper_trades
+            ORDER BY trade_date DESC
+            LIMIT 1;
+        ''')
         row = cursor.fetchone()
         cursor.close()
         conn.close()
 
         if not row:
-            return f"📂 【本週 ({week_str}) 模擬持倉】\n目前尚無建倉紀錄。(系統需在週一至週三掃描完成後自動執行建倉)"
+            return "📊 目前尚無任何模擬持股紀錄。"
 
-        trade_date, stocks_json, status = row[0], json.loads(row[1]), row[2]
-        
-        status_tag = "🟢 持有中" if status == 'HOLDING' else "🔴 已平倉結算"
-        msg = [f"💼 【本週模擬持倉明細】 ({status_tag})", f"📅 進場日期: {trade_date}\n"]
+        trade_date, stocks_json, status, buy_prices_json, settlement_json = row
+        stocks = json.loads(stocks_json) if stocks_json else []
 
-        from app import get_tw_stock_data_finmind  # 動態抓取最新價格
+        if not stocks:
+            return "📊 當前模擬倉無持股。"
 
-        total_cost = 0
-        total_current_val = 0
+        lines = [f"💼【AI 模擬倉持股狀態】({trade_date})"]
+        lines.append(f"📌 狀態: {'🟢 持股中 (OPEN)' if status == 'OPEN' else '🔴 已結算 (CLOSED)'}\n")
 
-        for stock in stocks_json:
-            code = stock['code']
-            name = stock['name']
-            buy_price = stock['buy_price']
-            shares = stock['shares']
-            cost = stock['cost']
+        total_buy_val = 0.0
+        total_curr_val = 0.0
 
-            # 抓取最新收盤價
-            df = get_tw_stock_data_finmind(code)
-            current_price = float(df.iloc[-1]['Close']) if df is not None and not df.empty else buy_price
+        for item in stocks:
+            code = item.get('code')
+            name = item.get('name')
+            buy_p = float(item.get('buy_price', 0.0))
 
-            current_val = round(shares * current_price)
-            pnl = current_val - cost
-            ret_pct = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0.0
+            if status == 'OPEN':
+                curr_p = get_latest_price(code)
+                if curr_p == 0.0:
+                    curr_p = buy_p
+            else:
+                settlement = json.loads(settlement_json) if settlement_json else {}
+                curr_p = float(settlement.get(code, {}).get('sell_price', buy_p))
 
-            total_cost += cost
-            total_current_val += current_val
+            ret_pct = ((curr_p - buy_p) / buy_p * 100) if buy_p > 0 else 0.0
+            icon = "📈" if ret_pct >= 0 else "📉"
 
-            msg.append(
-                f"📌 {name} ({code})\n"
-                f"  • 進場價: ${buy_price:.2f} | 現價: ${current_price:.2f}\n"
-                f"  • 持有股數: {shares:,} 股 (成本 ${cost:,})\n"
-                f"  • 未實現損益: {pnl:+,.0f} 元 ({ret_pct:+.2f}%)"
-            )
+            lines.append(f"{icon} {name} ({code})")
+            lines.append(f"   • 買入價: ${buy_p:.2f}")
+            lines.append(f"   • 當前價: ${curr_p:.2f} (報酬率: {ret_pct:+.2f}%)\n")
 
-        total_pnl = total_current_val - total_cost
-        total_ret = ((total_current_val - total_cost) / total_cost) * 100 if total_cost > 0 else 0.0
+            total_buy_val += buy_p
+            total_curr_val += curr_p
 
-        msg.append("--------------------")
-        msg.append(f"📊 預估總市值: ${total_current_val:,} 元")
-        msg.append(f"💰 預估總損益: {total_pnl:+,.0f} 元 ({total_ret:+.2f}%)")
+        total_ret = ((total_curr_val - total_buy_val) / total_buy_val * 100) if total_buy_val > 0 else 0.0
+        lines.append(f"🎯 組合總報酬率: {total_ret:+.2f}%")
 
-        return "\n\n".join(msg)
+        return "\n".join(lines)
 
     except Exception as e:
-        return f"⚠️ 查詢模擬持倉失敗: {str(e)}"
+        return f"⚠️ 查詢模擬持股失敗: {str(e)}"
 
-# ----------------------------------------------------
-# 3. 執行模擬平倉結算 (LINE 指令: 結算 / CLOSE)
-# ----------------------------------------------------
 def execute_paper_trades_settlement():
+    """
+    LINE 指令：「結算」或「週結算」
+    強制進行最新一期模擬持股的結算並計算最終戰績
+    """
     if not DATABASE_URL:
-        return "⚠️ 未連接資料庫，無法執行結算。"
+        return "⚠️ 未設定資料庫，無法執行結算。"
 
     try:
-        now_dt = datetime.datetime.now()
-        week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
-        settle_date_str = now_dt.strftime("%Y-%m-%d")
-
         conn = get_db_connection()
+        if not conn:
+            return "⚠️ 資料庫連線失敗。"
+
         cursor = conn.cursor()
-        cursor.execute('SELECT trade_date, stocks_json, status FROM paper_trades WHERE week_id = %s;', (week_str,))
+        cursor.execute('''
+            SELECT trade_date, stocks_json, status, buy_prices_json
+            FROM paper_trades
+            WHERE status = 'OPEN'
+            ORDER BY trade_date DESC
+            LIMIT 1;
+        ''')
         row = cursor.fetchone()
 
         if not row:
             cursor.close()
             conn.close()
-            return f"⚠️ 本週 ({week_str}) 尚無模擬持倉紀錄，無法進行結算。"
+            return "⚠️ 當前沒有待結算 (OPEN) 的模擬持股組合。"
 
-        trade_date, stocks_json, status = row[0], json.loads(row[1]), row[2]
+        trade_date, stocks_json, status, buy_prices_json = row
+        stocks = json.loads(stocks_json) if stocks_json else []
 
-        if status == 'SETTLED':
-            cursor.close()
-            conn.close()
-            return f"⚠️ 本週 ({week_str}) 持倉先前已完成平倉結算，請勿重複結算！"
+        settlement_dict = {}
+        total_buy_val = 0.0
+        total_sell_val = 0.0
 
-        from app import get_tw_stock_data_finmind
+        lines = [f"🏆【AI 模擬倉週結算報告】({trade_date})"]
+        lines.append("--------------------")
 
-        total_cost = 0
-        total_settle_val = 0
-        msg = [f"🏁 【本週 ({week_str}) 模擬持倉平倉結算報告】", f"📅 進場日: {trade_date} ➔ 結算日: {settle_date_str}\n"]
+        for item in stocks:
+            code = item.get('code')
+            name = item.get('name')
+            buy_p = float(item.get('buy_price', 0.0))
+            sell_p = get_latest_price(code)
+            
+            if sell_p == 0.0:
+                sell_p = buy_p
 
-        for stock in stocks_json:
-            code = stock['code']
-            name = stock['name']
-            buy_price = stock['buy_price']
-            shares = stock['shares']
-            cost = stock['cost']
+            ret_pct = ((sell_p - buy_p) / buy_p * 100) if buy_p > 0 else 0.0
+            settlement_dict[code] = {
+                'buy_price': buy_p,
+                'sell_price': sell_p,
+                'return_pct': ret_pct
+            }
 
-            df = get_tw_stock_data_finmind(code)
-            settle_price = float(df.iloc[-1]['Close']) if df is not None and not df.empty else buy_price
+            icon = "🟢" if ret_pct >= 0 else "🔴"
+            lines.append(f"{icon} {name} ({code})")
+            lines.append(f"   • 買入: ${buy_p:.2f} ➔ 賣出: ${sell_p:.2f}")
+            lines.append(f"   • 戰績: {ret_pct:+.2f}%\n")
 
-            settle_val = round(shares * settle_price)
-            pnl = settle_val - cost
-            ret_pct = ((settle_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0.0
+            total_buy_val += buy_p
+            total_sell_val += sell_p
 
-            total_cost += cost
-            total_settle_val += settle_val
+        total_ret = ((total_sell_val - total_buy_val) / total_buy_val * 100) if total_buy_val > 0 else 0.0
+        lines.append("--------------------")
+        lines.append(f"🎯 本期組合最終總戰績: {total_ret:+.2f}%")
 
-            msg.append(
-                f"📌 {name} ({code})\n"
-                f"  • 買入價: ${buy_price:.2f} ➔ 結算價: ${settle_price:.2f}\n"
-                f"  • 最終損益: {pnl:+,.0f} 元 ({ret_pct:+.2f}%)"
-            )
-
-        total_pnl = total_settle_val - total_cost
-        total_ret = ((total_settle_val - total_cost) / total_cost) * 100 if total_cost > 0 else 0.0
-
-        # 更新資料庫平倉狀態
+        # 更新資料庫狀態為 CLOSED
         cursor.execute('''
             UPDATE paper_trades
-            SET status = 'SETTLED', settle_date = %s, total_pnl = %s, total_return_pct = %s
-            WHERE week_id = %s;
-        ''', (settle_date_str, total_pnl, total_ret, week_str))
+            SET status = 'CLOSED', settlement_json = %s
+            WHERE trade_date = %s;
+        ''', (json.dumps(settlement_dict, ensure_ascii=False), trade_date))
 
         conn.commit()
         cursor.close()
         conn.close()
 
-        msg.append("--------------------")
-        msg.append(f"💰 本週最終實現總損益: {total_pnl:+,.0f} 元")
-        msg.append(f"📈 本週總報酬率: {total_ret:+.2f}%")
-        msg.append("🎉 結算完成！狀態已更新為【已平倉】。")
-
-        return "\n\n".join(msg)
+        return "\n".join(lines)
 
     except Exception as e:
-        return f"⚠️ 執行結算發生錯誤: {str(e)}"
+        return f"⚠️ 執行結算失敗: {str(e)}"
