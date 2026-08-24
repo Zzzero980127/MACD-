@@ -127,7 +127,7 @@ def get_history_from_db(date_str):
 init_db()
 
 # ----------------------------------------------------
-# 2. 上市 + 上櫃 股票清單
+# 2. 上市 + 上櫃 股票清單 (防 API 格式錯誤)
 # ----------------------------------------------------
 def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
@@ -242,7 +242,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (修正日期判斷 Bug)
+# 4. 背景輪詢掃描器 (修復重啟歸零問題)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -253,6 +253,7 @@ def background_stock_scanner():
         if not all_stocks:
             return
 
+        # 每次輪詢都向 Supabase 讀取最新狀態，防範休眠重啟影響
         curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
         next_idx = (curr_idx + 1) % len(all_stocks)
@@ -264,7 +265,7 @@ def background_stock_scanner():
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', '')).strip()
 
-                # 💡 強制統一為 YYYY-MM-DD 格式比對
+                # 遇到真正的跨日交易才重置
                 if fetched_date:
                     if not recorded_date:
                         recorded_date = fetched_date
@@ -294,6 +295,7 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
+                # 技術面條件過濾
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
@@ -314,20 +316,15 @@ def background_stock_scanner():
         sorted_list = sorted(leaderboard.values(), key=lambda x: x['score'], reverse=True)
         leaderboard = {x['code']: x for x in sorted_list[:5]}
 
-        # 寫入歷史紀錄時統一轉為 YYYYMMDD
         if leaderboard and recorded_date:
             history_key = recorded_date.replace("-", "")
             save_history_to_db(history_key, format_ai_report(list(leaderboard.values())))
 
+        # 將進度存回 DB
         update_scanner_state(next_idx, total_scanned + 1, leaderboard, recorded_date)
 
     except Exception as e:
         print(f"Scanner Loop Catch: {e}")
-        try:
-            c_idx, t_scan, l_board, r_date = get_scanner_state()
-            update_scanner_state((c_idx + 1) % len(STOCK_NAME_MAP or [1]), t_scan + 1, l_board, r_date)
-        except Exception:
-            pass
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
@@ -396,15 +393,12 @@ def get_ai_selected_stocks():
     curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
     top_stocks = list(leaderboard.values())
 
-    if total_scanned < 5 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
-
     display_date = recorded_date.replace("-", "/") if recorded_date else datetime.datetime.now().strftime("%Y/%m/%d")
-    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 档標的)"
+    scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
     report_content = format_ai_report(top_stocks)
 
     if not report_content:
-        return f"🎯【{display_date} AI 全台股動態排名】:\n{scanned_info}\n目前尚無符合嚴格條件的標的，後續持續篩選中！"
+        return f"🎯【{display_date} AI 全台股動態排名】:\n{scanned_info}\n目前後台正持續掃描中，尚無符合嚴格指標的標的，請稍後再試！"
 
     return f"🎯【{display_date} AI 全台股動態 Top 5 總排名】\n{scanned_info}:\n\n" + report_content
 
