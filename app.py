@@ -23,13 +23,21 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_NAME_MAP = {}
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        return None
+    url = DATABASE_URL
+    if "sslmode" not in url:
+        sep = "&" if "?" in url else "?"
+        url += f"{sep}sslmode=require"
+    return psycopg2.connect(url, connect_timeout=10)
 
 def get_history_from_db(date_str):
     if not DATABASE_URL:
         return None
     try:
         conn = get_db_connection()
+        if not conn:
+            return None
         cursor = conn.cursor()
         cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
         row = cursor.fetchone()
@@ -198,9 +206,9 @@ def analyze_stock(user_input):
 
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active - Fast Sync Version"
+    return "TW Stock Bot Active - Sync Execution Version"
 
-# ✅ 修正為同步執行，確保 Render 不會在背景把流程掐斷
+# ✅ 關鍵修復：同步執行運算，讓 Render 保持連線運作直到完全存檔發送推播
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
     try:
