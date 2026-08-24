@@ -4,9 +4,15 @@ import requests
 import pandas as pd
 import datetime
 import psycopg2
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
+
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -38,9 +44,8 @@ def save_history_to_db(date_str, content_str):
         conn.commit()
         cursor.close()
         conn.close()
-        print(f"✅ 已成功將 {date_str} 報告存入 Supabase！")
     except Exception as e:
-        print(f"❌ DB Save Error: {e}")
+        print(f"❌ DB Save Error for {date_str}: {e}")
 
 def get_tw_stock_data(stock_id):
     try:
@@ -112,14 +117,13 @@ def run_precalculation():
                     except Exception: pass
     except Exception: pass
 
-    # 排序並取前 100 檔
     raw_list.sort(key=lambda x: x['vol'], reverse=True)
     top_100 = raw_list[:100]
 
     leaderboard = []
     trade_date = ""
 
-    # 前 100 檔逐一計算，每檔精準間隔 10 秒（共 100 次 FinMind API 呼叫，耗時約 16.6 分鐘）
+    # 前 100 檔逐一計算，每檔精準間隔 10 秒
     for idx, item in enumerate(top_100, 1):
         print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...")
         res = analyze_candidate(item)
@@ -127,14 +131,14 @@ def run_precalculation():
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
-        # 安全防封鎖，每 10 秒抓一檔
         time.sleep(10)
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
     top_3 = leaderboard[:3]
 
     if top_3:
-        today_str = datetime.datetime.now().strftime("%Y年%m月%d日")
+        today_dt = datetime.datetime.now()
+        today_str = today_dt.strftime("%Y年%m月%d日")
         formatted_date = trade_date.replace("-", "/") if trade_date else today_str
         
         header_title = f"📊【{today_str} AI選股 Top 3】\n(基於前100大成交量 & {formatted_date} 技術面數據)\n" + "="*22 + "\n"
@@ -150,12 +154,24 @@ def run_precalculation():
 
         final_content = header_title + "\n\n".join(report_cards)
 
-        # 計算完成後存入 Supabase
+        # 1. 寫入 Supabase 快取（同時寫入多種日期 key，確保使用者輸入 20260824 或 0824 都能查到）
         save_history_to_db("LATEST", final_content)
-        print("✅ 後台 100 檔運算順利完工，已更新 Supabase 資料庫！")
+        save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
+        save_history_to_db(today_dt.strftime("%m%d"), final_content)
+        save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
+        save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
+        print("✅ 已成功將報告與各種日期 key 存入 Supabase！")
+
+        # 2. 自動發送 LINE 主動推播
+        if line_bot_api and LINE_USER_ID:
+            try:
+                line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
+                print("✅ 已成功發送 LINE 自動推播！")
+            except Exception as e:
+                print(f"❌ LINE 推播失敗: {e}")
+
         return final_content
 
-    print("❌ 計算失敗：無有效數據")
     return "計算失敗"
 
 if __name__ == "__main__":
