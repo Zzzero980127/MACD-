@@ -44,7 +44,7 @@ RUNTIME_CACHE = {
 }
 
 # ----------------------------------------------------
-# 1. Supabase 資料庫操作
+# 1. Supabase 資料庫操作 (包含自動自動修復欄位)
 # ----------------------------------------------------
 def get_db_connection():
     if not DATABASE_URL:
@@ -71,6 +71,11 @@ def init_db():
                         leaderboard_json TEXT,
                         data_date VARCHAR(20)
                     );
+                ''')
+                # 🛠️ 自動補強：防止舊版資料庫缺乏 data_date 欄位而報錯
+                cursor.execute('''
+                    ALTER TABLE scanner_state 
+                    ADD COLUMN IF NOT EXISTS data_date VARCHAR(20);
                 ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS paper_trades (
@@ -351,7 +356,7 @@ def background_stock_scanner():
         update_scanner_state(curr_idx + 1, total_scanned + 1, leaderboard, saved_date)
 
 # ----------------------------------------------------
-# 5. 排程器（已改回最安全的 30 秒一檔）
+# 5. 排程器（30 秒一檔）
 # ----------------------------------------------------
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
