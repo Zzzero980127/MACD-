@@ -198,7 +198,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 單檔股票分析作業（動態扣分評分制，確保必出牌）
+# 4. 單檔股票分析作業（含防外資出貨與爆量黑K機制）
 # ----------------------------------------------------
 def analyze_candidate(item):
     try:
@@ -221,6 +221,7 @@ def analyze_candidate(item):
             five_days_ago = df.iloc[-6] if len(df) >= 6 else prev
 
             close = float(latest['Close'])
+            prev_close = float(prev['Close'])
             close_5d = float(five_days_ago['Close'])
             ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
 
@@ -231,21 +232,30 @@ def analyze_candidate(item):
             bias_pct = ((close - ma20) / ma20) * 100
             foreign_val = get_tw_foreign_investor(code)
 
-            # --- 動態評分演算法 ---
+            # --- 動態防禦評分演算法 ---
             score = 100.0
 
-            # 1. 外資籌碼加分
-            score += (foreign_val * 0.05)
+            # 1. 外資賣超防禦 (賣越多扣越多，賣超 > 2000 張直接倒扣 50 分重罰)
+            if foreign_val < 0:
+                score -= abs(foreign_val) * 0.1
+                if foreign_val < -2000:
+                    score -= 50
+            else:
+                score += (foreign_val * 0.05)
 
-            # 2. 防追高懲罰 (5日漲幅 > 12% 開始加倍扣分)
+            # 2. 爆量收黑防禦 (當天收跌視為高檔出貨，扣 25 分)
+            if close < prev_close:
+                score -= 25
+
+            # 3. 防追高懲罰 (5日漲幅 > 12% 加倍扣分)
             if gain_5d > 12.0:
                 score -= (gain_5d - 12.0) * 5
 
-            # 3. 乖離率懲罰 (遠離月線扣分)
+            # 4. 乖離率懲罰 (遠離月線扣分)
             if abs(bias_pct) > 8.0:
                 score -= (abs(bias_pct) - 8.0) * 4
 
-            # 4. MACD 轉強加分/轉弱扣分
+            # 5. MACD 狀態加減分
             if hist_today > hist_yesterday:
                 score += 15
             else:
@@ -365,7 +375,7 @@ def fast_scan_all_stocks():
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active with Multithreaded Engine!"
+    return "TW Stock Bot Active with Anti-Dump Engine!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
