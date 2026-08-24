@@ -9,7 +9,9 @@ import traceback
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
+# 寫死 FinMind Token 確保 100% 帶入
+FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk".strip()
+
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
@@ -53,10 +55,13 @@ def save_history_to_db(date_str, content_str):
 def get_tw_stock_data(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
+        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'token': FINMIND_TOKEN
+        }
+        res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -71,11 +76,11 @@ def analyze_candidate(item):
         code, name = item['code'], item['name']
         df = get_tw_stock_data(code)
         
-        # 保底機制：如果抓不到歷史 K 線，使用證交所當日收盤價評分
+        # 備用機制：抓不到 K 線時用證交所數據
         if df is None or len(df) < 5:
             close_price = item.get('close', 100.0)
             vol = item.get('vol', 0)
-            score = 50.0 + (vol / 1000000.0)  # 依據成交量基礎給分
+            score = 50.0 + (vol / 1000000.0)
             return {
                 'code': code, 'name': name, 'close': close_price, 'ma20': close_price * 0.95,
                 'score': score, 'trade_date': datetime.datetime.now().strftime("%Y-%m-%d")
@@ -115,7 +120,7 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 【防爆全涵蓋版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
+    print("🚀 後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         raw_list = []
@@ -154,7 +159,7 @@ def run_precalculation():
                 if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
             
             gc.collect()
-            time.sleep(10)
+            time.sleep(5)  # 有 Token 後帶入，速度可加快至 5 秒
 
         print(f"🏁 100 檔分析完畢！成功算出 {len(leaderboard)} 檔。", flush=True)
 
