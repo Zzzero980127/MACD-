@@ -1,24 +1,19 @@
 import os
-import threading
+import time
 import requests
 import pandas as pd
 import datetime
 import psycopg2
-from flask import Flask, request
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import gc  # 導入垃圾回收模組，防止記憶體爆掉
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
-app = Flask(__name__)
-
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-STOCK_NAME_MAP = {}
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -28,50 +23,38 @@ def get_db_connection():
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
-    except Exception: return None
+    except Exception as e:
+        print(f"❌ DB Connect Error: {e}", flush=True)
+        return None
 
-def get_history_from_db(date_str="LATEST"):
+def save_history_to_db(date_str, content_str):
     conn = get_db_connection()
-    if not conn: return None
+    if not conn: return
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
-        row = cursor.fetchone()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+                date VARCHAR(20) PRIMARY KEY,
+                content TEXT
+            );
+        ''')
+        cursor.execute('''
+            INSERT INTO history (date, content) VALUES (%s, %s)
+            ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;
+        ''', (date_str, content_str))
+        conn.commit()
         cursor.close()
         conn.close()
-        return row[0] if row else None
-    except Exception: return None
+    except Exception as e:
+        print(f"❌ DB Save Error for {date_str}: {e}", flush=True)
 
-def load_all_taiwan_stocks():
-    global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=3)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                s_id = str(item.get("Code", "")).strip()
-                s_name = str(item.get("Name", "")).strip().replace(" ", "")
-                if s_id.isdigit() and len(s_id) == 4 and s_name: STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
-
-    try:
-        res = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes", headers=headers, timeout=3)
-        if res.status_code == 200 and res.text.strip().startswith('['):
-            for item in res.json():
-                s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "")
-                if s_id.isdigit() and len(s_id) == 4 and s_name: STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
-
-load_all_taiwan_stocks()
-
-def get_tw_stock_data_finmind(stock_id):
+def get_tw_stock_data(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
         if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=4.0)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -81,163 +64,116 @@ def get_tw_stock_data_finmind(stock_id):
     except Exception: pass
     return None
 
-def get_tw_foreign_investor(stock_id):
+def analyze_candidate(item):
     try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
+        code, name = item['code'], item['name']
+        df = get_tw_stock_data(code)
+        if df is None or len(df) < 20: return None
 
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"])
-            foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
-            if not foreign_df.empty:
-                latest_date = foreign_df.iloc[-1]['date']
-                day_data = foreign_df[foreign_df['date'] == latest_date]
-                return round((day_data['buy'].sum() - day_data['sell'].sum()) / 1000)
-    except Exception: pass
-    return 0
-
-def get_tw_stock_revenue(stock_id):
-    try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-        if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
-
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"])
-            if 'revenue' in df.columns and len(df) >= 13:
-                df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
-                df = df.dropna(subset=['revenue'])
-                
-                latest, prev_month, last_year = df.iloc[-1], df.iloc[-2], df.iloc[-13]
-                rev_latest, rev_prev, rev_ly = float(latest['revenue']), float(prev_month['revenue']), float(last_year['revenue'])
-                rev_date = f"{latest.get('revenue_year', '')}/{str(latest.get('revenue_month', '')).zfill(2)}"
-
-                yoy_val = ((rev_latest - rev_ly) / rev_ly * 100) if rev_ly > 0 else 0.0
-                mom_val = ((rev_latest - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0.0
-                eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
-                return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n    評價: {eval_text}"
-    except Exception: pass
-    return "暫無最新月營收資料"
-
-def resolve_stock_symbol(user_input):
-    if len(STOCK_NAME_MAP) < 300: load_all_taiwan_stocks()
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
-    if clean_input.isdigit() and len(clean_input) == 4:
-        name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
-        return clean_input, name[0] if name else clean_input
-    if clean_input in STOCK_NAME_MAP: return STOCK_NAME_MAP[clean_input], clean_input
-    for name, code in STOCK_NAME_MAP.items():
-        if clean_input in name or name in clean_input: return code, name
-    return clean_input, clean_input
-
-def analyze_stock(user_input):
-    try:
-        stock_code, display_name = resolve_stock_symbol(user_input)
-        if not stock_code.isdigit() or len(stock_code) != 4:
-            return f"⚠️ 找不到「{user_input}」的台股資料，請確認名稱或代號是否正確。"
-
-        df = get_tw_stock_data_finmind(stock_code)
-        if df is None or df.empty:
-            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後重試。"
-
-        foreign_net = get_tw_foreign_investor(stock_code)
-        revenue_info = get_tw_stock_revenue(stock_code)
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        trade_date = str(latest.get('date', '')).strip()
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-        df['STD20'] = df['Close'].rolling(window=20).std(ddof=0)
-        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+        
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = exp1 - exp2
+        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['Hist'] = df['DIF'] - df['MACD']
 
-        latest, prev = df.iloc[-1], df.iloc[-2]
         close, prev_close = float(latest['Close']), float(prev['Close'])
-        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
-        ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
-        bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
+        ma20 = float(latest['MA20'])
+        ma60 = float(latest['MA60'])
+        hist_today, hist_yesterday = float(latest['Hist']), float(prev['Hist'])
 
-        diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
-        vol_today = float(latest['Volume'])
-        vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
-        price_change_pct = ((close - prev_close) / prev_close) * 100
+        score = 100.0
+        if close > ma20: score += 20.0
+        if close > ma60: score += 15.0
+        if hist_today > hist_yesterday: score += 15.0
+        if close > prev_close: score += 10.0
 
-        if close >= bb_upper * 0.98:
-            vol_status = f"💥 接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n  👉 短線過熱，切勿追高"
-        elif price_change_pct > 0 and vol_today >= vol_ma5 * 1.15:
-            vol_status = f"👆 上漲放量 (+{price_change_pct:.1f}%)\n  👉 多頭攻擊強烈"
-        elif price_change_pct < 0 and vol_today >= vol_ma5 * 1.15:
-            vol_status = f"👇 下跌放量 ({price_change_pct:.1f}%)\n  👉 注意賣壓風險"
-        else:
-            vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)"
+        return {
+            'code': code, 'name': name, 'close': close, 'ma20': ma20,
+            'score': score, 'trade_date': trade_date
+        }
+    except Exception: pass
+    return None
 
-        foreign_text = f"{foreign_net:} 張" if foreign_net != 0 else "0 張/估算中"
-        signal = "🔴 【建議出場/觀望】跌破支撐" if (close < ma60 or diff_pct < -3.0) else ("🔥 【多頭控盤】可持股或觀察" if close >= ma20 else "🟡 【多短觀望】偏溫運作")
-        pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"低於月線 {abs(diff_pct):.2f}%"
+def run_precalculation():
+    print("🚀 【防爆優化版】後台啟動：開始運算全台股成交量前 100 档指標...", flush=True)
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    raw_list = []
 
-        return (
-            f"📊 [{display_name} ({stock_code})] 技術與籌碼分析 :\n"
-            f"--------------------\n"
-            f"最新收盤價: {close:.2f}\n"
-            f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
-            f"60日均線(季線): {ma60:.2f}\n"
-            f"布林通道上軌: {bb_upper:.2f}\n"
-            f"量價結構:\n  {vol_status}\n"
-            f"外資籌碼: {foreign_text}\n"
-            f"--------------------\n"
-            f"📈 基本面與營收 :\n  {revenue_info}\n"
-            f"--------------------\n"
-            f"💡 操作建議 :\n{signal}"
-        )
-    except Exception as e:
-        return f"⚠️ 分析發生錯誤: {str(e)}"
+    try:
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=5)
+        if res.status_code == 200 and isinstance(res.json(), list):
+            for item in res.json():
+                code = str(item.get("Code", "")).strip()
+                name = str(item.get("Name", "")).strip().replace(" ", "")
+                raw_vol = str(item.get("TradeVolume", "0")).replace(",", "").strip()
+                if code.isdigit() and len(code) == 4 and not code.startswith("00"):
+                    try: raw_list.append({'code': code, 'name': name, 'vol': float(raw_vol)})
+                    except Exception: pass
+    except Exception: pass
 
-@app.route("/", methods=['GET'])
-def index(): return "OK"
+    raw_list.sort(key=lambda x: x['vol'], reverse=True)
+    top_100 = raw_list[:100]
 
-@app.route('/run-cron-job-secret', methods=['GET'])
-def trigger_cron():
-    from cron_job import run_precalculation
-    threading.Thread(target=run_precalculation).start()
-    return "🚀 前 100 檔選股運算已在背景啟動！每 10 秒處理一檔（總耗時約 16 分鐘），完成後會自動存入 Supabase 並推播到 LINE。", 200
+    leaderboard = []
+    trade_date = ""
 
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except Exception as e: print(f"Error: {e}")
-    return 'OK'
+    for idx, item in enumerate(top_100, 1):
+        # flush=True 確保每秒即時顯示在 Log，不再被暫存封鎖
+        print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
+        res = analyze_candidate(item)
+        if res is not None:
+            leaderboard.append(res)
+            if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
+        
+        # 釋放記憶體避免 Render 重啟
+        gc.collect()
+        time.sleep(10)
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_input = event.message.text.strip()
-    clean_keyword = user_input.upper().replace(" ", "")
+    leaderboard.sort(key=lambda x: x['score'], reverse=True)
+    top_3 = leaderboard[:3]
 
-    # 1. AI 選股（回傳最新資料）
-    if "選股" in clean_keyword or "AI" in clean_keyword:
-        report = get_history_from_db("LATEST")
-        reply_text = report if report else "⚠️ 後台尚未完成今日統計，請稍後再試！"
+    if top_3:
+        today_dt = datetime.datetime.now()
+        today_str = today_dt.strftime("%Y年%m月%d日")
+        formatted_date = trade_date.replace("-", "/") if trade_date else today_str
+        
+        header_title = f"📊【{today_str} AI選股 Top 3】\n(基於前100大成交量 & {formatted_date} 技術面數據)\n" + "="*22 + "\n"
+        report_cards = []
+        for idx, item in enumerate(top_3, 1):
+            card = (
+                f"🔥 No.{idx} {item['name']} ({item['code']})\n"
+                f"  • 收盤價: ${item['close']:.2f}\n"
+                f"  • 月線支撐: ${item['ma20']:.1f}\n"
+                f"  • 狀態: 強勢多頭動能 (MACD向上)"
+            )
+            report_cards.append(card)
 
-    # 2. 歷史日期查詢（如 20260824 或 0824）
-    elif user_input.replace("/", "").replace("-", "").isdigit() and len(user_input.replace("/", "").replace("-", "")) in [4, 8]:
-        clean_date = user_input.replace("/", "").replace("-", "")
-        query_date = f"{datetime.datetime.now().strftime('%Y')}{clean_date}" if len(clean_date) == 4 else clean_date
+        final_content = header_title + "\n\n".join(report_cards)
 
-        report = get_history_from_db(query_date)
-        if report:
-            reply_text = report
-        else:
-            # 若不是歷史選股日期，自動轉去查詢個股（例如輸入 2330）
-            reply_text = analyze_stock(user_input)
+        save_history_to_db("LATEST", final_content)
+        save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
+        save_history_to_db(today_dt.strftime("%m%d"), final_content)
+        save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
+        save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
+        print("✅ 已成功將報告存入 Supabase 資料庫！", flush=True)
 
-    # 3. 個股即時查詢（輸入股票名稱或代號，如 台積電、2317）
-    else:
-        reply_text = analyze_stock(user_input)
+        if line_bot_api and LINE_USER_ID:
+            try:
+                line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
+                print("✅ 已成功發送 LINE 自動推播！", flush=True)
+            except Exception as e:
+                print(f"❌ LINE 推播失敗: {e}", flush=True)
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return final_content
+
+    return "計算失敗"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    run_precalculation()
