@@ -5,6 +5,7 @@ import pandas as pd
 import datetime
 import psycopg2
 import gc
+import traceback
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
@@ -16,7 +17,9 @@ LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 def get_db_connection():
-    if not DATABASE_URL: return None
+    if not DATABASE_URL: 
+        print("⚠️ 警告：找不到 DATABASE_URL 環境變數！", flush=True)
+        return None
     try:
         url = DATABASE_URL
         if "sslmode" not in url:
@@ -24,12 +27,14 @@ def get_db_connection():
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
     except Exception as e:
-        print(f"❌ DB Connect Error: {e}", flush=True)
+        print(f"❌ DB 連線失敗詳情: {e}", flush=True)
         return None
 
 def save_history_to_db(date_str, content_str):
     conn = get_db_connection()
-    if not conn: return
+    if not conn: 
+        print("⚠️ 無法連線至資料庫，取消寫入 DB。", flush=True)
+        return
     try:
         cursor = conn.cursor()
         cursor.execute('''
@@ -45,8 +50,9 @@ def save_history_to_db(date_str, content_str):
         conn.commit()
         cursor.close()
         conn.close()
+        print(f"✅ 成功寫入資料庫 Key: {date_str}", flush=True)
     except Exception as e:
-        print(f"❌ DB Save Error for {date_str}: {e}", flush=True)
+        print(f"❌ DB 寫入失敗 [{date_str}]: {e}", flush=True)
 
 def get_tw_stock_data(stock_id):
     try:
@@ -98,79 +104,88 @@ def analyze_candidate(item):
             'code': code, 'name': name, 'close': close, 'ma20': ma20,
             'score': score, 'trade_date': trade_date
         }
-    except Exception: pass
+    except Exception as e:
+        print(f"分析個股錯誤 {item.get('code')}: {e}", flush=True)
     return None
 
 def run_precalculation():
-    print("🚀 【防爆優化版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    raw_list = []
-
+    print("🚀 【防爆除錯版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                code = str(item.get("Code", "")).strip()
-                name = str(item.get("Name", "")).strip().replace(" ", "")
-                raw_vol = str(item.get("TradeVolume", "0")).replace(",", "").strip()
-                if code.isdigit() and len(code) == 4 and not code.startswith("00"):
-                    try: raw_list.append({'code': code, 'name': name, 'vol': float(raw_vol)})
-                    except Exception: pass
-    except Exception: pass
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        raw_list = []
 
-    raw_list.sort(key=lambda x: x['vol'], reverse=True)
-    top_100 = raw_list[:100]
+        try:
+            res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=5)
+            if res.status_code == 200 and isinstance(res.json(), list):
+                for item in res.json():
+                    code = str(item.get("Code", "")).strip()
+                    name = str(item.get("Name", "")).strip().replace(" ", "")
+                    raw_vol = str(item.get("TradeVolume", "0")).replace(",", "").strip()
+                    if code.isdigit() and len(code) == 4 and not code.startswith("00"):
+                        try: raw_list.append({'code': code, 'name': name, 'vol': float(raw_vol)})
+                        except Exception: pass
+        except Exception as e:
+            print(f"❌ 抓取證交所列表失敗: {e}", flush=True)
 
-    leaderboard = []
-    trade_date = ""
+        raw_list.sort(key=lambda x: x['vol'], reverse=True)
+        top_100 = raw_list[:100]
 
-    for idx, item in enumerate(top_100, 1):
-        print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
-        res = analyze_candidate(item)
-        if res is not None:
-            leaderboard.append(res)
-            if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
-        
-        gc.collect()
-        time.sleep(10)
+        leaderboard = []
+        trade_date = ""
 
-    leaderboard.sort(key=lambda x: x['score'], reverse=True)
-    top_3 = leaderboard[:3]
+        for idx, item in enumerate(top_100, 1):
+            print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
+            res = analyze_candidate(item)
+            if res is not None:
+                leaderboard.append(res)
+                if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
+            
+            gc.collect()
+            time.sleep(10)
 
-    if top_3:
-        today_dt = datetime.datetime.now()
-        today_str = today_dt.strftime("%Y年%m月%d日")
-        formatted_date = trade_date.replace("-", "/") if trade_date else today_str
-        
-        header_title = f"📊【{today_str} AI選股 Top 3】\n(基於前100大成交量 & {formatted_date} 技術面數據)\n" + "="*22 + "\n"
-        report_cards = []
-        for idx, item in enumerate(top_3, 1):
-            card = (
-                f"🔥 No.{idx} {item['name']} ({item['code']})\n"
-                f"  • 收盤價: ${item['close']:.2f}\n"
-                f"  • 月線支撐: ${item['ma20']:.1f}\n"
-                f"  • 狀態: 強勢多頭動能 (MACD向上)"
-            )
-            report_cards.append(card)
+        print(f"🏁 100 檔分析完畢！成功算出 {len(leaderboard)} 檔。", flush=True)
 
-        final_content = header_title + "\n\n".join(report_cards)
+        if len(leaderboard) > 0:
+            leaderboard.sort(key=lambda x: x['score'], reverse=True)
+            top_3 = leaderboard[:3]
 
-        # 確實寫入 LATEST，解決 LINE 回傳「尚未完成」的問題
-        save_history_to_db("LATEST", final_content)
-        save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
-        save_history_to_db(today_dt.strftime("%m%d"), final_content)
-        save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
-        save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
-        print("✅ 已成功將報告存入 Supabase 資料庫！", flush=True)
+            today_dt = datetime.datetime.now()
+            today_str = today_dt.strftime("%Y年%m月%d日")
+            formatted_date = trade_date.replace("-", "/") if trade_date else today_str
+            
+            header_title = f"📊【{today_str} AI選股 Top 3】\n(基於前100大成交量 & {formatted_date} 技術面數據)\n" + "="*22 + "\n"
+            report_cards = []
+            for idx, item in enumerate(top_3, 1):
+                card = (
+                    f"🔥 No.{idx} {item['name']} ({item['code']})\n"
+                    f"  • 收盤價: ${item['close']:.2f}\n"
+                    f"  • 月線支撐: ${item['ma20']:.1f}\n"
+                    f"  • 狀態: 強勢多頭動能 (MACD向上)"
+                )
+                report_cards.append(card)
 
-        if line_bot_api and LINE_USER_ID:
-            try:
-                line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
-                print("✅ 已成功發送 LINE 自動推播！", flush=True)
-            except Exception as e:
-                print(f"❌ LINE 推播失敗: {e}", flush=True)
+            final_content = header_title + "\n\n".join(report_cards)
 
-        return final_content
+            print("📝 正在寫入 Supabase 資料庫...", flush=True)
+            save_history_to_db("LATEST", final_content)
+            save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
+            save_history_to_db(today_dt.strftime("%m%d"), final_content)
+            save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
+            save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
+
+            if line_bot_api and LINE_USER_ID:
+                try:
+                    line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
+                    print("✅ 已成功發送 LINE 主動推播！", flush=True)
+                except Exception as e:
+                    print(f"❌ LINE 推播失敗: {e}", flush=True)
+
+            return final_content
+        else:
+            print("⚠️ 沒有任何股票符合分析條件。", flush=True)
+
+    except Exception as e:
+        print(f"💥 run_precalculation 發生致命崩潰:\n{traceback.format_exc()}", flush=True)
 
     return "計算失敗"
 
