@@ -5,10 +5,12 @@ import pandas as pd
 import datetime
 import re
 import json
+import time
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -135,7 +137,7 @@ def load_all_taiwan_stocks():
 load_all_taiwan_stocks()
 
 # ----------------------------------------------------
-# 3. FinMind 數據抓取 (超強容錯保護)
+# 3. FinMind 數據抓取
 # ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
@@ -184,22 +186,17 @@ def get_tw_stock_revenue(stock_id):
             data = res.json()
             if data.get("status") == 200 and data.get("data"):
                 df = pd.DataFrame(data["data"])
-                rev_col = None
-                for col in ['revenue', 'revenue_month', 'revenue_year']:
-                    if col in df.columns:
-                        rev_col = col
-                        break
-                if rev_col and len(df) >= 13:
-                    df[rev_col] = pd.to_numeric(df[rev_col], errors='coerce')
-                    df = df.dropna(subset=[rev_col])
+                if 'revenue' in df.columns and len(df) >= 13:
+                    df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
+                    df = df.dropna(subset=['revenue'])
                     
                     latest = df.iloc[-1]
                     prev_month = df.iloc[-2]
                     last_year = df.iloc[-13]
 
-                    rev_latest = float(latest[rev_col])
-                    rev_prev = float(prev_month[rev_col])
-                    rev_ly = float(last_year[rev_col])
+                    rev_latest = float(latest['revenue'])
+                    rev_prev = float(prev_month['revenue'])
+                    rev_ly = float(last_year['revenue'])
 
                     rev_date = f"{latest.get('revenue_year', '')}/{str(latest.get('revenue_month', '')).zfill(2)}"
 
@@ -213,16 +210,16 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 掃描邏輯
+# 4. 背景輪詢掃描器
 # ----------------------------------------------------
-def scan_one_stock():
+def background_stock_scanner():
     try:
         if len(STOCK_NAME_MAP) < 300:
             load_all_taiwan_stocks()
 
         all_stocks = sorted(list(STOCK_NAME_MAP.items()), key=lambda x: x[1])
         if not all_stocks:
-            return "No stocks"
+            return
 
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         name, code = all_stocks[curr_idx % len(all_stocks)]
@@ -276,24 +273,22 @@ def scan_one_stock():
         today_str = datetime.datetime.now().strftime("%Y%m%d")
         save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
         update_scanner_state(next_idx, total_scanned + 1, leaderboard)
-        return f"OK: {name}({code}) | Total: {total_scanned + 1}"
 
     except Exception as e:
         curr_idx, total_scanned, leaderboard = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard)
-        return f"Err: {str(e)}"
+
+# 啟動背景排程 (每 3 秒觸發 1 檔)
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(background_stock_scanner, 'interval', seconds=3)
+scheduler.start()
 
 # ----------------------------------------------------
-# 5. LINE Bot Routes (包含萬用全局 Exception 捕捉)
+# 5. LINE Bot Routes
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
     return "TW Stock Bot Active!"
-
-@app.route("/scan", methods=['GET'])
-def trigger_scan():
-    res = scan_one_stock()
-    return res
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -302,7 +297,7 @@ def callback():
     try:
         handler.handle(body, signature)
     except Exception as e:
-        print(f"Webhook Callback Error: {e}")
+        print(f"Callback Error: {e}")
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -330,7 +325,7 @@ def handle_message(event):
             TextSendMessage(text=reply_text)
         )
     except Exception as e:
-        print(f"Handle Message Error: {e}")
+        print(f"Handle Error: {e}")
 
 def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x['score'], reverse=True)
@@ -352,7 +347,7 @@ def get_ai_selected_stocks():
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 10 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 档標的\n💡 請再等待約 2~3 分鐘後重新點選！"
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 2~3 分鐘後重新點選！"
 
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
