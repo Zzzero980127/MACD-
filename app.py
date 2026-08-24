@@ -146,7 +146,7 @@ def load_all_taiwan_stocks():
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
-                s_name = str(item.get("Name", "")).strip().replace(" ", "").replace("　", "")
+                s_name = str(item.get("Name", "")).strip().replace(" ", "").replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
@@ -158,7 +158,7 @@ def load_all_taiwan_stocks():
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "").replace("　", "")
+                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "").replace(" ", "")
                 if s_id.isdigit() and len(s_id) == 4 and s_name:
                     STOCK_NAME_MAP[s_name] = s_id
     except Exception:
@@ -430,7 +430,7 @@ def resolve_stock_symbol(user_input):
     if len(STOCK_NAME_MAP) < 300:
         load_all_taiwan_stocks()
 
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace("　", "").strip()
+    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").replace(" ", "").strip()
 
     if clean_input.isdigit() and len(clean_input) == 4:
         name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
@@ -501,4 +501,29 @@ def analyze_stock(user_input):
 
         if close < ma60 or diff_pct < -3.0:
             signal = "🔴 【建議出場/觀望】跌破關鍵支撐或空頭走勢！"
-        elif close >= ma20 and hist_toda
+        elif close >= ma20 and hist_today > hist_yesterday:
+            signal = "🔥 【多頭控盤】站穩均線且 MACD 柱狀體升高，可持股或分批佈局。"
+        else:
+            signal = "🟡 【多短觀望】超越月線軌道，走勢偏溫。"
+
+        pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"低於月線 {abs(diff_pct):.2f}%"
+
+        return (
+            f"📊 [{display_name} ({stock_code})] 技術與籌碼分析 :\n"
+            f"--------------------\n"
+            f"最新收盤價: {close:.2f}\n"
+            f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
+            f"60日均線(季線): {ma60:.2f}\n"
+            f"布林通道上軌: {bb_upper:.2f}\n"
+            f"量價結構:\n  {vol_status}\n"
+            f"外資籌碼: {foreign_text}\n"
+            f"--------------------\n"
+            f"📈 基本面與營收 :\n  {revenue_info}\n"
+            f"--------------------\n"
+            f"💡 操作建議 :\n{signal}"
+        )
+    except Exception as e:
+        return f"⚠️ 分析發生錯誤: {str(e)}"
+
+if __name__ == "__main__":
+    app.run(port=5000)
