@@ -9,7 +9,6 @@ import traceback
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-# 寫死 FinMind Token 確保 100% 帶入
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk".strip()
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -56,11 +55,8 @@ def get_tw_stock_data(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+        headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'token': FINMIND_TOKEN
-        }
         res = requests.get(url, headers=headers, timeout=8)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
@@ -76,7 +72,6 @@ def analyze_candidate(item):
         code, name = item['code'], item['name']
         df = get_tw_stock_data(code)
         
-        # 備用機制：抓不到 K 線時用證交所數據
         if df is None or len(df) < 5:
             close_price = item.get('close', 100.0)
             vol = item.get('vol', 0)
@@ -159,7 +154,7 @@ def run_precalculation():
                 if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
             
             gc.collect()
-            time.sleep(5)  # 有 Token 後帶入，速度可加快至 5 秒
+            time.sleep(10)  # 設定為精準 10 秒間隔
 
         print(f"🏁 100 檔分析完畢！成功算出 {len(leaderboard)} 檔。", flush=True)
 
