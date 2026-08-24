@@ -7,16 +7,19 @@ import pandas as pd
 import datetime
 import psycopg2
 
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk".strip()
+# 優先讀取環境變數，若無則備用安全預設 Token
+ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
+DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk"
+FINMIND_TOKEN = ENV_TOKEN if ENV_TOKEN else DEFAULT_TOKEN
+
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
-# 建立具有自動重試（Retry）機制的 Request Session
 def create_robust_session():
     session = requests.Session()
     retries = Retry(
-        total=3,                # 最多重試 3 次
-        backoff_factor=0.5,     # 重試間隔: 0.5s, 1.0s, 2.0s
-        status_forcelist=[429, 500, 502, 503, 504], # 遇限流或伺服器錯誤自動重試
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False
     )
     adapter = HTTPAdapter(max_retries=retries)
@@ -37,7 +40,6 @@ def get_top_100_volume_stocks():
             stocks = []
             for item in data:
                 code = item.get("Code", "").strip()
-                # 排除 ETF (00開頭) 與權證 (6碼以上)，專注台股一般個股 (4碼數字)
                 if len(code) == 4 and code.isdigit():
                     try:
                         trade_volume = int(item.get("TradeVolume", 0))
@@ -45,10 +47,9 @@ def get_top_100_volume_stocks():
                     except ValueError:
                         continue
             
-            # 依成交量遞減排序，取前 100 名
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             top_100 = df_stocks.head(100)["code"].tolist()
-            print(f"✅ 成功獲取今日成交量前 100 名個股！", flush=True)
+            print("✅ 成功獲取今日成交量前 100 名個股！", flush=True)
             return top_100
     except Exception as e:
         print(f"❌ 抓取證交所全市場數據失敗: {e}", flush=True)
@@ -89,12 +90,12 @@ def save_to_db(report_text, date_str="LATEST"):
         print(f"❌ 寫入資料庫失敗: {e}", flush=True)
 
 def fetch_stock_price_with_retry(stock_id):
-    """ 【選股專用】100% 強制使用 Token 抓取日 K 價量，絕不跳轉無 Token 通道 """
+    """ 強制帶 Token 抓取日 K 價量 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     url_token = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
-        res = http.get(url_token, timeout=5.0)
+        res = http.get(url_token, timeout=8.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -102,18 +103,20 @@ def fetch_stock_price_with_retry(stock_id):
             df = df.dropna(subset=['Close'])
             if len(df) >= 35: 
                 return df
+        else:
+            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
     except Exception as e:
-        print(f"⚠️ [{stock_id}] 選股價量 API 失敗: {e}", flush=True)
+        print(f"⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
 
     return None
 
 def fetch_foreign_investor_with_retry(stock_id):
-    """ 【選股專用】100% 強制使用 Token 抓取外資籌碼 """
+    """ 強制帶 Token 抓取外資籌碼 """
     start_date = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
     url_token = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
-        res = http.get(url_token, timeout=5.0)
+        res = http.get(url_token, timeout=8.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
@@ -135,12 +138,12 @@ def fetch_foreign_investor_with_retry(stock_id):
                     else:
                         return False, round(today_foreign), ""
     except Exception as e:
-        print(f"⚠️ [{stock_id}] 選股外資 API 失敗: {e}", flush=True)
+        print(f"⚠️ [{stock_id}] 外資 API 失敗: {e}", flush=True)
 
     return False, 0, ""
 
 def analyze_single_stock(stock_id):
-    """ 分析單一熱門個股指標 """
+    """ 分析單一個股 (技術面不通過就不抓外資 API) """
     df = fetch_stock_price_with_retry(stock_id)
     if df is None: return None
 
@@ -167,14 +170,15 @@ def analyze_single_stock(stock_id):
     osc_today = float(latest['OSC'])
     bb_upper = float(latest['BB_Upper'])
 
-    # 選股多頭條件
+    # 技術面篩選
     is_bull_trend = (close > ma20) and (ma20 >= ma60)
     is_macd_good = (osc_today > 0)
     is_vol_surge = (vol_today >= vol_ma5 * 1.1)
     not_overheated = (close < bb_upper * 0.99)
 
     if is_bull_trend and is_macd_good and is_vol_surge and not_overheated:
-        time.sleep(0.15)
+        # 技術面通過，間隔 2 秒抓外資籌碼
+        time.sleep(2.0)
         has_foreign_signal, foreign_shares, foreign_label = fetch_foreign_investor_with_retry(stock_id)
         
         if has_foreign_signal:
@@ -189,21 +193,21 @@ def analyze_single_stock(stock_id):
     return None
 
 def run_precalculation():
-    print("🚀 開始執行「成交量 Top 100 動態抓取 + 外資由賣轉買」選股任務...", flush=True)
+    print(f"🚀 開始選股任務！(Token狀態: {FINMIND_TOKEN[:10]}...)", flush=True)
     
-    # 1. 自動向證交所抓取當天成交量最高的 100 檔個股
     target_stocks = get_top_100_volume_stocks()
     selected_stocks = []
     
-    # 2. 逐檔進行分析
+    # 每檔間隔 10 秒，嚴格防禦 API 限流暴沖
     for i, stock_id in enumerate(target_stocks, 1):
-        print(f"[{i}/{len(target_stocks)}] 正在分析熱門股 {stock_id}...", flush=True)
+        print(f"[{i}/{len(target_stocks)}] 正在分析個股 {stock_id}...", flush=True)
         res = analyze_single_stock(stock_id)
         if res:
             selected_stocks.append(res)
-        time.sleep(0.25)
+        
+        # 強制休息 10 秒
+        time.sleep(10.0)
 
-    # 3. 依外資買超張數遞減排序
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
 
     today_str = datetime.datetime.now().strftime('%Y%m%d')
@@ -222,7 +226,6 @@ def run_precalculation():
         lines.append("💡 篩選核心：當日成交量 Top100 + 站穩月線 + MACD紅柱 + 外資突破性買超。")
         report = "\n".join(lines)
 
-    # 4. 寫入資料庫
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     print("🎉 動態成交量選股運算完畢並已成功寫入 DB！", flush=True)
