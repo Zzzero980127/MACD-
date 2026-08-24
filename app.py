@@ -44,12 +44,16 @@ def init_db():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # 1. 歷史選股紀錄表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS history (
                 date VARCHAR(20) PRIMARY KEY,
                 content TEXT
             );
         ''')
+        
+        # 2. 掃描器狀態表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS scanner_state (
                 id INT PRIMARY KEY,
@@ -59,9 +63,22 @@ def init_db():
                 data_date VARCHAR(20)
             );
         ''')
+        
+        # 3. 模擬交易資料表 (解決 relation "paper_trades" does not exist 錯誤)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                trade_date VARCHAR(20) PRIMARY KEY,
+                stocks_json TEXT,
+                status VARCHAR(20),
+                buy_prices_json TEXT,
+                settlement_json TEXT
+            );
+        ''')
+        
         cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
         if cursor.fetchone()[0] == 0:
             cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
+            
         conn.commit()
         cursor.close()
         conn.close()
@@ -249,7 +266,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (資料日期不一致自動重置)
+# 4. 背景輪詢掃描器
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -339,8 +356,9 @@ def background_stock_scanner():
         curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
         update_scanner_state(curr_idx + 1, total_scanned, leaderboard, saved_date)
 
+# 啟動背景排程器 (頻率調整為 5 秒)
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
+scheduler.add_job(background_stock_scanner, 'interval', seconds=5)
 scheduler.start()
 
 # ----------------------------------------------------
@@ -348,7 +366,7 @@ scheduler.start()
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active with Robust Auto Reset!"
+    return "TW Stock Bot Active!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -366,6 +384,12 @@ def handle_message(event):
         user_input = event.message.text.strip()
         clean_keyword = user_input.upper().replace(" ", "")
 
+        # 每次收到訊息時，被動觸發背景掃描，解決 Render 休眠問題
+        try:
+            background_stock_scanner()
+        except Exception:
+            pass
+
         date_match = re.search(r'^(20\d{6})$', clean_keyword)
 
         if date_match:
@@ -377,7 +401,7 @@ def handle_message(event):
                 reply_text = f"⚠️ 找不到 ({target_date}) 的歷史紀錄，請確認日期格式如 20260824"
         elif "選股" in clean_keyword or "AI" in clean_keyword or "潛力股" in clean_keyword:
             reply_text = get_ai_selected_stocks()
-        elif clean_keyword in ["模擬持股", "PAPER", "持股"]:
+        elif clean_keyword in ["模擬持股", "PAPER", "持股", "持倉"]:  # 👈 已加入 "持倉"
             reply_text = get_paper_trades_status()
         elif clean_keyword in ["結算", "CLOSE", "週結算"]:
             reply_text = execute_paper_trades_settlement()
@@ -526,4 +550,5 @@ def analyze_stock(user_input):
         return f"⚠️ 分析發生錯誤: {str(e)}"
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
