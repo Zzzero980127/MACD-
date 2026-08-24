@@ -131,7 +131,7 @@ def run_precalculation():
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
-        # 強制每處理一檔停頓 10 秒，避免請求太頻繁
+        # 精準防卡停頓 10 秒
         time.sleep(10)
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
@@ -155,15 +155,15 @@ def run_precalculation():
 
         final_content = header_title + "\n\n".join(report_cards)
 
-        # 1. 寫入 Supabase 快取（同時寫入多種日期 key）
+        # 1. 寫入 Supabase 快取（寫入各種日期 key 備查）
         save_history_to_db("LATEST", final_content)
         save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
         save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
-        print("✅ 已成功將報告與各種日期 key 存入 Supabase！")
+        print("✅ 已成功將報告存入 Supabase 資料庫！")
 
-        # 2. 自動發送 LINE 主動推播
+        # 2. 自動發送 LINE 主動推播給使用者
         if line_bot_api and LINE_USER_ID:
             try:
                 line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
