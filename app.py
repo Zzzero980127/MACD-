@@ -52,7 +52,6 @@ def init_db():
                 data_date VARCHAR(20)
             );
         ''')
-        # 擴充欄位檢查
         cursor.execute('''
             ALTER TABLE scanner_state ADD COLUMN IF NOT EXISTS data_date VARCHAR(20) DEFAULT '';
         ''')
@@ -246,7 +245,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景輪詢掃描器 (含跨日收盤新資料自動重置邏輯)
+# 4. 背景輪詢掃描器 (平滑無縫重置)
 # ----------------------------------------------------
 def background_stock_scanner():
     try:
@@ -268,13 +267,15 @@ def background_stock_scanner():
                 latest = df.iloc[-1]
                 fetched_date = str(latest.get('date', ''))
 
-                # 💡 核心重點：當偵測到 API 釋出全新交易日資料，歸零重新開始掃描！
-                if recorded_date != "" and fetched_date != recorded_date and fetched_date != "":
-                    update_scanner_state(0, 0, {}, fetched_date)
-                    return
-
-                if recorded_date == "" and fetched_date != "":
-                    recorded_date = fetched_date
+                # 💡 只有遇到「真正的新交易日 (日期更大)」時才重置排行榜
+                if fetched_date != "":
+                    if recorded_date == "":
+                        recorded_date = fetched_date
+                    elif fetched_date > recorded_date:
+                        print(f"🔄 偵測到新交易日數據 ({fetched_date})，重置計數並開始新掃描！")
+                        recorded_date = fetched_date
+                        total_scanned = 0
+                        leaderboard = {}
 
                 df['MA20'] = df['Close'].rolling(window=20).mean()
                 exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -319,14 +320,17 @@ def background_stock_scanner():
         today_str = datetime.datetime.now().strftime("%Y%m%d")
         if leaderboard:
             save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        
+
         update_scanner_state(next_idx, total_scanned + 1, leaderboard, recorded_date)
 
-    except Exception:
-        curr_idx, total_scanned, leaderboard, recorded_date = get_scanner_state()
-        update_scanner_state(curr_idx + 1, total_scanned, leaderboard, recorded_date)
+    except Exception as e:
+        print(f"Scanner Loop Catch: {e}")
+        try:
+            c_idx, t_scan, l_board, r_date = get_scanner_state()
+            update_scanner_state((c_idx + 1) % len(STOCK_NAME_MAP or [1]), t_scan + 1, l_board, r_date)
+        except Exception:
+            pass
 
-# 啟動背景排程 (30 秒間隔)
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
@@ -395,7 +399,7 @@ def get_ai_selected_stocks():
     top_stocks = list(leaderboard.values())
 
     if total_scanned < 5 and not top_stocks:
-        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 档標的\n💡 請再等待約 1~2 分鐘後重新點選！"
+        return f"⏳【AI 後台數據庫暖機中】\n• 當前進度: 已掃描 {total_scanned} 檔標的\n💡 請再等待約 1~2 分鐘後重新點選！"
 
     display_date = recorded_date.replace("-", "/") if recorded_date else datetime.datetime.now().strftime("%Y/%m/%d")
     scanned_info = f"(後台已累計全台股動態掃描 {total_scanned} 檔標的)"
