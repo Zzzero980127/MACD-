@@ -1,5 +1,6 @@
 import os
 import threading
+import traceback
 import requests
 import pandas as pd
 import datetime
@@ -196,11 +197,17 @@ def analyze_stock(user_input):
 @app.route("/", methods=['GET'])
 def index(): return "OK"
 
+def run_with_logging():
+    from cron_job import run_precalculation
+    try:
+        run_precalculation()
+    except Exception as e:
+        print(f"💥 背景選股任務發生未捕獲異常:\n{traceback.format_exc()}", flush=True)
+
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
-    from cron_job import run_precalculation
-    threading.Thread(target=run_precalculation).start()
-    return "🚀 前 100 檔選股運算已在背景啟動！每 10 秒處理一檔（總耗時約 16 分鐘），完成後會自動存入 Supabase 並推播到 LINE。", 200
+    threading.Thread(target=run_with_logging).start()
+    return "🚀 前 100 檔選股運算已在背景啟動！耗時約 16 分鐘，完成後自動發送結果。", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -224,10 +231,7 @@ def handle_message(event):
         query_date = f"{datetime.datetime.now().strftime('%Y')}{clean_date}" if len(clean_date) == 4 else clean_date
 
         report = get_history_from_db(query_date)
-        if report:
-            reply_text = report
-        else:
-            reply_text = analyze_stock(user_input)
+        reply_text = report if report else analyze_stock(user_input)
 
     else:
         reply_text = analyze_stock(user_input)
