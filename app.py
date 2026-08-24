@@ -61,9 +61,6 @@ def load_all_taiwan_stocks():
 
 load_all_taiwan_stocks()
 
-# ----------------------------------------------------
-# 個股單獨查詢輔助函式
-# ----------------------------------------------------
 def get_tw_stock_data_finmind(stock_id):
     try:
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
@@ -198,12 +195,9 @@ def analyze_stock(user_input):
     except Exception as e:
         return f"⚠️ 分析發生錯誤: {str(e)}"
 
-# ----------------------------------------------------
-# 路由與事件
-# ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
-    return "TW Stock Bot Active - Top 3 Precision Edition!"
+    return "TW Stock Bot Active - Standard Fast Version"
 
 @app.route("/callback", methods=['POST'])
 def callback():
