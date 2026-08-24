@@ -224,8 +224,8 @@ def analyze_stock(stock_id):
 def index():
     return f"LINE Bot Webhook Server is Running! (Loaded {len(STOCK_NAME_TO_ID)} stocks)"
 
-# cron-job.org 觸發進入點
-@app.route("/run_cron", methods=['GET', 'POST'])
+# 配合你 cron-job.org 設定的專屬觸發入口
+@app.route("/run-cron-job-secret", methods=['GET', 'POST'])
 def trigger_cron():
     """ 供 cron-job.org 呼叫的選股任務觸發點 """
     try:
