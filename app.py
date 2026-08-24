@@ -21,7 +21,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
-IS_CRON_RUNNING = False  # 全域開關：防止背景任務重複執行
+IS_CRON_RUNNING = False
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -49,7 +49,7 @@ def load_all_taiwan_stocks():
     global STOCK_NAME_MAP
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=3)
+        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=5)
         if res.status_code == 200 and isinstance(res.json(), list):
             for item in res.json():
                 s_id = str(item.get("Code", "")).strip()
@@ -58,7 +58,7 @@ def load_all_taiwan_stocks():
     except Exception: pass
 
     try:
-        res = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes", headers=headers, timeout=3)
+        res = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes", headers=headers, timeout=5)
         if res.status_code == 200 and res.text.strip().startswith('['):
             for item in res.json():
                 s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
@@ -74,13 +74,13 @@ def get_tw_stock_data_finmind(stock_id):
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
         headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
         
-        res = requests.get(url, headers=headers, timeout=5.0)
+        res = requests.get(url, headers=headers, timeout=8.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
-            if len(df) >= 20: return df
+            if len(df) >= 5: return df # 放寬為大於等於 5 天即可分析
     except Exception: pass
     return None
 
@@ -90,7 +90,7 @@ def get_tw_foreign_investor(stock_id):
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
         headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
 
-        res = requests.get(url, headers=headers, timeout=4.0)
+        res = requests.get(url, headers=headers, timeout=5.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
@@ -107,7 +107,7 @@ def get_tw_stock_revenue(stock_id):
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
         headers = {'User-Agent': 'Mozilla/5.0', 'token': FINMIND_TOKEN}
 
-        res = requests.get(url, headers=headers, timeout=4.0)
+        res = requests.get(url, headers=headers, timeout=5.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"])
             if 'revenue' in df.columns and len(df) >= 13:
@@ -149,13 +149,13 @@ def analyze_stock(user_input):
         foreign_net = get_tw_foreign_investor(stock_code)
         revenue_info = get_tw_stock_revenue(stock_code)
 
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA60'] = df['Close'].rolling(window=60).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-        df['STD20'] = df['Close'].rolling(window=20).std(ddof=0)
+        df['MA20'] = df['Close'].rolling(window=min(20, len(df))).mean()
+        df['MA60'] = df['Close'].rolling(window=min(60, len(df))).mean()
+        df['Vol_MA5'] = df['Volume'].rolling(window=min(5, len(df))).mean()
+        df['STD20'] = df['Close'].rolling(window=min(20, len(df))).std(ddof=0)
         df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
-        latest, prev = df.iloc[-1], df.iloc[-2]
+        latest, prev = df.iloc[-1], df.iloc[-2] if len(df) > 1 else df.iloc[-1]
         close, prev_close = float(latest['Close']), float(prev['Close'])
         ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
         ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
@@ -164,7 +164,7 @@ def analyze_stock(user_input):
         diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
         vol_today = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
-        price_change_pct = ((close - prev_close) / prev_close) * 100
+        price_change_pct = ((close - prev_close) / prev_close) * 100 if prev_close != 0 else 0.0
 
         if close >= bb_upper * 0.98:
             vol_status = f"💥 接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n  👉 短線過熱，切勿追高"
@@ -208,7 +208,7 @@ def run_with_logging():
     except Exception as e:
         print(f"💥 背景選股任務發生未捕獲異常:\n{traceback.format_exc()}", flush=True)
     finally:
-        IS_CRON_RUNNING = False  # 跑完或出錯都會自動解鎖
+        IS_CRON_RUNNING = False
 
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
