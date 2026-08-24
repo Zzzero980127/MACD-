@@ -230,3 +230,14 @@ def handle_message(event):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+import subprocess
+
+@app.route('/run-cron-job-secret', methods=['GET'])
+def trigger_cron():
+    try:
+        # 在背景執行 cron_job.py
+        subprocess.Popen(["python", "cron_job.py"])
+        return "Cron job triggered successfully!", 200
+    except Exception as e:
+        return f"Error: {str(e)}", 500
