@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import datetime
 import psycopg2
-import gc  # 導入垃圾回收模組，防止記憶體爆掉
+import gc
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
@@ -102,7 +102,7 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 【防爆優化版】後台啟動：開始運算全台股成交量前 100 档指標...", flush=True)
+    print("🚀 【防爆優化版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
     headers = {'User-Agent': 'Mozilla/5.0'}
     raw_list = []
 
@@ -125,14 +125,12 @@ def run_precalculation():
     trade_date = ""
 
     for idx, item in enumerate(top_100, 1):
-        # flush=True 確保每秒即時顯示在 Log，不再被暫存封鎖
         print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
         res = analyze_candidate(item)
         if res is not None:
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
-        # 釋放記憶體避免 Render 重啟
         gc.collect()
         time.sleep(10)
 
@@ -157,6 +155,7 @@ def run_precalculation():
 
         final_content = header_title + "\n\n".join(report_cards)
 
+        # 確實寫入 LATEST，解決 LINE 回傳「尚未完成」的問題
         save_history_to_db("LATEST", final_content)
         save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%m%d"), final_content)
