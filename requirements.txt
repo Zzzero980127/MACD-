@@ -4,3 +4,4 @@ requests
 pandas
 APScheduler
 gunicorn
+psycopg2-binary
