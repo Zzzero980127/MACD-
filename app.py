@@ -35,8 +35,16 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
 
+# 🟢 全域記憶體快取：保護背景掃描與 LINE Bot 讀取，防止資料庫延遲影響運作
+RUNTIME_CACHE = {
+    "current_index": 0,
+    "total_scanned": 0,
+    "leaderboard": {},
+    "data_date": ""
+}
+
 # ----------------------------------------------------
-# 1. Supabase 資料庫操作與自動修復機制
+# 1. Supabase 資料庫操作與備份機制
 # ----------------------------------------------------
 def get_db_connection():
     if not DATABASE_URL:
@@ -49,14 +57,12 @@ def init_db():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                # 建立歷史紀錄表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS history (
                         date VARCHAR(20) PRIMARY KEY,
                         content TEXT
                     );
                 ''')
-                # 建立掃描器狀態表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS scanner_state (
                         id INT PRIMARY KEY,
@@ -66,12 +72,6 @@ def init_db():
                         data_date VARCHAR(20)
                     );
                 ''')
-                # 自動補強欄位（防止缺少 data_date 報錯）
-                cursor.execute('''
-                    ALTER TABLE scanner_state 
-                    ADD COLUMN IF NOT EXISTS data_date VARCHAR(20);
-                ''')
-                # 建立模擬交易表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS paper_trades (
                         trade_date VARCHAR(20) PRIMARY KEY,
@@ -81,53 +81,46 @@ def init_db():
                         settlement_json TEXT
                     );
                 ''')
-                cursor.execute('SELECT COUNT(*) FROM scanner_state WHERE id = 1;')
-                if cursor.fetchone()[0] == 0:
-                    cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
-                conn.commit()
-    except Exception as e:
-        print(f"DB Init Error: {e}")
-
-# 從資料庫安全讀取（防止 Render 重啟資料遺失）
-def get_scanner_state():
-    if not DATABASE_URL:
-        return 0, 0, {}, ""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
                 cursor.execute('SELECT current_index, total_scanned, leaderboard_json, data_date FROM scanner_state WHERE id = 1;')
                 row = cursor.fetchone()
-                if row:
-                    c_idx = row[0] if row[0] is not None else 0
-                    t_scan = row[1] if row[1] is not None else 0
-                    d_date = row[3] if row[3] is not None else ""
-                    
-                    # 安全解析排行榜 JSON
+                if not row:
+                    cursor.execute('INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date) VALUES (1, 0, 0, %s, %s);', ("{}", ""))
+                else:
+                    # 從資料庫還原至記憶體快取
+                    RUNTIME_CACHE["current_index"] = row[0] or 0
+                    RUNTIME_CACHE["total_scanned"] = row[1] or 0
                     try:
-                        leaderboard = json.loads(row[2]) if row[2] else {}
+                        RUNTIME_CACHE["leaderboard"] = json.loads(row[2]) if row[2] else {}
                     except Exception:
-                        leaderboard = {}
-
-                    return c_idx, t_scan, leaderboard, d_date
+                        RUNTIME_CACHE["leaderboard"] = {}
+                    RUNTIME_CACHE["data_date"] = row[3] or ""
+                conn.commit()
     except Exception as e:
-        print(f"DB Read Warning: {e}")
-    return 0, 0, {}, ""
+        print(f"DB Init Warning: {e}")
 
-# 更新回 Supabase（保存記憶體暫存）
-def update_scanner_state(current_index, total_scanned, leaderboard_dict, data_date):
+def update_scanner_state_to_db():
     if not DATABASE_URL:
         return
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute('''
-                    UPDATE scanner_state
-                    SET current_index = %s, total_scanned = %s, leaderboard_json = %s, data_date = %s
-                    WHERE id = 1;
-                ''', (current_index, total_scanned, json.dumps(leaderboard_dict), data_date))
+                    INSERT INTO scanner_state (id, current_index, total_scanned, leaderboard_json, data_date)
+                    VALUES (1, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        current_index = EXCLUDED.current_index,
+                        total_scanned = EXCLUDED.total_scanned,
+                        leaderboard_json = EXCLUDED.leaderboard_json,
+                        data_date = EXCLUDED.data_date;
+                ''', (
+                    RUNTIME_CACHE["current_index"],
+                    RUNTIME_CACHE["total_scanned"],
+                    json.dumps(RUNTIME_CACHE["leaderboard"]),
+                    RUNTIME_CACHE["data_date"]
+                ))
                 conn.commit()
     except Exception as e:
-        print(f"DB Update Warning: {e}")
+        print(f"DB Sync Warning: {e}")
 
 def save_history_to_db(date_str, content_str):
     if not DATABASE_URL:
@@ -273,11 +266,9 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 背景掃描邏輯（整合完整 Supabase 同步）
+# 4. 背景掃描邏輯
 # ----------------------------------------------------
 def background_stock_scanner():
-    curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
-
     try:
         if len(STOCK_NAME_MAP) < 10:
             load_all_taiwan_stocks()
@@ -286,8 +277,9 @@ def background_stock_scanner():
         if not all_stocks:
             return
 
+        curr_idx = RUNTIME_CACHE["current_index"]
         name, code = all_stocks[curr_idx % len(all_stocks)]
-        next_idx = (curr_idx + 1) % len(all_stocks)
+        RUNTIME_CACHE["current_index"] = (curr_idx + 1) % len(all_stocks)
 
         if not code.startswith("00") and len(code) == 4:
             df = get_tw_stock_data(code)
@@ -297,12 +289,16 @@ def background_stock_scanner():
                 fetched_date = str(latest.get('date', ''))
 
                 # 新交易日重置
-                if saved_date != "" and fetched_date != saved_date and fetched_date != "":
-                    update_scanner_state(0, 0, {}, fetched_date)
+                if RUNTIME_CACHE["data_date"] != "" and fetched_date != RUNTIME_CACHE["data_date"] and fetched_date != "":
+                    RUNTIME_CACHE["current_index"] = 0
+                    RUNTIME_CACHE["total_scanned"] = 0
+                    RUNTIME_CACHE["leaderboard"] = {}
+                    RUNTIME_CACHE["data_date"] = fetched_date
+                    update_scanner_state_to_db()
                     return
 
-                if saved_date == "" and fetched_date != "":
-                    saved_date = fetched_date
+                if RUNTIME_CACHE["data_date"] == "" and fetched_date != "":
+                    RUNTIME_CACHE["data_date"] = fetched_date
 
                 df['MA20'] = df['Close'].rolling(window=20).mean()
                 exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -324,13 +320,12 @@ def background_stock_scanner():
                 gain_5d = ((close - close_5d) / close_5d) * 100
                 bias_pct = ((close - ma20) / ma20) * 100
 
-                # 篩選指標條件
                 if (10 <= close <= 600) and (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
                     foreign_val = get_tw_foreign_investor(code)
                     score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
                     macd_status_text = "MACD 紅柱微幅擴張" if hist_today >= 0 else "MACD 綠柱縮短"
 
-                    leaderboard[code] = {
+                    RUNTIME_CACHE["leaderboard"][code] = {
                         'code': code,
                         'name': name,
                         'close': close,
@@ -343,38 +338,37 @@ def background_stock_scanner():
                         'data_date': fetched_date
                     }
 
-        # 動態取 Top 5 排序
-        sorted_list = sorted(leaderboard.values(), key=lambda x: x.get('score', 0), reverse=True)
+        # 動態取 Top 5
+        sorted_list = sorted(RUNTIME_CACHE["leaderboard"].values(), key=lambda x: x.get('score', 0), reverse=True)
         top5_list = sorted_list[:5]
-        leaderboard = {x['code']: x for x in top5_list}
+        RUNTIME_CACHE["leaderboard"] = {x['code']: x for x in top5_list}
+        RUNTIME_CACHE["total_scanned"] += 1
 
         now_dt = datetime.datetime.now()
         today_str = now_dt.strftime("%Y%m%d")
         week_str = f"{now_dt.isocalendar()[0]}_W{now_dt.isocalendar()[1]}"
 
-        # 模擬倉機制
-        if PAPER_TRADING_AVAILABLE and total_scanned >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
+        if PAPER_TRADING_AVAILABLE and RUNTIME_CACHE["total_scanned"] >= 1800 and len(top5_list) >= 3 and now_dt.weekday() <= 2:
             try:
                 auto_execute_paper_buy(top5_list[:3], today_str, week_str)
             except Exception as pe:
                 print(f"⚠️ 模擬倉跳過: {pe}")
 
-        save_history_to_db(today_str, format_ai_report(list(leaderboard.values())))
-        update_scanner_state(next_idx, total_scanned + 1, leaderboard, saved_date)
+        save_history_to_db(today_str, format_ai_report(list(RUNTIME_CACHE["leaderboard"].values())))
+        update_scanner_state_to_db()
 
     except Exception as e:
         print(f"Scanner Exception: {e}")
-        update_scanner_state(curr_idx + 1, total_scanned + 1, leaderboard, saved_date)
 
 # ----------------------------------------------------
-# 5. 排程器 (30 秒安全間隔)
+# 5. 排程器（30 秒一檔）
 # ----------------------------------------------------
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(background_stock_scanner, 'interval', seconds=30)
 scheduler.start()
 
 # ----------------------------------------------------
-# 6. LINE Bot 訊息觸發邏輯
+# 6. LINE Bot 路由與訊息處理
 # ----------------------------------------------------
 @app.route("/", methods=['GET'])
 def index():
@@ -421,7 +415,6 @@ def handle_message(event):
     except Exception as e:
         print(f"Handle Error: {e}")
 
-# 卡片格式
 def format_ai_report(top_stocks):
     top_stocks.sort(key=lambda x: x.get('score', 0), reverse=True)
     results = []
@@ -437,10 +430,10 @@ def format_ai_report(top_stocks):
         results.append(card)
     return "\n\n".join(results)
 
-# LINE 顯示輸出
 def get_ai_selected_stocks():
-    curr_idx, total_scanned, leaderboard, saved_date = get_scanner_state()
-    top_stocks = list(leaderboard.values())
+    top_stocks = list(RUNTIME_CACHE["leaderboard"].values())
+    total_scanned = RUNTIME_CACHE["total_scanned"]
+    saved_date = RUNTIME_CACHE["data_date"]
 
     if len(saved_date) == 8:
         formatted_date = f"{saved_date[:4]}/{saved_date[4:6]}/{saved_date[6:]}"
