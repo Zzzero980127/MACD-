@@ -102,11 +102,12 @@ def fetch_stock_price_with_retry(stock_id):
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
             if len(df) >= 35: 
+                print(f"  └─ 🟢 [{stock_id}] 成功取得 90 天日 K 數據 ({len(df)}筆)", flush=True)
                 return df
         else:
-            print(f"⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
+            print(f"  └─ ⚠️ [{stock_id}] 價量 API 回應異常 (Code: {res.status_code})", flush=True)
     except Exception as e:
-        print(f"⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
+        print(f"  └─ ⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
 
     return None
 
@@ -134,11 +135,12 @@ def fetch_foreign_investor_with_retry(stock_id):
 
                     if is_turn_to_buy or is_continuous_buy:
                         status_label = "🔄 外資由賣轉買" if is_turn_to_buy else "🔥 外資連買加碼"
+                        print(f"  └─ 🔥 [{stock_id}] 發現外資籌碼訊號: {status_label} ({round(today_foreign)}張)", flush=True)
                         return True, round(today_foreign), status_label
                     else:
                         return False, round(today_foreign), ""
     except Exception as e:
-        print(f"⚠️ [{stock_id}] 外資 API 失敗: {e}", flush=True)
+        print(f"  └─ ⚠️ [{stock_id}] 外資 API 失敗: {e}", flush=True)
 
     return False, 0, ""
 
@@ -190,7 +192,8 @@ def analyze_single_stock(stock_id):
     return None
 
 def run_precalculation():
-    print(f"🚀 開始選股任務！(Token 已順利帶入，長度: {len(FINMIND_TOKEN)})", flush=True)
+    token_preview = FINMIND_TOKEN[:10] + "..." if len(FINMIND_TOKEN) > 10 else "無"
+    print(f"🚀 開始選股任務！(Token 強制帶入中: {token_preview})", flush=True)
     
     target_stocks = get_top_100_volume_stocks()
     selected_stocks = []
