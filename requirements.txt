@@ -1,8 +1,6 @@
-flask
-line-bot-sdk
-pandas
-requests
-apscheduler
-psycopg2-binary
-gunicorn
-gevent
+flask==3.0.3
+line-bot-sdk==3.12.0
+requests==2.32.3
+pandas==2.2.2
+psycopg2-binary==2.9.9
+gunicorn==22.0.0
