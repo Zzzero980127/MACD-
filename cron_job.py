@@ -23,7 +23,7 @@ def get_db_connection():
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
     except Exception as e:
-        print(f"❌ DB Connect Error: {e}")
+        print(f"❌ DB Connect Error: {e}", flush=True)
         return None
 
 def save_history_to_db(date_str, content_str):
@@ -45,7 +45,7 @@ def save_history_to_db(date_str, content_str):
         cursor.close()
         conn.close()
     except Exception as e:
-        print(f"❌ DB Save Error for {date_str}: {e}")
+        print(f"❌ DB Save Error for {date_str}: {e}", flush=True)
 
 def get_tw_stock_data(stock_id):
     try:
@@ -101,7 +101,7 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 後台啟動：開始運算全台股成交量前 100 檔指標...")
+    print("🚀 【v2.0 嚴格控速版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
     headers = {'User-Agent': 'Mozilla/5.0'}
     raw_list = []
 
@@ -125,13 +125,13 @@ def run_precalculation():
 
     # 前 100 檔逐一計算，每檔精準間隔 10 秒
     for idx, item in enumerate(top_100, 1):
-        print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...")
+        print(f"[{idx}/100] 正在分析 {item['name']} ({item['code']})...", flush=True)
         res = analyze_candidate(item)
         if res is not None:
             leaderboard.append(res)
             if not trade_date and res.get('trade_date'): trade_date = res['trade_date']
         
-        # 精準防卡停頓 10 秒
+        # ⚠️ 強制每單次迴圈結束必等 10 秒
         time.sleep(10)
 
     leaderboard.sort(key=lambda x: x['score'], reverse=True)
@@ -155,21 +155,19 @@ def run_precalculation():
 
         final_content = header_title + "\n\n".join(report_cards)
 
-        # 1. 寫入 Supabase 快取（寫入各種日期 key 備查）
         save_history_to_db("LATEST", final_content)
         save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%m%d"), final_content)
         save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
         save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
-        print("✅ 已成功將報告存入 Supabase 資料庫！")
+        print("✅ 已成功將報告存入 Supabase 資料庫！", flush=True)
 
-        # 2. 自動發送 LINE 主動推播給使用者
         if line_bot_api and LINE_USER_ID:
             try:
                 line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=final_content))
-                print("✅ 已成功發送 LINE 自動推播！")
+                print("✅ 已成功發送 LINE 自動推播！", flush=True)
             except Exception as e:
-                print(f"❌ LINE 推播失敗: {e}")
+                print(f"❌ LINE 推播失敗: {e}", flush=True)
 
         return final_content
 
