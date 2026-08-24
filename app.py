@@ -21,6 +21,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 STOCK_NAME_MAP = {}
+IS_CRON_RUNNING = False  # 全域開關：防止背景任務重複執行
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -199,16 +200,25 @@ def analyze_stock(user_input):
 def index(): return "OK"
 
 def run_with_logging():
+    global IS_CRON_RUNNING
     from cron_job import run_precalculation
     try:
+        IS_CRON_RUNNING = True
         run_precalculation()
     except Exception as e:
         print(f"💥 背景選股任務發生未捕獲異常:\n{traceback.format_exc()}", flush=True)
+    finally:
+        IS_CRON_RUNNING = False  # 跑完或出錯都會自動解鎖
 
 @app.route('/run-cron-job-secret', methods=['GET'])
 def trigger_cron():
+    global IS_CRON_RUNNING
+    if IS_CRON_RUNNING:
+        print("⚠️ 任務正在運行中，拒絕重複觸發！", flush=True)
+        return "⚠️ 任務正在運行中，請勿重複觸發。", 200
+        
     threading.Thread(target=run_with_logging).start()
-    return "🚀 前 100 档選股運算已在背景啟動！", 200
+    return "🚀 前 100 檔選股運算已在背景啟動！", 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
