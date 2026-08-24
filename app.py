@@ -1,18 +1,17 @@
 import os
-import threading
-import traceback
+import re
 import requests
 import pandas as pd
 import datetime
 import psycopg2
-from flask import Flask, request
+from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjo2t5bGdkc0BnWFpc5jb20iLCJlbWFpbCI6InRewXnZHNAZ21haWWuY29tIwidG9rZW5_fdmVyc2lvbiI6MH0.ebdFVr_Wfwo_Cm3ZnxZolvZGxfmXkywJJv8Y19gngCk".strip()
-
+# LINE Bot 金鑰
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -20,8 +19,49 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-STOCK_NAME_MAP = {}
-IS_CRON_RUNNING = False
+# 全域動態股票名稱與代號對照字典
+STOCK_NAME_TO_ID = {}
+STOCK_ID_TO_NAME = {}
+
+def update_stock_symbol_map():
+    """ 自動向證交所 (TWSE) 與櫃買中心 (TPEx) 動態抓取『全市場上市櫃股票名稱與代號』 """
+    global STOCK_NAME_TO_ID, STOCK_ID_TO_NAME
+    print("🔄 正在動態更新全台股名稱與代號對照表...", flush=True)
+    temp_name_map = {}
+    temp_id_map = {}
+
+    try:
+        # 1. 抓取上市股票 (TWSE)
+        twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res_twse = requests.get(twse_url, timeout=10)
+        if res_twse.status_code == 200:
+            for item in res_twse.json():
+                code = item.get("Code", "").strip()
+                name = item.get("Name", "").strip()
+                if len(code) == 4 and code.isdigit() and name:
+                    temp_name_map[name] = code
+                    temp_id_map[code] = name
+
+        # 2. 抓取上櫃股票 (TPEx)
+        tpex_url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes"
+        res_tpex = requests.get(tpex_url, timeout=10)
+        if res_tpex.status_code == 200:
+            for item in res_tpex.json():
+                code = item.get("SecuritiesCompanyCode", "").strip()
+                name = item.get("CompanyName", "").strip()
+                if len(code) == 4 and code.isdigit() and name:
+                    temp_name_map[name] = code
+                    temp_id_map[code] = name
+
+        if temp_name_map:
+            STOCK_NAME_TO_ID = temp_name_map
+            STOCK_ID_TO_NAME = temp_id_map
+            print(f"✅ 台股對照表更新完成！成功載入 {len(STOCK_NAME_TO_ID)} 檔上市櫃股票。", flush=True)
+    except Exception as e:
+        print(f"⚠️ 動態抓取證交所名單失敗: {e}", flush=True)
+
+# 伺服器啟動時立即執行一次名單更新
+update_stock_symbol_map()
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -33,231 +73,186 @@ def get_db_connection():
         return psycopg2.connect(url, connect_timeout=10)
     except Exception: return None
 
-def get_history_from_db(date_str="LATEST"):
+def get_latest_report_from_db():
+    """ 從 PostgreSQL 撈取 cron_job.py 計算好的最新 AI 選股報告 """
     conn = get_db_connection()
-    if not conn: return None
+    if not conn:
+        return "⚠️ 資料庫連線失敗，請稍後再試。"
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT content FROM history WHERE date = %s;', (date_str,))
+        cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
         row = cursor.fetchone()
         cursor.close()
         conn.close()
-        return row[0] if row else None
-    except Exception: return None
+        if row and row[0]:
+            return row[0]
+        else:
+            return "📅 目前尚無 AI 選股報告，請等待每日盤後自動計算。"
+    except Exception as e:
+        return f"⚠️ 讀取選股報告失敗: {e}"
 
-def load_all_taiwan_stocks():
-    global STOCK_NAME_MAP
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def fetch_single_stock_price_public(stock_id):
+    """ 【個股查詢專用】100% 走無 Token 公用通道，絕不佔用選股 Token 配額 """
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
     try:
-        res = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=5)
-        if res.status_code == 200 and isinstance(res.json(), list):
-            for item in res.json():
-                s_id = str(item.get("Code", "")).strip()
-                s_name = str(item.get("Name", "")).strip().replace(" ", "")
-                if s_id.isdigit() and len(s_id) == 4 and s_name: STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
-
-    try:
-        res = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dailyclose_quotes", headers=headers, timeout=5)
-        if res.status_code == 200 and res.text.strip().startswith('['):
-            for item in res.json():
-                s_id = str(item.get("SecuritiesCompanyCode", "")).strip()
-                s_name = str(item.get("CompanyName", "")).strip().replace(" ", "")
-                if s_id.isdigit() and len(s_id) == 4 and s_name: STOCK_NAME_MAP[s_name] = s_id
-    except Exception: pass
-
-load_all_taiwan_stocks()
-
-def get_tw_stock_data_finmind(stock_id):
-    """ 單股查詢優先嘗試 Token，若失敗（如限流）自動切換成公用免 Token 模式 """
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-    
-    # 第一次試帶 Token
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-    try:
-        res = requests.get(url, timeout=4.0)
+        res = requests.get(url, timeout=5.0)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
-            if len(df) >= 5: return df
+            if len(df) >= 35: return df
     except Exception: pass
+    return None
 
-    # 第二次備援：不帶 Token（分流避開 Token 頻率限制）
-    url_public = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+def fetch_single_stock_foreign_public(stock_id):
+    """ 【個股查詢專用】100% 走無 Token 公用通道抓取外資籌碼 """
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
     try:
-        res = requests.get(url_public, timeout=4.0)
+        res = requests.get(url, timeout=5.0)
         if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-            df = df.dropna(subset=['Close'])
-            if len(df) >= 5: return df
+            df = pd.DataFrame(res.json()["data"])
+            foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
+            if not foreign_df.empty:
+                foreign_df['net_buy'] = (foreign_df['buy'] - foreign_df['sell']) / 1000
+                daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index()
+                daily_summary = daily_summary.sort_values('date')
+                if len(daily_summary) >= 2:
+                    today_foreign = float(daily_summary.iloc[-1]['net_buy'])
+                    prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
+                    return round(today_foreign), round(prev_foreign)
     except Exception: pass
+    return 0, 0
+
+def find_stock_id(user_input):
+    """ 智慧辨識使用者輸入：支援 4 位數代號、完整名稱、簡稱模糊搜尋 """
+    text = user_input.strip()
+
+    # 1. 檢查是否直接輸入 4 位數代號
+    if len(text) == 4 and text.isdigit():
+        return text
+
+    # 2. 精準名稱比對 (如: "台積電")
+    if text in STOCK_NAME_TO_ID:
+        return STOCK_NAME_TO_ID[text]
+
+    # 3. 模糊名稱搜尋 (如輸入 "台積" 可找到 "台積電")
+    for name, code in STOCK_NAME_TO_ID.items():
+        if text in name:
+            return code
+
+    # 4. 文字中有包含 4 位數字代號
+    match = re.search(r'\b\d{4}\b', text)
+    if match:
+        return match.group(0)
 
     return None
 
-def get_tw_foreign_investor(stock_id):
-    try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, timeout=4.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"])
-            foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)]
-            if not foreign_df.empty:
-                latest_date = foreign_df.iloc[-1]['date']
-                day_data = foreign_df[foreign_df['date'] == latest_date]
-                return round((day_data['buy'].sum() - day_data['sell'].sum()) / 1000)
-    except Exception: pass
-    return 0
+def analyze_stock(stock_id):
+    """ 單一個股分析邏輯 """
+    df = fetch_single_stock_price_public(stock_id)
+    stock_name = STOCK_ID_TO_NAME.get(stock_id, stock_id)
+    
+    if df is None:
+        return f"❌ 找不到 [{stock_name} ({stock_id})] 的近期行情數據，請確認代號或名稱是否正確。"
 
-def get_tw_stock_revenue(stock_id):
-    try:
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start_date}"
-        res = requests.get(url, timeout=4.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"])
-            if 'revenue' in df.columns and len(df) >= 13:
-                df['revenue'] = pd.to_numeric(df['revenue'], errors='coerce')
-                df = df.dropna(subset=['revenue'])
-                
-                latest, prev_month, last_year = df.iloc[-1], df.iloc[-2], df.iloc[-13]
-                rev_latest, rev_prev, rev_ly = float(latest['revenue']), float(prev_month['revenue']), float(last_year['revenue'])
-                rev_date = f"{latest.get('revenue_year', '')}/{str(latest.get('revenue_month', '')).zfill(2)}"
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(min(60, len(df))).mean()
+    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
+    
+    df['STD20'] = df['Close'].rolling(20).std(ddof=0)
+    df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
 
-                yoy_val = ((rev_latest - rev_ly) / rev_ly * 100) if rev_ly > 0 else 0.0
-                mom_val = ((rev_latest - rev_prev) / rev_prev * 100) if rev_prev > 0 else 0.0
-                eval_text = "🟢 強勁成長" if yoy_val > 15 else ("🟢 穩健成長" if yoy_val > 0 else "🔴 營收衰退")
-                return f"{rev_date}月營收 | YoY: {yoy_val:+.2f}% | MoM: {mom_val:+.2f}%\n    評價: {eval_text}"
-    except Exception: pass
-    return "暫無最新月營收資料"
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = exp1 - exp2
+    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['OSC'] = df['DIF'] - df['MACD']
 
-def resolve_stock_symbol(user_input):
-    if len(STOCK_NAME_MAP) < 300: load_all_taiwan_stocks()
-    clean_input = user_input.upper().replace(".TW", "").replace(".TWO", "").replace(" ", "").strip()
-    if clean_input.isdigit() and len(clean_input) == 4:
-        name = [k for k, v in STOCK_NAME_MAP.items() if v == clean_input]
-        return clean_input, name[0] if name else clean_input
-    if clean_input in STOCK_NAME_MAP: return STOCK_NAME_MAP[clean_input], clean_input
-    for name, code in STOCK_NAME_MAP.items():
-        if clean_input in name or name in clean_input: return code, name
-    return clean_input, clean_input
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-def analyze_stock(user_input):
-    try:
-        stock_code, display_name = resolve_stock_symbol(user_input)
-        if not stock_code.isdigit() or len(stock_code) != 4:
-            return f"⚠️ 找不到「{user_input}」的台股資料，請確認名稱或代號是否正確。"
+    close = float(latest['Close'])
+    prev_close = float(prev['Close'])
+    pct_change = ((close - prev_close) / prev_close) * 100
+    
+    ma5, ma20, ma60 = float(latest['MA5']), float(latest['MA20']), float(latest['MA60'])
+    osc_today = float(latest['OSC'])
 
-        df = get_tw_stock_data_finmind(stock_code)
-        if df is None or df.empty:
-            return f"⚠️ 暫時無法取得 [{display_name} ({stock_code})] 的技術數據，請稍後重試。"
+    # 抓取籌碼
+    today_foreign, prev_foreign = fetch_single_stock_foreign_public(stock_id)
 
-        foreign_net = get_tw_foreign_investor(stock_code)
-        revenue_info = get_tw_stock_revenue(stock_code)
+    # 外資籌碼標籤
+    if today_foreign > 50 and prev_foreign <= 50:
+        foreign_label = f"🔄 外資由賣轉買 (+{today_foreign} 張)"
+    elif today_foreign > 200 and prev_foreign > 200:
+        foreign_label = f"🔥 外資連買加碼 (+{today_foreign} 張)"
+    elif today_foreign > 0:
+        foreign_label = f"📈 外資買超 (+{today_foreign} 張)"
+    elif today_foreign < 0:
+        foreign_label = f"📉 外資賣超 ({today_foreign} 張)"
+    else:
+        foreign_label = "➖ 外資觀望/無變化"
 
-        df['MA20'] = df['Close'].rolling(window=min(20, len(df))).mean()
-        df['MA60'] = df['Close'].rolling(window=min(60, len(df))).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=min(5, len(df))).mean()
-        df['STD20'] = df['Close'].rolling(window=min(20, len(df))).std(ddof=0)
-        df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+    # 趨勢簡評
+    if close > ma20 and ma20 >= ma60:
+        trend_status = "🟢 多頭格局 (站穩均線之上)"
+    elif close < ma20 and ma20 <= ma60:
+        trend_status = "🔴 空頭修正 (受壓於均線下)"
+    else:
+        trend_status = "🟡 震盪整理期"
 
-        latest, prev = df.iloc[-1], df.iloc[-2] if len(df) > 1 else df.iloc[-1]
-        close, prev_close = float(latest['Close']), float(prev['Close'])
-        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
-        ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
-        bb_upper = float(latest['BB_Upper']) if not pd.isna(latest['BB_Upper']) else close
+    macd_status = "紅柱控盤 (偏多)" if osc_today > 0 else "綠柱控盤 (偏空)"
 
-        diff_pct = ((close - ma20) / ma20) * 100 if ma20 != 0 else 0
-        vol_today = float(latest['Volume'])
-        vol_ma5 = float(latest['Vol_MA5']) if not pd.isna(latest['Vol_MA5']) else vol_today
-        price_change_pct = ((close - prev_close) / prev_close) * 100 if prev_close != 0 else 0.0
-
-        if close >= bb_upper * 0.98:
-            vol_status = f"💥 接近/突破布林上軌 ({close:.2f} >= {bb_upper:.2f})\n  👉 短線過熱，切勿追高"
-        elif price_change_pct > 0 and vol_today >= vol_ma5 * 1.15:
-            vol_status = f"👆 上漲放量 (+{price_change_pct:.1f}%)\n  👉 多頭攻擊強烈"
-        elif price_change_pct < 0 and vol_today >= vol_ma5 * 1.15:
-            vol_status = f"👇 下跌放量 ({price_change_pct:.1f}%)\n  👉 注意賣壓風險"
-        else:
-            vol_status = f"➡️ 價量平穩 ({price_change_pct:+.1f}%)"
-
-        foreign_text = f"{foreign_net:} 張" if foreign_net != 0 else "0 張/估算中"
-        signal = "🔴 【建議出場/觀望】跌破支撐" if (close < ma60 or diff_pct < -3.0) else ("🔥 【多頭控盤】可持股或觀察" if close >= ma20 else "🟡 【多短觀望】偏溫運作")
-        pct_text = f"高於月線 {diff_pct:.2f}%" if diff_pct >= 0 else f"低於月線 {abs(diff_pct):.2f}%"
-
-        return (
-            f"📊 [{display_name} ({stock_code})] 技術與籌碼分析 :\n"
-            f"--------------------\n"
-            f"最新收盤價: {close:.2f}\n"
-            f"20日均線(月線): {ma20:.2f} ({pct_text})\n"
-            f"60日均線(季線): {ma60:.2f}\n"
-            f"布林通道上軌: {bb_upper:.2f}\n"
-            f"量價結構:\n  {vol_status}\n"
-            f"外資籌碼: {foreign_text}\n"
-            f"--------------------\n"
-            f"📈 基本面與營收 :\n  {revenue_info}\n"
-            f"--------------------\n"
-            f"💡 操作建議 :\n{signal}"
-        )
-    except Exception as e:
-        return f"⚠️ 分析發生錯誤: {str(e)}"
+    report = (
+        f"📊 【個股即時診斷：{stock_name} ({stock_id})】\n"
+        f"--------------------\n"
+        f"💵 最新收盤: {close:.2f} ({pct_change:+.2f}%)\n"
+        f"📈 均線趨勢: {trend_status}\n"
+        f"📊 MACD狀態: {macd_status}\n"
+        f"👤 外資籌碼: {foreign_label}\n"
+        f"--------------------\n"
+        f"💡 5MA: {ma5:.2f} | 20MA: {ma20:.2f} | 60MA: {ma60:.2f}"
+    )
+    return report
 
 @app.route("/", methods=['GET'])
-def index(): return "OK"
-
-def run_with_logging():
-    global IS_CRON_RUNNING
-    from cron_job import run_precalculation
-    try:
-        IS_CRON_RUNNING = True
-        run_precalculation()
-    except Exception as e:
-        print(f"💥 背景選股任務發生未捕獲異常:\n{traceback.format_exc()}", flush=True)
-    finally:
-        IS_CRON_RUNNING = False
-
-@app.route('/run-cron-job-secret', methods=['GET'])
-def trigger_cron():
-    global IS_CRON_RUNNING
-    if IS_CRON_RUNNING:
-        print("⚠️ 任務正在運行中，拒絕重複觸發！", flush=True)
-        return "⚠️ 任務正在運行中，請勿重複觸發。", 200
-        
-    threading.Thread(target=run_with_logging).start()
-    return "🚀 前 100 檔選股運算已在背景啟動！", 200
+def index():
+    return f"LINE Bot Webhook Server is Running! (Loaded {len(STOCK_NAME_TO_ID)} stocks)"
 
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except Exception as e: print(f"Error: {e}")
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
     return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_input = event.message.text.strip()
-    clean_keyword = user_input.upper().replace(" ", "")
+    user_msg = event.message.text.strip()
 
-    if "選股" in clean_keyword or "AI" in clean_keyword:
-        report = get_history_from_db("LATEST")
-        reply_text = report if report else "⚠️ 後台尚未完成今日統計，請稍後再試！"
+    # 1. 查詢選股報告指令
+    if user_msg in ["選股", "AI", "AI選股", "今日選股"]:
+        report = get_latest_report_from_db()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
+        return
 
-    elif user_input.replace("/", "").replace("-", "").isdigit() and len(user_input.replace("/", "").replace("-", "")) in [4, 8]:
-        clean_date = user_input.replace("/", "").replace("-", "")
-        query_date = f"{datetime.datetime.now().strftime('%Y')}{clean_date}" if len(clean_date) == 4 else clean_date
+    # 2. 自動匹配股票代號 (支援名稱、簡稱與 4 位數代號)
+    stock_id = find_stock_id(user_msg)
 
-        report = get_history_from_db(query_date)
-        reply_text = report if report else analyze_stock(user_input)
-
+    # 3. 執行個股查詢或預設回覆
+    if stock_id:
+        report = analyze_stock(stock_id)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
     else:
-        reply_text = analyze_stock(user_input)
-
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        reply_text = "🤖 請輸入欲查詢的股票名稱（如：台積電、緯穎、長榮航）或 4 位數代號（如：2330、2603），輸入「選股」可查看最新 AI 篩選報告！"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
