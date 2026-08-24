@@ -198,7 +198,7 @@ def get_tw_stock_revenue(stock_id):
     return "暫無最新月營收資料"
 
 # ----------------------------------------------------
-# 4. 單檔股票分析作業（多線程平行計算）
+# 4. 單檔股票分析作業（動態扣分評分制，確保必出牌）
 # ----------------------------------------------------
 def analyze_candidate(item):
     try:
@@ -229,25 +229,42 @@ def analyze_candidate(item):
 
             gain_5d = ((close - close_5d) / close_5d) * 100
             bias_pct = ((close - ma20) / ma20) * 100
+            foreign_val = get_tw_foreign_investor(code)
 
-            # 防追高與低位階指標卡關條件
-            if (gain_5d <= 15.0) and (-10.0 <= bias_pct <= 10.0) and (hist_today > hist_yesterday):
-                foreign_val = get_tw_foreign_investor(code)
-                score = (foreign_val * 0.6) + ((10.0 - bias_pct) * 15) + ((hist_today - hist_yesterday) * 40)
-                macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else "紅柱微幅擴張"
+            # --- 動態評分演算法 ---
+            score = 100.0
 
-                return {
-                    'code': code,
-                    'name': name,
-                    'close': close,
-                    'ma20': ma20,
-                    'bias_pct': bias_pct,
-                    'gain_5d': gain_5d,
-                    'foreign_net': foreign_val,
-                    'macd_status': macd_status_text,
-                    'score': score,
-                    'trade_date': trade_date
-                }
+            # 1. 外資籌碼加分
+            score += (foreign_val * 0.05)
+
+            # 2. 防追高懲罰 (5日漲幅 > 12% 開始加倍扣分)
+            if gain_5d > 12.0:
+                score -= (gain_5d - 12.0) * 5
+
+            # 3. 乖離率懲罰 (遠離月線扣分)
+            if abs(bias_pct) > 8.0:
+                score -= (abs(bias_pct) - 8.0) * 4
+
+            # 4. MACD 轉強加分/轉弱扣分
+            if hist_today > hist_yesterday:
+                score += 15
+            else:
+                score -= 10
+
+            macd_status_text = "綠柱縮短 (空方衰退)" if hist_today < 0 else ("紅柱擴張" if hist_today > hist_yesterday else "紅柱縮短")
+
+            return {
+                'code': code,
+                'name': name,
+                'close': close,
+                'ma20': ma20,
+                'bias_pct': bias_pct,
+                'gain_5d': gain_5d,
+                'foreign_net': foreign_val,
+                'macd_status': macd_status_text,
+                'score': score,
+                'trade_date': trade_date
+            }
     except Exception:
         pass
     return None
@@ -382,7 +399,7 @@ def handle_message(event):
             if top_stocks:
                 reply_text = f"🎯【{display_date} AI 全台股極速動態 Top 5 總排名】:\n\n" + format_ai_report(top_stocks)
             else:
-                reply_text = f"🎯【{display_date} AI 全台股極速動態排名】:\n目前今日無符合嚴格爆發指標的標的，建議觀望！"
+                reply_text = f"🎯【{display_date} AI 全台股極速動態排名】:\n目前今日無符合爆發指標的標的，建議觀望！"
         else:
             reply_text = analyze_stock(user_input)
 
