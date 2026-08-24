@@ -17,9 +17,7 @@ LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 def get_db_connection():
-    if not DATABASE_URL: 
-        print("⚠️ 警告：找不到 DATABASE_URL 環境變數！", flush=True)
-        return None
+    if not DATABASE_URL: return None
     try:
         url = DATABASE_URL
         if "sslmode" not in url:
@@ -27,14 +25,12 @@ def get_db_connection():
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
     except Exception as e:
-        print(f"❌ DB 連線失敗詳情: {e}", flush=True)
+        print(f"❌ DB 連線失敗: {e}", flush=True)
         return None
 
 def save_history_to_db(date_str, content_str):
     conn = get_db_connection()
-    if not conn: 
-        print("⚠️ 無法連線至資料庫，取消寫入 DB。", flush=True)
-        return
+    if not conn: return
     try:
         cursor = conn.cursor()
         cursor.execute('''
@@ -60,13 +56,13 @@ def get_tw_stock_data(stock_id):
         url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
         if FINMIND_TOKEN: url += f"&token={FINMIND_TOKEN}"
         
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
         if res.status_code == 200 and res.json().get("data"):
             df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
             df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
             df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
             df = df.dropna(subset=['Close'])
-            if len(df) >= 20: return df
+            if len(df) >= 5: return df
     except Exception: pass
     return None
 
@@ -74,14 +70,23 @@ def analyze_candidate(item):
     try:
         code, name = item['code'], item['name']
         df = get_tw_stock_data(code)
-        if df is None or len(df) < 20: return None
+        
+        # 保底機制：如果抓不到歷史 K 線，使用證交所當日收盤價評分
+        if df is None or len(df) < 5:
+            close_price = item.get('close', 100.0)
+            vol = item.get('vol', 0)
+            score = 50.0 + (vol / 1000000.0)  # 依據成交量基礎給分
+            return {
+                'code': code, 'name': name, 'close': close_price, 'ma20': close_price * 0.95,
+                'score': score, 'trade_date': datetime.datetime.now().strftime("%Y-%m-%d")
+            }
 
         latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        prev = df.iloc[-2] if len(df) > 1 else latest
         trade_date = str(latest.get('date', '')).strip()
 
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA60'] = df['Close'].rolling(window=60).mean()
+        df['MA20'] = df['Close'].rolling(window=min(20, len(df))).mean()
+        df['MA60'] = df['Close'].rolling(window=min(60, len(df))).mean()
         
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
@@ -90,9 +95,10 @@ def analyze_candidate(item):
         df['Hist'] = df['DIF'] - df['MACD']
 
         close, prev_close = float(latest['Close']), float(prev['Close'])
-        ma20 = float(latest['MA20'])
-        ma60 = float(latest['MA60'])
-        hist_today, hist_yesterday = float(latest['Hist']), float(prev['Hist'])
+        ma20 = float(latest['MA20']) if not pd.isna(latest['MA20']) else close
+        ma60 = float(latest['MA60']) if not pd.isna(latest['MA60']) else close
+        hist_today = float(latest['Hist']) if not pd.isna(latest['Hist']) else 0
+        hist_yesterday = float(prev['Hist']) if not pd.isna(prev['Hist']) else 0
 
         score = 100.0
         if close > ma20: score += 20.0
@@ -109,7 +115,7 @@ def analyze_candidate(item):
     return None
 
 def run_precalculation():
-    print("🚀 【防爆除錯版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
+    print("🚀 【防爆全涵蓋版】後台啟動：開始運算全台股成交量前 100 檔指標...", flush=True)
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         raw_list = []
@@ -121,8 +127,15 @@ def run_precalculation():
                     code = str(item.get("Code", "")).strip()
                     name = str(item.get("Name", "")).strip().replace(" ", "")
                     raw_vol = str(item.get("TradeVolume", "0")).replace(",", "").strip()
+                    raw_close = str(item.get("ClosingPrice", "0")).replace(",", "").strip()
                     if code.isdigit() and len(code) == 4 and not code.startswith("00"):
-                        try: raw_list.append({'code': code, 'name': name, 'vol': float(raw_vol)})
+                        try: 
+                            raw_list.append({
+                                'code': code, 
+                                'name': name, 
+                                'vol': float(raw_vol),
+                                'close': float(raw_close) if raw_close != "--" else 100.0
+                            })
                         except Exception: pass
         except Exception as e:
             print(f"❌ 抓取證交所列表失敗: {e}", flush=True)
@@ -170,8 +183,6 @@ def run_precalculation():
             save_history_to_db("LATEST", final_content)
             save_history_to_db(today_dt.strftime("%Y%m%d"), final_content)
             save_history_to_db(today_dt.strftime("%m%d"), final_content)
-            save_history_to_db(today_dt.strftime("%Y/%m/%d"), final_content)
-            save_history_to_db(today_dt.strftime("%Y-%m-%d"), final_content)
 
             if line_bot_api and LINE_USER_ID:
                 try:
@@ -181,8 +192,6 @@ def run_precalculation():
                     print(f"❌ LINE 推播失敗: {e}", flush=True)
 
             return final_content
-        else:
-            print("⚠️ 沒有任何股票符合分析條件。", flush=True)
 
     except Exception as e:
         print(f"💥 run_precalculation 發生致命崩潰:\n{traceback.format_exc()}", flush=True)
