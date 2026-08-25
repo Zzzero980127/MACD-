@@ -10,11 +10,11 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 # -----------------------------------------------------------------------------
-# 1. 環境變數設定
+# 1. 環境變數設定（專用 Token 機制）
 # -----------------------------------------------------------------------------
 FINMIND_TOKEN = (
-    os.environ.get('FINMIND_TOKEN', '').strip() or 
-    os.environ.get('FINMIND_API_TOKEN', '').strip()
+    os.environ.get('FINMIND_API_TOKEN', '').strip() or 
+    os.environ.get('FINMIND_TOKEN', '').strip()
 )
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -82,19 +82,29 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 核心個股分析與詳細 Console 日誌
+# 3. 核心個股分析 (Cron Job：使用 Token 獲取穩定高額度)
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    
+    headers = {}
+    if FINMIND_TOKEN:
+        headers["Authorization"] = f"Bearer {FINMIND_TOKEN}"
+
+    price_url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_id,
+        "start_date": start_date
+    }
     
     try:
-        res_p = http.get(price_url, timeout=8.0)
+        res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
         if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  ❌ [{stock_id} {stock_name}] K線 API 讀取失敗或無資料", flush=True)
+            print(f"  ❌ [{stock_id} {stock_name}] K線 API 失敗 (HTTP {res_p.status_code})", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -108,7 +118,7 @@ def fetch_finmind_data(stock_info):
             print(f"  ⚠️ [{stock_id} {stock_name}] K線資料不足 30 天", flush=True)
             return None
 
-        # --- 計算 MACD 指標 ---
+        # --- MACD 指標計算 ---
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -134,15 +144,14 @@ def fetch_finmind_data(stock_info):
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
         # ---------------------------------------------------------------------
-        # 🎯 核心門檻：MACD 空方力道下降 (今天 OSC > 昨天 OSC)
+        # 🎯 唯一硬性篩選門檻：MACD 空方力道下降 (今天 OSC > 昨天 OSC)
         # ---------------------------------------------------------------------
         if osc_today <= osc_p1:
-            print(f"  🚫 [{stock_id} {stock_name}] 剔除: MACD 未見轉折 (今日OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
+            print(f"  🚫 [{stock_id} {stock_name}] 跳過: MACD 未見轉折 (今日OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
 
-        # 極端值防範
         if pct_change > 9.8 or pct_change < -7.0:
-            print(f"  🚫 [{stock_id} {stock_name}] 剔除: 漲跌幅過大 ({pct_change:.2f}%)", flush=True)
+            print(f"  🚫 [{stock_id} {stock_name}] 跳過: 漲跌幅過大 ({pct_change:.2f}%)", flush=True)
             return None
 
         # ---------------------------------------------------------------------
@@ -151,7 +160,7 @@ def fetch_finmind_data(stock_info):
         score = 50
         tags = []
 
-        # 1. MACD 狀態加分
+        # 1. MACD 加分
         if osc_today > 0 and osc_p1 <= 0:
             score += 15
             tags.append("💥綠轉紅第1天")
@@ -178,22 +187,25 @@ def fetch_finmind_data(stock_info):
             score += 10
             tags.append("🚀帶量攻擊")
 
-        # 4. 籌碼面抓取與雙重容錯
-        time.sleep(0.4)
+        # 4. 籌碼面（三大法人）
+        time.sleep(0.3)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
-        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
+        chip_params = {
+            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+            "data_id": stock_id,
+            "start_date": chip_start
+        }
         
         today_total = 0
         today_foreign = 0
         today_trust = 0
 
-        res_c = http.get(chip_url, timeout=6.0)
+        res_c = http.get(price_url, params=chip_params, headers=headers, timeout=6.0)
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
                 df_c['net_buy'] = (pd.to_numeric(df_c['buy'], errors='coerce').fillna(0) - pd.to_numeric(df_c['sell'], errors='coerce').fillna(0)) / 1000
                 
-                # 相容 FinMind 多種命名格式
                 daily_total = df_c.groupby('date')['net_buy'].sum().reset_index(name='total_net')
                 foreign_df = df_c[df_c['name'].astype(str).str.contains('Foreign|外資', case=False)].groupby('date')['net_buy'].sum().reset_index(name='foreign_net')
                 trust_df = df_c[df_c['name'].astype(str).str.contains('Trust|投信', case=False)].groupby('date')['net_buy'].sum().reset_index(name='trust_net')
@@ -223,13 +235,12 @@ def fetch_finmind_data(stock_info):
         # 🔍 洗盤後起漲點 獨立判定
         # ---------------------------------------------------------------------
         is_wash_breakout = False
-        # 條件：昨日或前日拉回洗盤 + 今日收紅發動(>0.5%) + 有量/法人買超
         if (osc_p1 < osc_p2 or float(prev1['Close']) <= float(prev2['Close'])) and (pct_change >= 0.5) and (is_volume_breakout or today_total >= 1000):
             is_wash_breakout = True
             score += 15
             tags.append("⚡洗盤結束起漲")
 
-        # 輸出後台終端機詳細 Log
+        # 終端機詳細 Log 輸出
         print(f"  ✅ [選中標的] {stock_id} {stock_name} | 收盤:{close_price} ({pct_change:+.2f}%) | 得分:{score} | 法人買超:{round(today_total)}張 | 洗盤突破:{is_wash_breakout}", flush=True)
 
         return {
@@ -250,11 +261,14 @@ def fetch_finmind_data(stock_info):
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
-    print(f"🚀 [Cron Job Log] 開始執行排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
+    print(f"🚀 [Cron Job Log] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
     
     if not FINMIND_TOKEN:
-        print("❌ [Fatal Error] FINMIND_TOKEN 未設定！", flush=True)
+        print("❌ [Fatal Error] FINMIND_API_TOKEN 未設定或讀取失敗！", flush=True)
         return
+    else:
+        masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
+        print(f"🔑 [Token Check] 成功載入 FinMind Token ({masked_token})", flush=True)
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
@@ -294,7 +308,7 @@ def run_precalculation():
             
         time.sleep(0.3)
 
-    # 分別按得分高低排序
+    # 依得分高低排序
     all_passed_stocks.sort(key=lambda x: x['score'], reverse=True)
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
 
