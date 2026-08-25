@@ -73,6 +73,7 @@ def fetch_finmind_data(stock_info):
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 35: return None
 
+        # 計算 MACD 與均線
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -98,22 +99,32 @@ def fetch_finmind_data(stock_info):
         open_price = float(latest['Open'])
         high_price = float(latest['High'])
         prev_close = float(prev1['Close'])
+        today_volume = float(latest['Volume'])
+        vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 技術面過濾
+        # 防追高與避雷針過濾
         if pct_change > 6.0: return None
         upper_shadow = high_price - max(open_price, close_price)
         body_length = max(abs(close_price - open_price), 0.01)
         if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015): return None
+        
         ma20_val = float(latest['MA20'])
         if ma20_val > 0 and (close_price / ma20_val) > 1.20: return None
-        if (close_price >= float(latest['Boll_Upper']) * 0.985) and (float(latest['Volume']) < float(latest['Vol_MA5'])): return None
 
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1)
-        is_first_red = (osc_today > 0) and (osc_p1 <= 0)
-        is_macd_expanding = (osc_today > 0) and (osc_today > osc_p1)
-        is_red_shrinking_2days = (osc_p1 > 0) and (osc_p2 > osc_p1)
-        is_red_shrinking_3days = (osc_p1 > 0) and (osc_p3 > osc_p2 > osc_p1)
+        # 🎯 優化：布林通道邏輯（防誤殺盤整突破股）
+        boll_upper = float(latest['Boll_Upper'])
+        is_volume_breakout = today_volume >= (vol_ma5 * 1.5) # 是否帶量突破
+        if (close_price >= boll_upper * 0.985) and not is_volume_breakout:
+            return None  # 縮量碰上軌才過濾，帶量突破不排除
+
+        # 🎯 嚴格 MACD 轉折判定（加入 0.001 精確度閥值）
+        is_green_shrinking = (osc_today < -0.001) and (osc_today > osc_p1)
+        is_first_red = (osc_today > 0.001) and (osc_p1 <= 0.001)
+        is_macd_expanding = (osc_today > 0.001) and (osc_today > osc_p1)
+        
+        is_red_shrinking_2days = (osc_p1 > 0.001) and (osc_p2 > osc_p1)
+        is_red_shrinking_3days = (osc_p1 > 0.001) and (osc_p3 > osc_p2 > osc_p1)
 
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
@@ -135,48 +146,71 @@ def fetch_finmind_data(stock_info):
                     if str(daily_chip.iloc[-1]['date']) != str(latest['date']): return None
 
                     today_total = float(daily_chip.iloc[-1]['total_net'])
-                    prev_total = float(daily_chip.iloc[-2]['total_net'])
                     today_foreign = float(daily_chip.iloc[-1]['foreign_net'])
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
-                    
-                    if (prev_total >= 3000) and (today_total < prev_total * 0.85): return None
-                    if today_trust <= -1000: return None
 
-                    is_heavy_sell_yesterday = (prev_total <= -2000)
-                    is_strong_rebound_cover = is_heavy_sell_yesterday and (today_total >= abs(prev_total) * 0.8)
-                    is_normal_turn_buy = (prev_total > -2000) and (today_total >= 2000)
-                    is_3x_surge = (prev_total > 0) and (today_total >= prev_total * 3) and (today_total >= 1000)
+                    if today_trust <= -1000: return None # 投信大賣保護
+                    is_chip_buy = (today_total >= 1000)
+
+                    # 🎯 優化：防範隔日沖機制（計算買超佔總成交量比例）
+                    # FinMind 成交量單位為股，需除以 1000 換算為張
+                    total_vol_shares = (today_volume / 1000) if today_volume > 0 else 1
+                    chip_ratio = (today_total / total_vol_shares) if total_vol_shares > 0 else 0
+                    is_day_trading_risk = (chip_ratio >= 0.40) # 買超比率超標，具隔日沖風險
 
                     score = 0
                     strategy_type = None
                     tags = []
 
-                    if (is_green_shrinking or is_first_red):
-                        if is_strong_rebound_cover:
-                            strategy_type = "BOTTOM_TURN"
-                            score = 90
-                            tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
-                            tags.append(f"⚡法人強勢吞噬({round(today_total)}張)")
-                        elif is_normal_turn_buy:
-                            strategy_type = "BOTTOM_TURN"
-                            score = 80
-                            tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
-                            tags.append(f"🔄法人合買{round(today_total)}張")
-
-                    elif is_macd_expanding and (is_strong_rebound_cover or is_normal_turn_buy or is_3x_surge):
-                        strategy_type = "WASH_BREAKOUT"
+                    # 【策略一：底部止跌】
+                    if (is_green_shrinking or is_first_red) and is_chip_buy:
+                        strategy_type = "BOTTOM_TURN"
                         score = 70
-                        if is_red_shrinking_3days:
+                        tags.append("💥綠轉紅第1天" if is_first_red else "📉綠柱止跌")
+                        
+                        if is_day_trading_risk:
+                            score += 10
+                            tags.append(f"🔄法人合買({round(today_total)}張)")
+                            tags.append("⚠️籌碼過度集中")
+                        elif today_total >= 10000:
                             score += 20
+                            tags.append(f"⚡萬張爆買({round(today_total)}張)")
+                        elif today_total >= 5000:
+                            score += 15
+                            tags.append(f"🔥法人大買({round(today_total)}張)")
+                        else:
+                            score += 10
+                            tags.append(f"🔄法人合買({round(today_total)}張)")
+
+                    # 【策略二：洗盤突破】
+                    elif is_macd_expanding and is_chip_buy:
+                        strategy_type = "WASH_BREAKOUT"
+                        score = 65
+                        if is_red_shrinking_3days:
+                            score += 15
                             tags.append("⚡3日洗盤突破")
                         elif is_red_shrinking_2days:
-                            score += 15
+                            score += 10
                             tags.append("⚡2日洗盤突破")
-                        tags.append(f"🔥法人暴買{round(today_total)}張")
+                        
+                        if is_day_trading_risk:
+                            score += 10
+                            tags.append(f"🔥法人買超({round(today_total)}張)")
+                            tags.append("⚠️籌碼過度集中")
+                        elif today_total >= 10000:
+                            score += 20
+                            tags.append(f"⚡萬張爆買({round(today_total)}張)")
+                        else:
+                            score += 10
+                            tags.append(f"🔥法人買超({round(today_total)}張)")
 
+                    # 附加技術面加分
                     if strategy_type:
+                        if is_volume_breakout and (close_price >= boll_upper * 0.985):
+                            score += 10
+                            tags.append("🚀帶量強勢突破")
                         if today_foreign > 0 and today_trust > 0:
-                            score += 15
+                            score += 10
                             tags.append("🤝土洋同買")
                         if 1.0 <= pct_change <= 4.0:
                             score += 10
@@ -224,7 +258,6 @@ def run_precalculation():
     wash_breakout_stocks = []
     total_count = len(candidates)
 
-    # 🔍 補回每一檔的掃描進度 Log
     for idx, stock_info in enumerate(candidates, 1):
         print(f"📊 [{idx}/{total_count}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
