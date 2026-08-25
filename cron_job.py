@@ -9,8 +9,12 @@ import psycopg2
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-# 🔐 強制讀取環境變數 (自動去除前後空白)
-FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
+# 🔐 強制讀取環境變數 (同時相容 FINMIND_TOKEN 與 FINMIND_API_TOKEN)
+FINMIND_TOKEN = (
+    os.environ.get('FINMIND_TOKEN', '').strip() or 
+    os.environ.get('FINMIND_API_TOKEN', '').strip()
+)
+
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
@@ -158,37 +162,25 @@ def fetch_finmind_data(stock_info):
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
-                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張，嚴格防試單)
-                    # 情境 A: 外資前日賣超(或<=0)，今日直接轉大買 >= 1000 張
+                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張)
                     is_foreign_turn_buy_surge = (prev_foreign <= 0) and (today_foreign >= 1000)
-                    
-                    # 情境 B: 外資前日買超(>0)，今日買超張數為前日的 3 倍以上，且至少 >= 1000 張
                     is_foreign_3x_surge = (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 1000)
-
-                    # 只要符合 A 或 B 其中一種外資爆發情境
                     is_foreign_surge = is_foreign_turn_buy_surge or is_foreign_3x_surge
 
-                    # 基礎籌碼標籤
                     if today_foreign > 50 and prev_foreign <= 50:
                         tags.append("🔄外資轉買")
 
                     # 🎯 【組合條件大額加分】
-                    # 1. 3日洗盤遞減 + 今日紅柱突破 + 外資爆量(轉買千張或3倍)
                     if is_macd_expanding and is_red_shrinking_3days and is_foreign_surge:
                         score += 45
                         tags.append("⚡3日洗盤突破+外資爆買")
-
-                    # 2. 2日洗盤遞減 + 今日紅柱突破 + 外資爆量(轉買千張或3倍)
                     elif is_macd_expanding and is_red_shrinking_2days and is_foreign_surge:
                         score += 40
                         tags.append("⚡2日洗盤突破+外資爆買")
-
-                    # 3. 一般紅柱擴大 + 外資爆量(轉買千張或3倍)
                     elif is_macd_expanding and is_foreign_surge:
                         score += 30
                         tags.append("⚡紅柱擴大+外資爆買")
 
-                    # 漲幅黃金位階 (1% ~ 4%)
                     if 1.0 <= pct_change <= 4.0:
                         score += 15
                         tags.append("🛡️黃金位階")
@@ -210,7 +202,7 @@ def run_precalculation():
     print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
     
     if not FINMIND_TOKEN:
-        print("❌ [Token Error] 未檢測到 FINMIND_TOKEN 環境變數！程式中止！", flush=True)
+        print("❌ [Token Error] 未檢測到 FINMIND_TOKEN 或 FINMIND_API_TOKEN 環境變數！程式中止！", flush=True)
         print("==================================================", flush=True)
         return
     else:
@@ -267,7 +259,6 @@ def run_precalculation():
         lines.append("💡 策略說明：優先推薦經連日洗盤後，今日突破且外資暴買（>=1000張或前日3倍）之起漲標的。")
         report = "\n".join(lines)
 
-    # 寫入資料庫並發送推播
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
