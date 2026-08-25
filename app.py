@@ -1,206 +1,147 @@
 import os
-import time
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import pandas as pd
-import datetime
 import psycopg2
+import re
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# 讀取環境變數中的 Token
-ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
+app = Flask(__name__)
 
-# ⚠️ 請確認引號內填入你真正的 FinMind Token
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E" 
-
-FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
+# 從環境變數獲取 LINE Channel 與 FinMind 金鑰
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 
-def create_robust_session():
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        raise_on_status=False
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-http = create_robust_session()
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 def get_db_connection():
-    if not DATABASE_URL: return None
+    if not DATABASE_URL:
+        return None
     try:
         url = DATABASE_URL
         if "sslmode" not in url:
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
-    except Exception: return None
+    except Exception as e:
+        print(f"❌ 資料庫連線失敗: {e}")
+        return None
 
-def save_to_db(report_text, date_str="LATEST"):
+def get_report_by_date(date_key="LATEST"):
+    """ 查詢最新或特定日期的選股報告 """
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        return "⚠️ 資料庫未連線，請檢查 DATABASE_URL 設定。"
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS history (
-                date VARCHAR(20) PRIMARY KEY,
-                content TEXT NOT NULL
-            );
-        ''')
-        cursor.execute('''
-            INSERT INTO history (date, content)
-            VALUES (%s, %s)
-            ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;
-        ''', (date_str, report_text))
-        conn.commit()
+        cursor.execute("SELECT content FROM history WHERE date = %s;", (date_key,))
+        row = cursor.fetchone()
         cursor.close()
         conn.close()
-        print(f"✅ 已成功將 {date_str} 的選股報告寫入 PostgreSQL！", flush=True)
+        if row:
+            return row[0]
+        return f"ℹ️ 找不到 [{date_key}] 的歷史選股紀錄。"
     except Exception as e:
-        print(f"❌ 寫入資料庫失敗: {e}", flush=True)
+        return f"❌ 讀取報告失敗: {e}"
 
-def fetch_finmind_data(stock_id):
-    """ 只針對過濾後的少數精選個股進行 FinMind API 深度分析 (價量 + 籌碼) """
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
-    
-    # 1. 抓價量算 MACD
-    price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+def query_single_stock(stock_id):
+    """ 個股即時查：抓取 FinMind 最新價量與 MACD 轉折狀態 """
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&token={FINMIND_TOKEN}"
     try:
-        res_p = http.get(price_url, timeout=8.0)
-        if res_p.status_code != 200 or not res_p.json().get("data"):
-            return None
-        
-        df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df = df.dropna(subset=['Close'])
-        
-        if len(df) < 35: return None
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200 and res.json().get("data"):
+            data = res.json()["data"]
+            if len(data) >= 35:
+                import pandas as pd
+                df = pd.DataFrame(data).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+                df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+                df = df.dropna(subset=['Close'])
 
-        # 計算 MACD
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['DIF'] = exp1 - exp2
-        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['OSC'] = df['DIF'] - df['MACD']
+                exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+                exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+                df['DIF'] = exp1 - exp2
+                df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+                df['OSC'] = df['DIF'] - df['MACD']
 
-        osc_today = float(df.iloc[-1]['OSC'])
-        osc_prev = float(df.iloc[-2]['OSC'])
+                latest = df.iloc[-1]
+                prev = df.iloc[-2]
+                close = float(latest['Close'])
+                prev_close = float(prev['Close'])
+                pct = ((close - prev_close) / prev_close) * 100
+                osc_today = float(latest['OSC'])
+                osc_prev = float(prev['OSC'])
 
-        # 🎯 抓精準轉折：綠柱收縮(空方衰退) 或 紅柱第1天(剛起漲)
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
-        is_first_red = (osc_today > 0) and (osc_prev <= 0)
+                if osc_today < 0 and osc_today > osc_prev:
+                    macd_status = "📉 綠柱縮短 (空方衰退/轉折中)"
+                elif osc_today > 0 and osc_prev <= 0:
+                    macd_status = "💥 紅柱第1天 (剛起漲轉折)"
+                elif osc_today > 0:
+                    macd_status = "🔥 多頭控盤中 (紅柱)"
+                else:
+                    macd_status = "❄️ 空頭控盤中 (綠柱)"
 
-        if not (is_green_shrinking or is_first_red):
-            return None
-        
-        macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
-
-        # 2. 抓外資籌碼
-        time.sleep(1.0) # 安全間隔
-        chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
-        
-        res_c = http.get(chip_url, timeout=8.0)
-        if res_c.status_code == 200 and res_c.json().get("data"):
-            df_c = pd.DataFrame(res_c.json()["data"])
-            foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
-            if not foreign_df.empty:
-                foreign_df['net_buy'] = (foreign_df['buy'] - foreign_df['sell']) / 1000
-                daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
-                
-                if len(daily_summary) >= 2:
-                    today_foreign = float(daily_summary.iloc[-1]['net_buy'])
-                    prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
-                    
-                    is_turn_to_buy = (today_foreign > 50) and (prev_foreign <= 50)
-                    is_continuous_buy = (today_foreign > 200) and (prev_foreign > 200)
-
-                    if is_turn_to_buy or is_continuous_buy:
-                        status_label = "🔄 外資由賣轉買" if is_turn_to_buy else "🔥 外資連買加碼"
-                        close_price = float(df.iloc[-1]['Close'])
-                        prev_close = float(df.iloc[-2]['Close'])
-                        pct_change = ((close_price - prev_close) / prev_close) * 100
-
-                        return {
-                            "code": stock_id,
-                            "close": close_price,
-                            "pct": pct_change,
-                            "foreign_shares": round(today_foreign),
-                            "foreign_label": status_label,
-                            "macd_status": macd_status
-                        }
+                return f"📊 【個股即時解析 - {stock_id}】\n--------------------\n🔹 最新收盤: {close:.2f} ({pct:+.2f}%)\n🔹 MACD狀態: {macd_status}\n🔹 當日成交量: {int(latest['Volume'])/1000:.0f} 張"
     except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id}] 分析過程異常: {e}", flush=True)
+        print(f"查詢個股失敗: {e}")
+    return f"⚠️ 無法取得個股 [{stock_id}] 的最新數據，請確認代號是否正確。"
 
-    return None
+@app.route("/", methods=['GET'])
+def home():
+    return "OK - LINE Bot Running!", 200
 
-def run_precalculation():
-    print("🚀 開始兩階段安全選股任務 (第一階段：TWSE 免費 API 篩選)...", flush=True)
-    
-    # 階段 1：使用證交所免費 API 快速取得 Top 200 個股
-    twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    candidates = []
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
     try:
-        res = http.get(twse_url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            stocks = []
-            for item in data:
-                code = item.get("Code", "").strip()
-                if len(code) == 4 and code.isdigit():
-                    try:
-                        vol = int(item.get("TradeVolume", 0))
-                        stocks.append({"code": code, "volume": vol})
-                    except ValueError: continue
-            
-            # 排名前 200 檔
-            df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
-            top_200 = df_stocks.head(200)["code"].tolist()
-            print(f"✅ 第一階段完成，鎖定 Top 200 成交量個股！", flush=True)
-            candidates = top_200
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK', 200
+
+@app.route("/run-job", methods=['GET', 'POST'])
+def trigger_job():
+    try:
+        from cron_job import run_precalculation
+        run_precalculation()
+        return "✅ 選股排程順利執行完成！", 200
     except Exception as e:
-        print(f"❌ 證交所 API 抓取失敗: {e}", flush=True)
-        return
+        return f"❌ 執行選股排程失敗: {e}", 500
 
-    # 階段 2：只對 Top 200 呼叫 FinMind 進行 MACD 轉折與外資驗證
-    print(f"🔍 第二階段：開始針對 Top 200 進行深度驗證 (安全速跑模式)...", flush=True)
-    selected_stocks = []
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_msg = event.message.text.strip()
     
-    for i, stock_id in enumerate(candidates, 1):
-        res = fetch_finmind_data(stock_id)
-        if res:
-            print(f"  └─ 🎯 發現符合標的: [{stock_id}] {res['macd_status']} | {res['foreign_label']}", flush=True)
-            selected_stocks.append(res)
+    # 1. 查詢最新選股結果
+    if "選股" in user_msg or "推薦" in user_msg:
+        report = get_report_by_date("LATEST")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
+    
+    # 2. 查詢歷史紀錄 (例如輸入：歷史選股 或 20260825)
+    elif "歷史" in user_msg or re.match(r'^\d{8}$', user_msg):
+        date_key = user_msg if re.match(r'^\d{8}$', user_msg) else "LATEST"
+        report = get_report_by_date(date_key)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📜 歷史選股查詢結果 ({date_key}):\n\n" + report))
         
-        # 間隔 1.2 秒，安全不超額（總計消耗 API 次數大幅低於免費限制）
-        time.sleep(1.2)
-
-    selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
-
-    today_str = datetime.datetime.now().strftime('%Y%m%d')
-    date_display = datetime.datetime.now().strftime('%Y/%m/%d')
-
-    if not selected_stocks:
-        report = f"📅 【AI 今日 Top200 轉折起漲精選】({date_display})\n--------------------\n今日 Top200 熱門股中，未有符合「MACD轉折/起漲 + 外資進場」之個股。"
+    # 3. 個股代號單獨查詢 (4位數字，例如：2330)
+    elif re.match(r'^\d{4}$', user_msg):
+        reply_msg = query_single_stock(user_msg)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+        
+    # 4. 預設提示
     else:
-        lines = [f"🔥 【AI 精選：Top200 底部轉折 + 外資加碼股】({date_display})", "--------------------"]
-        for item in selected_stocks:
-            lines.append(
-                f"🔹 {item['code']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 {item['macd_status']} | {item['foreign_label']}: {item['foreign_shares']:+} 張"
-            )
-        lines.append("--------------------")
-        lines.append("💡 篩選核心：Top200 成交量 + MACD綠柱縮短/剛轉紅柱 + 外資突破性買超。")
-        report = "\n".join(lines)
-
-    save_to_db(report, "LATEST")
-    save_to_db(report, today_str)
-    print("🎉 動態選股完全安全執行完畢，並已成功寫入 DB！", flush=True)
+        hint = (
+            "🤖 AI 選股機器人使用指南：\n"
+            "1. 輸入「選股」：查看今日 Top 200 轉折強勢股\n"
+            "2. 輸入「4位股票代號」(如 2330)：即時查詢單檔 MACD 轉折狀態\n"
+            "3. 輸入「8位西元年日期」(如 20260825)：查詢歷史選股紀錄"
+        )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
 
 if __name__ == "__main__":
-    run_precalculation()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
