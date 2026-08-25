@@ -59,7 +59,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查詢：🔓 刻意無密鑰 (不帶 Token) """
+    """ 個股即時查詢：🔓 無密鑰 (不帶 Token) """
     global STOCK_MAP
     if not STOCK_MAP: update_stock_map()
 
@@ -72,9 +72,8 @@ def query_single_stock(user_input):
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    print(f"🔍 [Query Log] 收到即時查詢: [{user_input}] -> 代號: {stock_id} (模式: 🔓無密鑰/無Token)", flush=True)
+    print(f"🔍 [Query Log] 個股即時查詢: [{user_input}] -> {stock_id} (🔓無密鑰模式)", flush=True)
 
-    # 🔓 這裡故意不加 &token= 參數，使用公共額度
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
     try:
         res = requests.get(url, timeout=5)
@@ -112,7 +111,6 @@ def query_single_stock(user_input):
                     macd_status = "❄️ 空頭控盤中 (綠柱)"
 
                 display_title = f"{stock_id} {stock_name}".strip()
-                print(f"✅ [Query Log] [{display_title}] 查詢成功！", flush=True)
                 return (
                     f"📊 【個股即時解析 - {display_title}】\n"
                     f"--------------------\n"
@@ -120,7 +118,6 @@ def query_single_stock(user_input):
                     f"🔹 MACD狀態: {macd_status}\n"
                     f"🔹 當日成交量: {int(latest['Volume'])/1000:.0f} 張"
                 )
-        print(f"⚠️ [Query Log] FinMind API 回傳無數據，Status: {res.status_code}", flush=True)
     except Exception as e:
         print(f"❌ [Query Log] 查詢失敗: {e}", flush=True)
         
@@ -140,13 +137,16 @@ def callback():
         abort(400)
     return 'OK', 200
 
+# 🎯 解決 404 的關鍵：讓 cron-job.org 呼叫此端點觸發 AI 排程選股 + 推播
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
+    print("⏰ [Cron Endpoint] 收到排程觸發請求 /run-job！", flush=True)
     try:
         from cron_job import run_precalculation
         run_precalculation()
-        return "✅ 選股排程順利執行完成！", 200
+        return "✅ AI選股排程與LINE推播已順利完成！", 200
     except Exception as e:
+        print(f"❌ [Cron Endpoint] 執行失敗: {e}", flush=True)
         return f"❌ 執行選股排程失敗: {e}", 500
 
 @handler.add(MessageEvent, message=TextMessage)
