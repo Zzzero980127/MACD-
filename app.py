@@ -21,20 +21,41 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_MAP = {}
 
 def update_stock_map():
+    """ 自動更新上市 (TWSE) + 上櫃 (TPEx) 『中文名稱 <-> 股票代號』對照表 """
     global STOCK_MAP
+    new_map = {}
+    
+    # 1. 抓取上市股票 (TWSE)
     try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            for item in res.json():
+        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res_twse = requests.get(url_twse, timeout=5)
+        if res_twse.status_code == 200:
+            for item in res_twse.json():
                 code = item.get("Code", "").strip()
                 name = item.get("Name", "").strip()
                 if len(code) == 4 and code.isdigit():
-                    STOCK_MAP[code] = name
-                    STOCK_MAP[name] = code
-            print(f"✅ 股票名稱對照表已自動更新，共載入 {len(STOCK_MAP)//2} 檔個股！")
+                    new_map[code] = name
+                    new_map[name] = code
     except Exception as e:
-        print(f"⚠️ 更新股票名稱對照表失敗: {e}")
+        print(f"⚠️ 抓取上市名稱失敗: {e}")
+
+    # 2. 抓取上櫃股票 (TPEx)
+    try:
+        url_tpex = "https://www.tpex.org.tw/openapi/v1/mopsfront/t187ap03_R_otc"
+        res_tpex = requests.get(url_tpex, timeout=5)
+        if res_tpex.status_code == 200:
+            for item in res_tpex.json():
+                code = str(item.get("SecuritiesCompanyCode", "")).strip()
+                name = str(item.get("CompanyName", "")).strip()
+                if len(code) == 4 and code.isdigit() and name:
+                    new_map[code] = name
+                    new_map[name] = code
+    except Exception as e:
+        print(f"⚠️ 抓取上櫃名稱失敗: {e}")
+
+    if new_map:
+        STOCK_MAP = new_map
+        print(f"✅ 股票名稱對照表已自動更新（上市+上櫃），共載入 {len(STOCK_MAP)//2} 檔個股！", flush=True)
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -61,7 +82,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查：明確標註使用【無 Token 模式】與請求狀態 """
+    """ 個股即時查：支援上市/上櫃代號與中文名稱，使用【無 Token 模式】 """
     global STOCK_MAP
     if not STOCK_MAP:
         update_stock_map()
@@ -75,7 +96,6 @@ def query_single_stock(user_input):
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    # 🎯 無 TOKEN 個股查詢 Endpoint
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
     print(f"🔍 [個股即時查] 標的: {stock_id} {stock_name} | 🆓 [無Token模式]", flush=True)
 
