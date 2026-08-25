@@ -6,12 +6,15 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import datetime
 import psycopg2
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
-# 🔐 API Token 檢查
+# 🔐 環境變數設定
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 備用 Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
 def create_robust_session():
     session = requests.Session()
@@ -59,12 +62,24 @@ def save_to_db(report_text, date_str="LATEST"):
     except Exception as e:
         print(f"❌ [DB Log] 寫入資料庫失敗: {e}", flush=True)
 
+def send_line_push(report_text):
+    """ 📢 自動發送 LINE 訊息給所有加好友的使用者 """
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("⚠️ [LINE Log] 未設定 LINE_CHANNEL_ACCESS_TOKEN，跳過主動推播！", flush=True)
+        return
+    try:
+        line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+        # 使用廣播功能推播給所有追蹤者
+        line_bot_api.broadcast(TextSendMessage(text=report_text))
+        print("📣 [LINE Log] 已成功將選股結果推播至 LINE！", flush=True)
+    except Exception as e:
+        print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
+
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
-    # 🔑 使用 Token 抓取價格數據
     price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
@@ -89,7 +104,7 @@ def fetch_finmind_data(stock_info):
         prev_close = float(df.iloc[-2]['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        if pct_change > 6.0: return None # 防追高
+        if pct_change > 6.0: return None # 🛡️ 防追高：漲超過 6% 直接不考慮
 
         score = 0
         tags = []
@@ -112,7 +127,6 @@ def fetch_finmind_data(stock_info):
 
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-        # 🔑 使用 Token 抓取籌碼數據
         chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
         
         res_c = http.get(chip_url, timeout=8.0)
@@ -134,6 +148,7 @@ def fetch_finmind_data(stock_info):
                         score += 25
                         tags.append("🔥外資連買")
 
+                    # ⚡ 裕民加分邏輯：外資買超比昨日暴增 3 倍
                     if (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 500) and is_macd_expanding:
                         score += 35
                         tags.append("⚡外資爆買3倍")
@@ -155,11 +170,11 @@ def fetch_finmind_data(stock_info):
 
 def run_precalculation():
     print("==================================================", flush=True)
-    print("🚀 [Cron Job] 開始執行 AI 排程選股...", flush=True)
+    print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
     if FINMIND_TOKEN and len(FINMIND_TOKEN) > 20:
         print(f"🔑 [Token Log] 成功載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
     else:
-        print("⚠️ [Token Log] 未檢測到有效 Token，將以無密鑰模式運行 (可能遇到限制)！", flush=True)
+        print("⚠️ [Token Log] 未檢測到有效 Token，將以無密鑰模式運行！", flush=True)
     print("==================================================", flush=True)
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -180,7 +195,7 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-            print(f"✅ [TWSE Log] 成功從證交所取得 Top 200 熱門股！", flush=True)
+            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！", flush=True)
     except Exception as e:
         print(f"❌ [TWSE Log] 證交所 API 抓取失敗: {e}", flush=True)
         return
@@ -211,9 +226,14 @@ def run_precalculation():
         lines.append("💡 策略說明：採用評分架構，優先推薦兼具「外資急煞暴買、洗盤再起漲」之標的。")
         report = "\n".join(lines)
 
+    # 1. 儲存資料庫
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
-    print("🎉 [Cron Job Log] 排程選股全部順利完成！", flush=True)
+
+    # 2. 📢 執行 LINE 主動推播！
+    send_line_push(report)
+
+    print("🎉 [Cron Job Log] 排程選股與 LINE 推播發送完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
