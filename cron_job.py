@@ -9,10 +9,8 @@ import psycopg2
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-# 🔐 環境變數設定
-ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E" # ⚠️ 備用 Token
-FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
+# 🔐 100% 安全：完全從環境變數讀取，不留任何硬編碼 Token
+FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
@@ -172,7 +170,7 @@ def run_precalculation():
     print("==================================================", flush=True)
     print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
     if FINMIND_TOKEN and len(FINMIND_TOKEN) > 20:
-        print(f"🔑 [Token Log] 成功載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
+        print(f"🔑 [Token Log] 成功由環境變數載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
     else:
         print("⚠️ [Token Log] 未檢測到有效 Token，將以無密鑰模式運行！", flush=True)
     print("==================================================", flush=True)
