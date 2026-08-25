@@ -100,7 +100,7 @@ def fetch_finmind_data(stock_info):
         prev_close = float(prev1['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 技術面防追高過濾
+        # 技術面過濾
         if pct_change > 6.0: return None
         upper_shadow = high_price - max(open_price, close_price)
         body_length = max(abs(close_price - open_price), 0.01)
@@ -125,7 +125,6 @@ def fetch_finmind_data(stock_info):
             if not df_c.empty:
                 df_c['net_buy'] = (df_c['buy'] - df_c['sell']) / 1000
                 
-                # 計算全法人、外資、投信的獨立買賣超
                 daily_total = df_c.groupby('date')['net_buy'].sum().reset_index(name='total_net')
                 foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False)].groupby('date')['net_buy'].sum().reset_index(name='foreign_net')
                 trust_df = df_c[df_c['name'].str.contains('Trust|投信', case=False)].groupby('date')['net_buy'].sum().reset_index(name='trust_net')
@@ -140,11 +139,9 @@ def fetch_finmind_data(stock_info):
                     today_foreign = float(daily_chip.iloc[-1]['foreign_net'])
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
                     
-                    # 籌碼防禦機制
                     if (prev_total >= 3000) and (today_total < prev_total * 0.85): return None
-                    if today_trust <= -1000: return None # 投信大賣扯後腿直接排除
+                    if today_trust <= -1000: return None
 
-                    # 改為比對「三大法人合計」
                     is_heavy_sell_yesterday = (prev_total <= -2000)
                     is_strong_rebound_cover = is_heavy_sell_yesterday and (today_total >= abs(prev_total) * 0.8)
                     is_normal_turn_buy = (prev_total > -2000) and (today_total >= 2000)
@@ -175,9 +172,8 @@ def fetch_finmind_data(stock_info):
                         elif is_red_shrinking_2days:
                             score += 15
                             tags.append("⚡2日洗盤突破")
-                        tags.append(f"🔥法人爆買{round(today_total)}張")
+                        tags.append(f"🔥法人暴買{round(today_total)}張")
 
-                    # 加分項目：土洋同買與黃金位階
                     if strategy_type:
                         if today_foreign > 0 and today_trust > 0:
                             score += 15
@@ -219,18 +215,25 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-    except Exception: return
+            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！開始分析...", flush=True)
+    except Exception as e:
+        print(f"❌ [TWSE Log] 證交所 API 抓取失敗: {e}", flush=True)
+        return
 
     bottom_turn_stocks = []
     wash_breakout_stocks = []
+    total_count = len(candidates)
 
-    for stock_info in candidates:
+    # 🔍 補回每一檔的掃描進度 Log
+    for idx, stock_info in enumerate(candidates, 1):
+        print(f"📊 [{idx}/{total_count}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
         if res:
             if res['type'] == 'BOTTOM_TURN':
                 bottom_turn_stocks.append(res)
             elif res['type'] == 'WASH_BREAKOUT':
                 wash_breakout_stocks.append(res)
+            print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 類型:{res['type']} 得分:{res['score']}", flush=True)
         time.sleep(0.5)
 
     bottom_turn_stocks.sort(key=lambda x: x['score'], reverse=True)
@@ -267,6 +270,7 @@ def run_precalculation():
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
+    print("🎉 [Cron Job Log] 排程選股與 LINE 推播發送完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
