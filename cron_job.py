@@ -92,7 +92,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 5. 個股 K 線與籌碼分析核心 logic
+# 5. 個股 K 線與籌碼分析核心 Logic
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
@@ -158,13 +158,13 @@ def fetch_finmind_data(stock_info):
         if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015):
             return None
         
-        # 3. 乖離率與空頭格局過濾
+        # 3. 乖離率與空頭格局過濾（防群創類型的弱勢反彈）
         ma20_val = float(latest['MA20'])
         if ma20_val > 0:
             if (close_price / ma20_val) > 1.20:
                 return None  # 高檔乖離過大
             if (close_price / ma20_val) < 0.95:
-                return None  # 低於月線 5% 以上，屬於空頭弱勢格局，過濾如群創等標的
+                return None  # 低於月線 5% 以上，屬於空頭弱勢格局，直接過濾
 
         # 4. 布林通道突破優化（帶量突破不排除，縮量過軌才排除）
         boll_upper = float(latest['Boll_Upper'])
@@ -210,8 +210,8 @@ def fetch_finmind_data(stock_info):
                     if today_trust <= -1000:
                         return None
 
-                    # 🛡️ 致命防線：吞噬比例安全閥
-                    # 昨日大賣 (<= -2000張)，今日買超必須達昨日賣超的 80% 以上，否則視為假反彈
+                    # 🛡️ 致命防線 1：吞噬比例安全閥（解決群創漏進問題）
+                    # 昨日大賣 (<= -2000張)，今日買超必須達昨日賣超的 80% 以上，否則視為弱勢反彈
                     if (prev_total <= -2000) and (today_total < abs(prev_total) * 0.8):
                         return None
 
@@ -256,6 +256,15 @@ def fetch_finmind_data(stock_info):
                     # 【策略二：洗盤突破】
                     # ---------------------------------------------------------
                     elif is_macd_expanding and is_chip_buy:
+                        # 🛡️ 關鍵防線 2：買超動能衰退過濾（解決光寶科漏進問題）
+                        # 前日若大買 (>= 5000張)，今日買超不可大幅衰退至前日的 50% 以下
+                        if (prev_total >= 5000) and (today_total < prev_total * 0.5):
+                            return None
+
+                        # 洗盤突破需較高籌碼防禦門檻（提高至 2000 張）
+                        if today_total < 2000:
+                            return None
+
                         strategy_type = "WASH_BREAKOUT"
                         score = 65
                         
