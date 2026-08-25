@@ -12,16 +12,13 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
-FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 全域股票名稱與代號雙向對照快取
 STOCK_MAP = {}
 
 def update_stock_map():
-    """ 自動向證交所更新『中文名稱 <-> 股票代號』對照表 """
     global STOCK_MAP
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -32,10 +29,10 @@ def update_stock_map():
                 name = item.get("Name", "").strip()
                 if len(code) == 4 and code.isdigit():
                     STOCK_MAP[code] = name
-                    STOCK_MAP[name] = code  # 支援雙向查詢
-            print(f"✅ 股票名稱對照表已自動更新，共載入 {len(STOCK_MAP)//2} 檔個股！")
+                    STOCK_MAP[name] = code
+            print(f"✅ [App Log] 股票對照表載入完成，共 {len(STOCK_MAP)//2} 檔個股！")
     except Exception as e:
-        print(f"⚠️ 更新股票名稱對照表失敗: {e}")
+        print(f"⚠️ [App Log] 股票對照表更新失敗: {e}")
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -62,22 +59,23 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查：支援輸入『代號 (2330)』或『中文名稱 (台積電)』 """
+    """ 個股即時查詢：🔓 刻意無密鑰 (不帶 Token) """
     global STOCK_MAP
-    if not STOCK_MAP:
-        update_stock_map()
+    if not STOCK_MAP: update_stock_map()
 
     stock_id = user_input
     stock_name = ""
 
-    # 若輸入的是中文名稱，轉成代號；若輸入代號，補上中文名稱
     if user_input in STOCK_MAP and not user_input.isdigit():
         stock_id = STOCK_MAP[user_input]
         stock_name = user_input
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&token={FINMIND_TOKEN}"
+    print(f"🔍 [Query Log] 收到即時查詢: [{user_input}] -> 代號: {stock_id} (模式: 🔓無密鑰/無Token)", flush=True)
+
+    # 🔓 這裡故意不加 &token= 參數，使用公共額度
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
@@ -114,6 +112,7 @@ def query_single_stock(user_input):
                     macd_status = "❄️ 空頭控盤中 (綠柱)"
 
                 display_title = f"{stock_id} {stock_name}".strip()
+                print(f"✅ [Query Log] [{display_title}] 查詢成功！", flush=True)
                 return (
                     f"📊 【個股即時解析 - {display_title}】\n"
                     f"--------------------\n"
@@ -121,8 +120,10 @@ def query_single_stock(user_input):
                     f"🔹 MACD狀態: {macd_status}\n"
                     f"🔹 當日成交量: {int(latest['Volume'])/1000:.0f} 張"
                 )
+        print(f"⚠️ [Query Log] FinMind API 回傳無數據，Status: {res.status_code}", flush=True)
     except Exception as e:
-        print(f"查詢個股失敗: {e}")
+        print(f"❌ [Query Log] 查詢失敗: {e}", flush=True)
+        
     return f"⚠️ 無法取得個股 [{user_input}] 的數據，請確認名稱或代號是否正確。"
 
 @app.route("/", methods=['GET'])
@@ -161,7 +162,6 @@ def handle_message(event):
         report = get_report_by_date(date_key)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📜 歷史選股查詢結果 ({date_key}):\n\n" + report))
         
-    # 個股查詢：支援 4 位數字代號，或 2~4 字中文股票名稱 (如：台積電、裕民)
     elif re.match(r'^\d{4}$', user_msg) or (len(user_msg) >= 2 and not user_msg.isdigit()):
         reply_msg = query_single_stock(user_msg)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
@@ -176,6 +176,6 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
 
 if __name__ == "__main__":
-    update_stock_map() # 服務啟動時先載入股票中文對照表
+    update_stock_map()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
