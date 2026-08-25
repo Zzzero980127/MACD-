@@ -32,7 +32,7 @@ def update_stock_map():
                 name = item.get("Name", "").strip()
                 if len(code) == 4 and code.isdigit():
                     STOCK_MAP[code] = name
-                    STOCK_MAP[name] = code # 支援雙向查詢
+                    STOCK_MAP[name] = code  # 支援雙向查詢
             print(f"✅ 股票名稱對照表已自動更新，共載入 {len(STOCK_MAP)//2} 檔個股！")
     except Exception as e:
         print(f"⚠️ 更新股票名稱對照表失敗: {e}")
@@ -45,7 +45,7 @@ def get_db_connection():
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
-    except Exception as e: return None
+    except Exception: return None
 
 def get_report_by_date(date_key="LATEST"):
     conn = get_db_connection()
@@ -70,7 +70,6 @@ def query_single_stock(user_input):
     stock_id = user_input
     stock_name = ""
 
-    # 若輸入的是中文，轉換成代號
     if user_input in STOCK_MAP and not user_input.isdigit():
         stock_id = STOCK_MAP[user_input]
         stock_name = user_input
@@ -131,6 +130,8 @@ def callback():
         abort(400)
     return 'OK', 200
 
+# 🎯 同時支援兩種路徑，解決 cron-job 網址找不到的問題！
+@app.route("/run-cron-job-secret", methods=['GET', 'POST'])
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
     try:
@@ -153,7 +154,6 @@ def handle_message(event):
         report = get_report_by_date(date_key)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📜 歷史選股查詢結果 ({date_key}):\n\n" + report))
         
-    # 個股查詢（支援 4 位數字代號，或 2~4 字中文名稱如「台積電」）
     elif re.match(r'^\d{4}$', user_msg) or (len(user_msg) >= 2 and not user_msg.isdigit()):
         reply_msg = query_single_stock(user_msg)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
@@ -168,6 +168,6 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
 
 if __name__ == "__main__":
-    update_stock_map() # 啟動時預載對照表
+    update_stock_map()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
