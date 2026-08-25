@@ -151,13 +151,13 @@ def fetch_finmind_data(stock_info):
         # 1. MACD 型態加分
         is_first_red = (osc_today > 0) and (osc_p1 <= 0)
         if is_first_red:
-            score += 15
+            score += 10
             tags.append("💥綠轉紅第1天")
         elif osc_today < 0:
-            score += 10
+            score += 15
             tags.append("📉綠柱止跌")
         else:
-            score += 10
+            score += 0
             tags.append("🔥紅柱延伸")
 
         # 2. 均線位階加分
