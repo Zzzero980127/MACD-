@@ -110,10 +110,10 @@ def fetch_finmind_data(stock_info):
         is_macd_expanding = (osc_today > 0) and (osc_today > osc_prev)
 
         if is_green_shrinking:
-            score += 20
+            score += 30
             macd_status = "📉綠柱縮短"
         elif is_first_red:
-            score += 25
+            score += 20
             macd_status = "💥紅柱第1天"
         elif is_macd_expanding:
             score += 15
