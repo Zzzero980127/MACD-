@@ -10,11 +10,15 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 # -----------------------------------------------------------------------------
-# 1. 環境變數設定 (精準對齊你的控制台 Key 名稱)
+# 1. 環境變數設定與嚴格 Token 檢查 (防止無 Token 導致 IP 被鎖)
 # -----------------------------------------------------------------------------
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+
+if not FINMIND_TOKEN:
+    print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN！為防止無 Token 請求導致 IP 被封鎖，程式強制終止。", flush=True)
+    exit(1)
 
 # -----------------------------------------------------------------------------
 # 2. 連線與工具函式
@@ -81,7 +85,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 核心個股分析
+# 3. 核心個股分析 (僅使用 Token 呼叫 API)
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
@@ -89,9 +93,8 @@ def fetch_finmind_data(stock_info):
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     
-    headers = {}
-    if FINMIND_TOKEN:
-        headers["Authorization"] = f"Bearer {FINMIND_TOKEN}"
+    # 嚴格帶上 Bearer Token Header
+    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
     price_url = "https://api.finmindtrade.com/api/v4/data"
     params = {
@@ -102,10 +105,6 @@ def fetch_finmind_data(stock_info):
     
     try:
         res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
-        
-        # Token 異常自動退回匿名請求
-        if res_p.status_code in [401, 403]:
-            res_p = http.get(price_url, params=params, timeout=8.0)
 
         if res_p.status_code != 200 or not res_p.json().get("data"):
             print(f"  ❌ [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
@@ -149,7 +148,7 @@ def fetch_finmind_data(stock_info):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 通用初始門檻 (當日 OSC 轉折 + 防追高)
+        # 通用初始門檻 (當日 OSC 轉折 + 防追高/急跌)
         if osc_today <= osc_p1:
             print(f"  🚫 [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
@@ -175,8 +174,6 @@ def fetch_finmind_data(stock_info):
         today_trust = 0
 
         res_c = http.get(price_url, params=chip_params, headers=headers, timeout=6.0)
-        if res_c.status_code in [401, 403]:
-            res_c = http.get(price_url, params=chip_params, timeout=6.0)
 
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
@@ -281,11 +278,8 @@ def run_precalculation():
     print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
-    if FINMIND_TOKEN:
-        masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
-        print(f"🔑 [Token Check] 載入 FINMIND_API_TOKEN 成功 ({masked_token})", flush=True)
-    else:
-        print("⚠️ [Token Check] 未偵測到 FINMIND_API_TOKEN，將以匿名模式執行", flush=True)
+    masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
+    print(f"🔑 [Token Check] 載入 FINMIND_API_TOKEN 成功 ({masked_token})", flush=True)
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
