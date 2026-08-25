@@ -128,6 +128,7 @@ def fetch_finmind_data(stock_info):
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['Boll_Upper'] = df['MA20'] + (df['STD20'] * 2)
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
+        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
 
         latest = df.iloc[-1]
         prev1 = df.iloc[-2]
@@ -145,6 +146,7 @@ def fetch_finmind_data(stock_info):
         prev_close = float(prev1['Close'])
         today_volume = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5'])
+        vol_ma20 = float(latest['Vol_MA20'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
         # --- 技術面防衛過濾 ---
@@ -158,7 +160,7 @@ def fetch_finmind_data(stock_info):
         if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015):
             return None
         
-        # 3. 乖離率與空頭格局過濾（防群創類型的弱勢反彈）
+        # 3. 乖離率與空頭格局過濾
         ma20_val = float(latest['MA20'])
         if ma20_val > 0:
             if (close_price / ma20_val) > 1.20:
@@ -166,10 +168,10 @@ def fetch_finmind_data(stock_info):
             if (close_price / ma20_val) < 0.95:
                 return None  # 低於月線 5% 以上，屬於空頭弱勢格局，直接過濾
 
-        # 4. 布林通道突破優化（帶量突破不排除，縮量過軌才排除）
+        # 4. 布林通道過濾放寬（放寬量能判定至 1.2 倍或高於月均量，避免玉山金等大型股被誤殺）
         boll_upper = float(latest['Boll_Upper'])
-        is_volume_breakout = today_volume >= (vol_ma5 * 1.5)
-        if (close_price >= boll_upper * 0.985) and not is_volume_breakout:
+        is_volume_breakout = (today_volume >= vol_ma5 * 1.2) or (today_volume >= vol_ma20 * 1.1)
+        if (close_price > boll_upper * 1.005) and not is_volume_breakout:
             return None
 
         # --- MACD 轉折狀態判定 ---
@@ -210,14 +212,13 @@ def fetch_finmind_data(stock_info):
                     if today_trust <= -1000:
                         return None
 
-                    # 🛡️ 致命防線 1：吞噬比例安全閥（解決群創漏進問題）
-                    # 昨日大賣 (<= -2000張)，今日買超必須達昨日賣超的 80% 以上，否則視為弱勢反彈
+                    # 🛡️ 吞噬比例安全閥
                     if (prev_total <= -2000) and (today_total < abs(prev_total) * 0.8):
                         return None
 
                     is_chip_buy = (today_total >= 1000)
 
-                    # 籌碼集中度計算（防範隔日沖高風險）
+                    # 籌碼集中度計算
                     total_vol_shares = (today_volume / 1000) if today_volume > 0 else 1
                     chip_ratio = (today_total / total_vol_shares) if total_vol_shares > 0 else 0
                     is_day_trading_risk = (chip_ratio >= 0.40)
@@ -256,12 +257,10 @@ def fetch_finmind_data(stock_info):
                     # 【策略二：洗盤突破】
                     # ---------------------------------------------------------
                     elif is_macd_expanding and is_chip_buy:
-                        # 🛡️ 關鍵防線 2：買超動能衰退過濾（解決光寶科漏進問題）
-                        # 前日若大買 (>= 5000張)，今日買超不可大幅衰退至前日的 50% 以下
+                        # 🛡️ 前日大買衰退過濾
                         if (prev_total >= 5000) and (today_total < prev_total * 0.5):
                             return None
 
-                        # 洗盤突破需較高籌碼防禦門檻（提高至 2000 張）
                         if today_total < 2000:
                             return None
 
