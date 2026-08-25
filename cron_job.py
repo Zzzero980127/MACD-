@@ -80,7 +80,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 def fetch_finmind_data(stock_info):
-    """分析單檔股票的 MACD 與籌碼條件並進行評分"""
+    """分析單檔股票，分類為『底部轉折』或『洗盤突破』"""
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
@@ -122,29 +122,14 @@ def fetch_finmind_data(stock_info):
         # 過濾當天漲幅過高 (> 6%) 的股票，避免追高
         if pct_change > 6.0: return None
 
-        score = 0
-        tags = []
+        # MACD 型態定義
+        is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1) # 📉 綠柱縮短（止跌）
+        is_first_red = (osc_today > 0) and (osc_p1 <= 0)              # 💥 綠轉紅第1天
+        is_macd_expanding = (osc_today > 0) and (osc_today > osc_p1) # 🔥 紅柱擴大
 
-        # --- MACD 狀態判定 ---
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1)
-        is_first_red = (osc_today > 0) and (osc_p1 <= 0)
-        is_macd_expanding = (osc_today > 0) and (osc_today > osc_p1)
-
-        # 🎯 洗盤判定：前幾天紅柱「連續遞減」
+        # 洗盤判定
         is_red_shrinking_2days = (osc_p1 > 0) and (osc_p2 > osc_p1)
         is_red_shrinking_3days = (osc_p1 > 0) and (osc_p3 > osc_p2 > osc_p1)
-
-        if is_green_shrinking:
-            score += 50
-            macd_status = "📉綠柱縮短"
-        elif is_first_red:
-            score += 20
-            macd_status = "💥紅柱第1天"
-        elif is_macd_expanding:
-            score += 0   # 🎯 純紅柱擴大不給基礎分
-            macd_status = "🔥紅柱擴大"
-        else:
-            return None  # 綠柱擴大或紅柱縮短直接排除
 
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
@@ -159,56 +144,81 @@ def fetch_finmind_data(stock_info):
                 daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
                 
                 if len(daily_summary) >= 2:
+                    # 🛡️ 日期安全校驗：確認 API 最後一筆數據是否包含最新的價格日期
+                    last_chip_date = str(daily_summary.iloc[-1]['date'])
+                    last_price_date = str(latest['date'])
+                    
+                    # 若籌碼資料尚未更新至今日最新價格交易日，跳過避免拿舊數據誤判
+                    if last_chip_date != last_price_date:
+                        return None
+
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
-                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張，嚴格防試單)
-                    is_foreign_turn_buy_surge = (prev_foreign <= 0) and (today_foreign >= 1000)
+                    # 🎯 條件 1：籌碼強勢吞噬 (昨日大賣 <= -2000張，今日買超補回 80% 以上)
+                    is_heavy_sell_yesterday = (prev_foreign <= -2000)
+                    is_strong_rebound_cover = is_heavy_sell_yesterday and (today_foreign >= abs(prev_foreign) * 0.8)
+
+                    # 🎯 條件 2：標準翻多買超 (昨日小賣或微買，今日買超 >= 2000 張)
+                    is_normal_turn_buy = (prev_foreign > -2000) and (today_foreign >= 2000)
+
+                    # 🎯 條件 3：外資暴買突破 (買超為昨日 3 倍以上且 >= 1000 張)
                     is_foreign_3x_surge = (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 1000)
-                    is_foreign_surge = is_foreign_turn_buy_surge or is_foreign_3x_surge
 
-                    if today_foreign > 50 and prev_foreign <= 50:
-                        tags.append("🔄外資轉買")
+                    score = 0
+                    strategy_type = None
+                    tags = []
 
-                    # 🎯 【組合條件大額加分】
-                    if is_macd_expanding and is_red_shrinking_3days and is_foreign_surge:
-                        score += 45
-                        tags.append("⚡3日洗盤突破+外資爆買")
-                    elif is_macd_expanding and is_red_shrinking_2days and is_foreign_surge:
-                        score += 40
-                        tags.append("⚡2日洗盤突破+外資爆買")
-                    elif is_macd_expanding and is_foreign_surge:
+                    # 🎯 【策略 A：底部轉折起漲區】 (空轉多拐點)
+                    if (is_green_shrinking or is_first_red):
+                        if is_strong_rebound_cover:
+                            strategy_type = "BOTTOM_TURN"
+                            score = 90  # 強勢吞噬昨日賣壓，給予最高分
+                            tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
+                            tags.append(f"⚡籌碼強勢吞噬({round(today_foreign)}張)")
+                        elif is_normal_turn_buy:
+                            strategy_type = "BOTTOM_TURN"
+                            score = 80
+                            tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
+                            tags.append(f"🔄外資買超{round(today_foreign)}張")
+
+                    # 🎯 【策略 B：洗盤突破爆發區】 (即戰力飆股)
+                    elif is_macd_expanding and (is_strong_rebound_cover or is_normal_turn_buy or is_foreign_3x_surge):
+                        strategy_type = "WASH_BREAKOUT"
+                        score = 70
+                        if is_red_shrinking_3days:
+                            score += 20
+                            tags.append("⚡3日洗盤突破")
+                        elif is_red_shrinking_2days:
+                            score += 15
+                            tags.append("⚡2日洗盤突破")
+                        tags.append(f"🔥外資爆買{round(today_foreign)}張")
+
+                    # 位階加分 (1% ~ 4%)
+                    if strategy_type and (1.0 <= pct_change <= 4.0):
                         score += 10
-                        tags.append("⚡紅柱擴大+外資爆買")
-
-                    if 1.0 <= pct_change <= 4.0:
-                        score += 15
                         tags.append("🛡️黃金位階")
 
-                    if score >= 40:
+                    if strategy_type:
                         return {
                             "code": stock_id, "name": stock_name, "close": close_price,
                             "pct": pct_change, "foreign_shares": round(today_foreign),
-                            "score": score, "status_label": " ".join(tags) if tags else "籌碼轉佳",
-                            "macd_status": macd_status
+                            "score": score, "type": strategy_type,
+                            "status_label": " ".join(tags)
                         }
     except Exception as e:
         print(f"  └─ ⚠️ [{stock_id} {stock_name}] 分析異常: {e}", flush=True)
     return None
 
 def run_precalculation():
-    """主執行函式：抓取 Top 200 個股進行篩選與推播"""
+    """主執行函式：抓取 Top 200 個股進行篩選與分區推播"""
     print("==================================================", flush=True)
     print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
     
     if not FINMIND_TOKEN:
-        print("❌ [Token Error] 未檢測到 FINMIND_TOKEN 或 FINMIND_API_TOKEN 環境變數！程式中止！", flush=True)
+        print("❌ [Token Error] 未檢測到 FINMIND_TOKEN 環境變數！程式中止！", flush=True)
         print("==================================================", flush=True)
         return
-    else:
-        print(f"🔑 [Token Log] 成功載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
-        
-    print("==================================================", flush=True)
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
@@ -228,41 +238,67 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！開始逐一分析...", flush=True)
+            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！開始分析...", flush=True)
     except Exception as e:
         print(f"❌ [TWSE Log] 證交所 API 抓取失敗: {e}", flush=True)
         return
 
-    selected_stocks = []
+    bottom_turn_stocks = []
+    wash_breakout_stocks = []
     total_count = len(candidates)
-    
-    # 💡 逐檔分析並即時顯示進度
+
     for idx, stock_info in enumerate(candidates, 1):
         print(f"📊 [{idx}/{total_count}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
         if res:
-            print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 得分:{res['score']} | {res['macd_status']} | {res['status_label']}", flush=True)
-            selected_stocks.append(res)
+            if res['type'] == 'BOTTOM_TURN':
+                bottom_turn_stocks.append(res)
+            elif res['type'] == 'WASH_BREAKOUT':
+                wash_breakout_stocks.append(res)
+            print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 類型:{res['type']} 得分:{res['score']}", flush=True)
         time.sleep(0.5)
 
-    selected_stocks.sort(key=lambda x: x['score'], reverse=True)
+    # 排序
+    bottom_turn_stocks.sort(key=lambda x: x['score'], reverse=True)
+    wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
 
     today_str = datetime.datetime.now().strftime('%Y%m%d')
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
 
-    if not selected_stocks:
-        report = f"📅 【AI 今日 Top200 轉折起漲精選】({date_display})\n--------------------\n今日未有符合高分標準之標的。"
+    # 組成兩大策略分區的 LINE 報告格式
+    lines = [f"📊 【AI 精選雙策略雙軌選股報告】({date_display})", "===================="]
+
+    # 1. 顯示【🌱 底部轉折起漲區】
+    lines.append("🌱 【策略一：底部止跌 + 外資籌碼吞噬翻多】")
+    lines.append("💡 特性：空轉多拐點，低基期、獲利空間極大")
+    lines.append("--------------------")
+    if not bottom_turn_stocks:
+        lines.append("今日暫無符合條件之標的。")
     else:
-        lines = [f"🔥 【AI 精選：Top200 底部轉折 + 洗盤爆發股】({date_display})", "--------------------"]
-        for item in selected_stocks:
+        for item in bottom_turn_stocks:
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 得分: {item['score']}分 | {item['macd_status']} | {item['status_label']}"
+                f"   👉 得分:{item['score']}分 | {item['status_label']}"
             )
-        lines.append("--------------------")
-        lines.append("💡 策略說明：優先推薦經連日洗盤後，今日突破且外資暴買（>=1000張或前日3倍）之起漲標的。")
-        report = "\n".join(lines)
 
+    lines.append("\n====================")
+
+    # 2. 顯示【🔥 洗盤突破爆發區】
+    lines.append("🔥 【策略二：洗盤結束 + 外資暴買突破】")
+    lines.append("💡 特性：主力洗盤完成，短線發動拉升即戰力")
+    lines.append("--------------------")
+    if not wash_breakout_stocks:
+        lines.append("今日暫無符合條件之標的。")
+    else:
+        for item in wash_breakout_stocks:
+            lines.append(
+                f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
+                f"   👉 得分:{item['score']}分 | {item['status_label']}"
+            )
+
+    report = "\n".join(lines)
+
+    # 儲存與發送
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
