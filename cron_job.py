@@ -210,7 +210,7 @@ def fetch_finmind_data(stock_info):
                         elif is_red_shrinking_2days:
                             score += 15
                             tags.append("⚡2日洗盤突破")
-                        tags.append(f"🔥外資爆買{round(today_foreign)}張")
+                        tags.append(f"🔥外資暴買{round(today_foreign)}張")
 
                     # 位階加分 (1% ~ 4%)
                     if strategy_type and (1.0 <= pct_change <= 4.0):
@@ -292,13 +292,16 @@ def run_precalculation():
     if not bottom_turn_stocks:
         lines.append("今日暫無符合條件之標的。")
     else:
-        for item in bottom_turn_stocks:
+        for idx, item in enumerate(bottom_turn_stocks):
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
                 f"   👉 得分:{item['score']}分 | {item['status_label']}"
             )
+            # 💡 只有非最後一檔時才插入卡片分隔線
+            if idx < len(bottom_turn_stocks) - 1:
+                lines.append("┈┈┈┈┈┈┈┈┈┈")
 
-    lines.append("\n====================")
+    lines.append("\n====================\n")
 
     # 2. 🔥 洗盤突破爆發區
     lines.append("🔥 【策略二：洗盤結束 + 外資暴買突破】")
@@ -307,11 +310,14 @@ def run_precalculation():
     if not wash_breakout_stocks:
         lines.append("今日暫無符合條件之標的。")
     else:
-        for item in wash_breakout_stocks:
+        for idx, item in enumerate(wash_breakout_stocks):
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
                 f"   👉 得分:{item['score']}分 | {item['status_label']}"
             )
+            # 💡 只有非最後一檔時才插入卡片分隔線
+            if idx < len(wash_breakout_stocks) - 1:
+                lines.append("┈┈┈┈┈┈┈┈┈┈")
 
     report = "\n".join(lines)
 
