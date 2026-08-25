@@ -7,11 +7,10 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 🎯 這裡已幫你替換為最新的 Token！
+# 🎯 FinMind Token (寫死備援 + 環境變數優先)
 HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
 
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-# 優先使用環境變數，若無則自動帶入程式碼中的 Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -101,7 +100,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     try:
         res_p = http.get(price_url, timeout=8.0)
         
-        # ⚠️ 若 Token 依然報錯 (400/403)，自動切換至無 Token 免費模式
+        # ⚠️ 若 Token 驗證失敗 (400/403)，自動切換至無 Token 免費模式
         if res_p.status_code in [400, 403]:
             print(f"  └─ ⚠️ Token 驗證失敗 (HTTP {res_p.status_code})，自動切換至無 Token 免費模式...", flush=True)
             fallback_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
@@ -226,13 +225,14 @@ def run_precalculation():
     if not selected_stocks:
         report = f"📅 【AI 今日 Top200 轉折起漲精選】({date_display})\n--------------------\n今日 Top200 熱門股中，未有符合「MACD轉折/起漲 + 外資進場」之個股。"
     else:
-        lines = [f"🔥 【AI 精選：Top200 底部轉折 + 外資加碼股】({date_display})", "--------------------"]
+        lines = [f"🔥 【AI 精選：Top200 轉折起漲股】({date_display})", "════════════════════"]
         for item in selected_stocks:
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 {item['macd_status']} | {item['foreign_label']}: {item['foreign_shares']:+} 張"
+                f"   👉 {item['macd_status']}\n"
+                f"   👉 {item['foreign_label']}: {item['foreign_shares']:+} 張\n"
+                f"────────────────────"  # 👈 兩檔個股之間的分隔線
             )
-        lines.append("--------------------")
         lines.append("💡 篩選核心：Top200 成交量 + MACD綠柱縮短/剛轉紅柱 + 外資突破性買超。")
         report = "\n".join(lines)
 
@@ -241,7 +241,7 @@ def run_precalculation():
 
     push_line_message(report)
 
-    print("🎉 200 档選股、寫入 DB 與 LINE 推播皆順利完成！", flush=True)
+    print("🎉 200 檔選股、寫入 DB 與 LINE 推播皆順利完成！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
