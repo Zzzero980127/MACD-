@@ -137,7 +137,7 @@ def callback():
         abort(400)
     return 'OK', 200
 
-# 🎯 解決 404 的關鍵：讓 cron-job.org 呼叫此端點觸發 AI 排程選股 + 推播
+# 🎯 解決 cron-job.org 404 的觸發端點
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
     print("⏰ [Cron Endpoint] 收到排程觸發請求 /run-job！", flush=True)
