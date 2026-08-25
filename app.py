@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg2
 import re
+import threading  # 背景執行核心
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -17,7 +18,6 @@ FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 全域股票名稱與代號對照快取
 STOCK_MAP = {}
 
 def update_stock_map():
@@ -32,7 +32,7 @@ def update_stock_map():
                 name = item.get("Name", "").strip()
                 if len(code) == 4 and code.isdigit():
                     STOCK_MAP[code] = name
-                    STOCK_MAP[name] = code  # 支援雙向查詢
+                    STOCK_MAP[name] = code
             print(f"✅ 股票名稱對照表已自動更新，共載入 {len(STOCK_MAP)//2} 檔個股！")
     except Exception as e:
         print(f"⚠️ 更新股票名稱對照表失敗: {e}")
@@ -62,7 +62,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查：支援輸入『代號 (2330)』或『中文名稱 (台積電)』 """
+    """ 個股即時查：只用無密鑰（不帶 Token），節省 API 額度 """
     global STOCK_MAP
     if not STOCK_MAP:
         update_stock_map()
@@ -76,7 +76,8 @@ def query_single_stock(user_input):
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&token={FINMIND_TOKEN}"
+    # 🎯 完全不帶 token
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
@@ -130,16 +131,17 @@ def callback():
         abort(400)
     return 'OK', 200
 
-# 🎯 同時支援兩種路徑，解決 cron-job 網址找不到的問題！
+# 🎯 正確的背景觸發：接到請求立刻回傳 200，任務交給背景線程處理
 @app.route("/run-cron-job-secret", methods=['GET', 'POST'])
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
     try:
         from cron_job import run_precalculation
-        run_precalculation()
-        return "✅ 選股排程順利執行完成！", 200
+        thread = threading.Thread(target=run_precalculation)
+        thread.start()
+        return "OK", 200
     except Exception as e:
-        return f"❌ 執行選股排程失敗: {e}", 500
+        return f"❌ 觸發失敗: {e}", 500
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
