@@ -9,6 +9,9 @@ import psycopg2
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
+# -----------------------------------------------------------------------------
+# 1. 環境變數與設定
+# -----------------------------------------------------------------------------
 FINMIND_TOKEN = (
     os.environ.get('FINMIND_TOKEN', '').strip() or 
     os.environ.get('FINMIND_API_TOKEN', '').strip()
@@ -17,9 +20,16 @@ FINMIND_TOKEN = (
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
+# -----------------------------------------------------------------------------
+# 2. 建立連線 Session 與 API 重試機制
+# -----------------------------------------------------------------------------
 def create_robust_session():
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(
+        total=3, 
+        backoff_factor=1.0, 
+        status_forcelist=[429, 500, 502, 503, 504]
+    )
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -27,35 +37,63 @@ def create_robust_session():
 
 http = create_robust_session()
 
+# -----------------------------------------------------------------------------
+# 3. 資料庫連線與歷史寫入
+# -----------------------------------------------------------------------------
 def get_db_connection():
-    if not DATABASE_URL: return None
+    if not DATABASE_URL:
+        return None
     try:
         url = DATABASE_URL
         if "sslmode" not in url:
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
-    except Exception: return None
+    except Exception as e:
+        print(f"⚠️ [DB Log] 資料庫連線失敗: {e}", flush=True)
+        return None
 
 def save_to_db(report_text, date_str="LATEST"):
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        return
     try:
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS history (date VARCHAR(20) PRIMARY KEY, content TEXT NOT NULL);''')
-        cursor.execute('''INSERT INTO history (date, content) VALUES (%s, %s) ON CONFLICT (date) DO UPDATE SET content = EXCLUDED.content;''', (date_str, report_text))
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+                date VARCHAR(20) PRIMARY KEY, 
+                content TEXT NOT NULL
+            );
+        ''')
+        cursor.execute('''
+            INSERT INTO history (date, content) 
+            VALUES (%s, %s) 
+            ON CONFLICT (date) 
+            DO UPDATE SET content = EXCLUDED.content;
+        ''', (date_str, report_text))
         conn.commit()
         cursor.close()
         conn.close()
-    except Exception: pass
+    except Exception as e:
+        print(f"⚠️ [DB Log] 資料庫寫入失敗: {e}", flush=True)
 
+# -----------------------------------------------------------------------------
+# 4. LINE 廣播推播
+# -----------------------------------------------------------------------------
 def send_line_push(report_text):
-    if not LINE_CHANNEL_ACCESS_TOKEN: return
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("⚠️ [LINE Log] 未設定 LINE Channel Access Token，略過發送", flush=True)
+        return
     try:
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_bot_api.broadcast(TextSendMessage(text=report_text))
-    except Exception: pass
+        print("✅ [LINE Log] 廣播推播成功發送！", flush=True)
+    except Exception as e:
+        print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
+# -----------------------------------------------------------------------------
+# 5. 個股 K 線與籌碼分析核心 logic
+# -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
@@ -65,21 +103,27 @@ def fetch_finmind_data(stock_info):
     
     try:
         res_p = http.get(price_url, timeout=8.0)
-        if res_p.status_code != 200 or not res_p.json().get("data"): return None
+        if res_p.status_code != 200 or not res_p.json().get("data"):
+            return None
         
-        df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'})
+        df = pd.DataFrame(res_p.json()["data"]).rename(
+            columns={'close': 'Close', 'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'}
+        )
         for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+            
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
-        if len(df) < 35: return None
+        if len(df) < 35:
+            return None
 
-        # 計算 MACD 與均線
+        # --- 計算 MACD 技術指標 ---
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['OSC'] = df['DIF'] - df['MACD']
 
+        # --- 計算均線與布林通道 ---
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['Boll_Upper'] = df['MA20'] + (df['STD20'] * 2)
@@ -103,22 +147,32 @@ def fetch_finmind_data(stock_info):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 防追高與避雷針過濾
-        if pct_change > 6.0: return None
+        # --- 技術面防衛過濾 ---
+        # 1. 漲幅過高防追高
+        if pct_change > 6.0:
+            return None
+            
+        # 2. 上影線避雷針過濾
         upper_shadow = high_price - max(open_price, close_price)
         body_length = max(abs(close_price - open_price), 0.01)
-        if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015): return None
+        if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015):
+            return None
         
+        # 3. 乖離率與空頭格局過濾
         ma20_val = float(latest['MA20'])
-        if ma20_val > 0 and (close_price / ma20_val) > 1.20: return None
+        if ma20_val > 0:
+            if (close_price / ma20_val) > 1.20:
+                return None  # 高檔乖離過大
+            if (close_price / ma20_val) < 0.95:
+                return None  # 低於月線 5% 以上，屬於空頭弱勢格局，過濾如群創等標的
 
-        # 🎯 優化：布林通道邏輯（防誤殺盤整突破股）
+        # 4. 布林通道突破優化（帶量突破不排除，縮量過軌才排除）
         boll_upper = float(latest['Boll_Upper'])
-        is_volume_breakout = today_volume >= (vol_ma5 * 1.5) # 是否帶量突破
+        is_volume_breakout = today_volume >= (vol_ma5 * 1.5)
         if (close_price >= boll_upper * 0.985) and not is_volume_breakout:
-            return None  # 縮量碰上軌才過濾，帶量突破不排除
+            return None
 
-        # 🎯 嚴格 MACD 轉折判定（加入 0.001 精確度閥值）
+        # --- MACD 轉折狀態判定 ---
         is_green_shrinking = (osc_today < -0.001) and (osc_today > osc_p1)
         is_first_red = (osc_today > 0.001) and (osc_p1 <= 0.001)
         is_macd_expanding = (osc_today > 0.001) and (osc_today > osc_p1)
@@ -126,6 +180,7 @@ def fetch_finmind_data(stock_info):
         is_red_shrinking_2days = (osc_p1 > 0.001) and (osc_p2 > osc_p1)
         is_red_shrinking_3days = (osc_p1 > 0.001) and (osc_p3 > osc_p2 > osc_p1)
 
+        # --- 抓取籌碼面資料 ---
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
         chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
@@ -143,30 +198,45 @@ def fetch_finmind_data(stock_info):
                 daily_chip = daily_total.merge(foreign_df, on='date', how='left').merge(trust_df, on='date', how='left').fillna(0).sort_values('date')
                 
                 if len(daily_chip) >= 2:
-                    if str(daily_chip.iloc[-1]['date']) != str(latest['date']): return None
+                    if str(daily_chip.iloc[-1]['date']) != str(latest['date']):
+                        return None
 
                     today_total = float(daily_chip.iloc[-1]['total_net'])
+                    prev_total = float(daily_chip.iloc[-2]['total_net'])
                     today_foreign = float(daily_chip.iloc[-1]['foreign_net'])
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
-                    if today_trust <= -1000: return None # 投信大賣保護
+                    # 投信拋售保護
+                    if today_trust <= -1000:
+                        return None
+
+                    # 🛡️ 致命防線：吞噬比例安全閥
+                    # 昨日大賣 (<= -2000張)，今日買超必須達昨日賣超的 80% 以上，否則視為假反彈
+                    if (prev_total <= -2000) and (today_total < abs(prev_total) * 0.8):
+                        return None
+
                     is_chip_buy = (today_total >= 1000)
 
-                    # 🎯 優化：防範隔日沖機制（計算買超佔總成交量比例）
-                    # FinMind 成交量單位為股，需除以 1000 換算為張
+                    # 籌碼集中度計算（防範隔日沖高風險）
                     total_vol_shares = (today_volume / 1000) if today_volume > 0 else 1
                     chip_ratio = (today_total / total_vol_shares) if total_vol_shares > 0 else 0
-                    is_day_trading_risk = (chip_ratio >= 0.40) # 買超比率超標，具隔日沖風險
+                    is_day_trading_risk = (chip_ratio >= 0.40)
 
                     score = 0
                     strategy_type = None
                     tags = []
 
+                    # ---------------------------------------------------------
                     # 【策略一：底部止跌】
+                    # ---------------------------------------------------------
                     if (is_green_shrinking or is_first_red) and is_chip_buy:
                         strategy_type = "BOTTOM_TURN"
                         score = 70
-                        tags.append("💥綠轉紅第1天" if is_first_red else "📉綠柱止跌")
+                        
+                        if is_first_red:
+                            tags.append("💥綠轉紅第1天")
+                        else:
+                            tags.append("📉綠柱止跌")
                         
                         if is_day_trading_risk:
                             score += 10
@@ -182,10 +252,13 @@ def fetch_finmind_data(stock_info):
                             score += 10
                             tags.append(f"🔄法人合買({round(today_total)}張)")
 
+                    # ---------------------------------------------------------
                     # 【策略二：洗盤突破】
+                    # ---------------------------------------------------------
                     elif is_macd_expanding and is_chip_buy:
                         strategy_type = "WASH_BREAKOUT"
                         score = 65
+                        
                         if is_red_shrinking_3days:
                             score += 15
                             tags.append("⚡3日洗盤突破")
@@ -204,35 +277,51 @@ def fetch_finmind_data(stock_info):
                             score += 10
                             tags.append(f"🔥法人買超({round(today_total)}張)")
 
-                    # 附加技術面加分
+                    # ---------------------------------------------------------
+                    # 附加指標加分項
+                    # ---------------------------------------------------------
                     if strategy_type:
                         if is_volume_breakout and (close_price >= boll_upper * 0.985):
                             score += 10
                             tags.append("🚀帶量強勢突破")
+                            
                         if today_foreign > 0 and today_trust > 0:
                             score += 10
                             tags.append("🤝土洋同買")
+                            
                         if 1.0 <= pct_change <= 4.0:
                             score += 10
                             tags.append("🛡️黃金位階")
 
                         return {
-                            "code": stock_id, "name": stock_name, "close": close_price,
-                            "pct": pct_change, "score": score, "type": strategy_type,
+                            "code": stock_id,
+                            "name": stock_name,
+                            "close": close_price,
+                            "pct": pct_change,
+                            "score": score,
+                            "type": strategy_type,
                             "status_label": " ".join(tags)
                         }
     except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id} {stock_name}] 分析異常: {e}", flush=True)
+        print(f"  └─ ⚠️ [{stock_id} {stock_name}] 分析過程異常: {e}", flush=True)
+        
     return None
 
+# -----------------------------------------------------------------------------
+# 6. 主排程與掃描流程
+# -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
     print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
     
-    if not FINMIND_TOKEN: return
+    if not FINMIND_TOKEN:
+        print("❌ [Fatal Error] FINMIND_TOKEN 未設定，無法執行抓取！", flush=True)
+        return
 
+    # 從證交所取得交易量前 200 大個股
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
+    
     try:
         res = http.get(twse_url, timeout=10)
         if res.status_code == 200:
@@ -245,11 +334,12 @@ def run_precalculation():
                     try:
                         vol = int(item.get("TradeVolume", 0))
                         stocks.append({"code": code, "name": name, "volume": vol})
-                    except ValueError: continue
+                    except ValueError:
+                        continue
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！開始分析...", flush=True)
+            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股清單！開始逐一精準分析...", flush=True)
     except Exception as e:
         print(f"❌ [TWSE Log] 證交所 API 抓取失敗: {e}", flush=True)
         return
@@ -258,24 +348,32 @@ def run_precalculation():
     wash_breakout_stocks = []
     total_count = len(candidates)
 
+    # 執行掃描邏輯
     for idx, stock_info in enumerate(candidates, 1):
         print(f"📊 [{idx}/{total_count}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
+        
         if res:
             if res['type'] == 'BOTTOM_TURN':
                 bottom_turn_stocks.append(res)
             elif res['type'] == 'WASH_BREAKOUT':
                 wash_breakout_stocks.append(res)
-            print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 類型:{res['type']} 得分:{res['score']}", flush=True)
+            print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 類型: {res['type']} 得分: {res['score']}", flush=True)
+            
         time.sleep(0.5)
 
+    # 依分數排序
     bottom_turn_stocks.sort(key=lambda x: x['score'], reverse=True)
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
 
     today_str = datetime.datetime.now().strftime('%Y%m%d')
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
 
-    lines = [f"📊 【AI 精選雙策略雙軌選股報告】({date_display})", "===================="]
+    # 組合簡報格式
+    lines = [
+        f"📊 【AI 精選雙策略雙軌選股報告】({date_display})",
+        "===================="
+    ]
 
     lines.append("🌱 【策略一：底部止跌 + 法人合買翻多】")
     lines.append("💡 特性：空轉多拐點，低基期、獲利空間極大")
@@ -284,8 +382,12 @@ def run_precalculation():
         lines.append("今日暫無符合條件之標的。")
     else:
         for idx, item in enumerate(bottom_turn_stocks):
-            lines.append(f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n   👉 得分:{item['score']}分 | {item['status_label']}")
-            if idx < len(bottom_turn_stocks) - 1: lines.append("┈┈┈┈┈┈┈┈┈┈")
+            lines.append(
+                f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
+                f"   👉 得分:{item['score']}分 | {item['status_label']}"
+            )
+            if idx < len(bottom_turn_stocks) - 1:
+                lines.append("┈┈┈┈┈┈┈┈┈┈")
 
     lines.append("\n====================\n")
 
@@ -296,14 +398,24 @@ def run_precalculation():
         lines.append("今日暫無符合條件之標的。")
     else:
         for idx, item in enumerate(wash_breakout_stocks):
-            lines.append(f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n   👉 得分:{item['score']}分 | {item['status_label']}")
-            if idx < len(wash_breakout_stocks) - 1: lines.append("┈┈┈┈┈┈┈┈┈┈")
+            lines.append(
+                f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
+                f"   👉 得分:{item['score']}分 | {item['status_label']}"
+            )
+            if idx < len(wash_breakout_stocks) - 1:
+                lines.append("┈┈┈┈┈┈┈┈┈┈")
 
     report = "\n".join(lines)
+
+    # 儲存與發送推播
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
+    
     print("🎉 [Cron Job Log] 排程選股與 LINE 推播發送完畢！", flush=True)
 
+# -----------------------------------------------------------------------------
+# 7. 腳本進入點
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     run_precalculation()
