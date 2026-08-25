@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
 # -----------------------------------------------------------------------------
-# 2. Session 與 DB / LINE 工具
+# 2. 連線與工具函式
 # -----------------------------------------------------------------------------
 def create_robust_session():
     session = requests.Session()
@@ -77,12 +77,12 @@ def send_line_push(report_text):
     try:
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         line_bot_api.broadcast(TextSendMessage(text=report_text))
-        print("✅ [LINE Log] 推播發送成功！", flush=True)
+        print("✅ [LINE Log] LINE 推播成功發送！", flush=True)
     except Exception as e:
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 核心選股與加分機制
+# 3. 核心個股分析與詳細 Console 日誌
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info):
     stock_id = stock_info["code"]
@@ -94,6 +94,7 @@ def fetch_finmind_data(stock_info):
     try:
         res_p = http.get(price_url, timeout=8.0)
         if res_p.status_code != 200 or not res_p.json().get("data"):
+            print(f"  ❌ [{stock_id} {stock_name}] K線 API 讀取失敗或無資料", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -104,9 +105,10 @@ def fetch_finmind_data(stock_info):
             
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 30:
+            print(f"  ⚠️ [{stock_id} {stock_name}] K線資料不足 30 天", flush=True)
             return None
 
-        # --- 技術指標計算 ---
+        # --- 計算 MACD 指標 ---
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -114,7 +116,6 @@ def fetch_finmind_data(stock_info):
         df['OSC'] = df['DIF'] - df['MACD']
 
         df['MA5'] = df['Close'].rolling(window=5).mean()
-        df['MA10'] = df['Close'].rolling(window=10).mean()
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
 
@@ -132,35 +133,36 @@ def fetch_finmind_data(stock_info):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # =========================================================================
-        # 🎯 【唯一硬性篩選門檻】：MACD 空方力道下降 (今天 OSC > 昨天 OSC)
-        # =========================================================================
+        # ---------------------------------------------------------------------
+        # 🎯 核心門檻：MACD 空方力道下降 (今天 OSC > 昨天 OSC)
+        # ---------------------------------------------------------------------
         if osc_today <= osc_p1:
+            print(f"  🚫 [{stock_id} {stock_name}] 剔除: MACD 未見轉折 (今日OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
 
-        # 基本基礎過濾：避開極端跌停或高檔大洗盤噴出 (>9.5% 或 <-5%)
-        if pct_change > 9.5 or pct_change < -5.0:
+        # 極端值防範
+        if pct_change > 9.8 or pct_change < -7.0:
+            print(f"  🚫 [{stock_id} {stock_name}] 剔除: 漲跌幅過大 ({pct_change:.2f}%)", flush=True)
             return None
 
-        # =========================================================================
-        # 💯 【全加分演算法 (Scoring)】
-        # =========================================================================
-        score = 50  # 基礎分（只要滿足 MACD 空方力道下降就有 50 分）
+        # ---------------------------------------------------------------------
+        # 💯 計分與標籤系統
+        # ---------------------------------------------------------------------
+        score = 50
         tags = []
 
-        # 1. MACD 型態加分
-        is_first_red = (osc_today > 0) and (osc_p1 <= 0)
-        if is_first_red:
-            score += 10
+        # 1. MACD 狀態加分
+        if osc_today > 0 and osc_p1 <= 0:
+            score += 15
             tags.append("💥綠轉紅第1天")
         elif osc_today < 0:
-            score += 15
+            score += 10
             tags.append("📉綠柱止跌")
         else:
-            score += 0
+            score += 10
             tags.append("🔥紅柱延伸")
 
-        # 2. 均線位階加分
+        # 2. 均線加分
         ma5_today = float(latest['MA5'])
         ma20_today = float(latest['MA20'])
         if close_price >= ma20_today:
@@ -171,25 +173,30 @@ def fetch_finmind_data(stock_info):
             tags.append("⚡站上5日線")
 
         # 3. 量能加分
-        is_volume_breakout = (today_volume >= vol_ma5 * 1.3)
+        is_volume_breakout = (today_volume >= vol_ma5 * 1.2)
         if is_volume_breakout:
             score += 10
             tags.append("🚀帶量攻擊")
 
-        # 4. 抓取籌碼面加分 (外資/投信/法人)
-        time.sleep(0.5)
+        # 4. 籌碼面抓取與雙重容錯
+        time.sleep(0.4)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
         chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
         
         today_total = 0
+        today_foreign = 0
+        today_trust = 0
+
         res_c = http.get(chip_url, timeout=6.0)
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
-                df_c['net_buy'] = (df_c['buy'] - df_c['sell']) / 1000
+                df_c['net_buy'] = (pd.to_numeric(df_c['buy'], errors='coerce').fillna(0) - pd.to_numeric(df_c['sell'], errors='coerce').fillna(0)) / 1000
+                
+                # 相容 FinMind 多種命名格式
                 daily_total = df_c.groupby('date')['net_buy'].sum().reset_index(name='total_net')
-                foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False)].groupby('date')['net_buy'].sum().reset_index(name='foreign_net')
-                trust_df = df_c[df_c['name'].str.contains('Trust|投信', case=False)].groupby('date')['net_buy'].sum().reset_index(name='trust_net')
+                foreign_df = df_c[df_c['name'].astype(str).str.contains('Foreign|外資', case=False)].groupby('date')['net_buy'].sum().reset_index(name='foreign_net')
+                trust_df = df_c[df_c['name'].astype(str).str.contains('Trust|投信', case=False)].groupby('date')['net_buy'].sum().reset_index(name='trust_net')
                 
                 daily_chip = daily_total.merge(foreign_df, on='date', how='left').merge(trust_df, on='date', how='left').fillna(0).sort_values('date')
                 
@@ -199,12 +206,12 @@ def fetch_finmind_data(stock_info):
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
                     if today_total >= 10000:
-                        score += 20
+                        score += 25
                         tags.append(f"⚡萬張爆買({round(today_total)}張)")
                     elif today_total >= 3000:
                         score += 15
                         tags.append(f"🔥法人大買({round(today_total)}張)")
-                    elif today_total >= 1000:
+                    elif today_total >= 800:
                         score += 10
                         tags.append(f"🔄法人買超({round(today_total)}張)")
 
@@ -212,15 +219,18 @@ def fetch_finmind_data(stock_info):
                         score += 10
                         tags.append("🤝土洋同買")
 
-        # =========================================================================
-        # 🔍 【洗盤後起漲點 獨立判定（加分/標籤）】
-        # 判定條件：短線洗盤（前1~2天柱狀圖微幅回檔或小黑K），今日轉折發動漲幅 > 1% 且有量
-        # =========================================================================
+        # ---------------------------------------------------------------------
+        # 🔍 洗盤後起漲點 獨立判定
+        # ---------------------------------------------------------------------
         is_wash_breakout = False
-        if (osc_p1 < osc_p2 or float(prev1['Close']) < float(prev2['Close'])) and (pct_change >= 1.0) and is_volume_breakout:
+        # 條件：昨日或前日拉回洗盤 + 今日收紅發動(>0.5%) + 有量/法人買超
+        if (osc_p1 < osc_p2 or float(prev1['Close']) <= float(prev2['Close'])) and (pct_change >= 0.5) and (is_volume_breakout or today_total >= 1000):
             is_wash_breakout = True
             score += 15
             tags.append("⚡洗盤結束起漲")
+
+        # 輸出後台終端機詳細 Log
+        print(f"  ✅ [選中標的] {stock_id} {stock_name} | 收盤:{close_price} ({pct_change:+.2f}%) | 得分:{score} | 法人買超:{round(today_total)}張 | 洗盤突破:{is_wash_breakout}", flush=True)
 
         return {
             "code": stock_id,
@@ -232,22 +242,20 @@ def fetch_finmind_data(stock_info):
             "status_label": " ".join(tags)
         }
     except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id} {stock_name}] 異常: {e}", flush=True)
-        
-    return None
+        print(f"  ❌ [{stock_id} {stock_name}] 運算異常: {e}", flush=True)
+        return None
 
 # -----------------------------------------------------------------------------
-# 4. 主排程與輸出 (Top 5 + Top 5 控管)
+# 4. 主流程與 Top 5 + Top 5 輸出
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
-    print("🚀 [Cron Job] 開始執行 AI 排程選股...", flush=True)
+    print(f"🚀 [Cron Job Log] 開始執行排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
     
     if not FINMIND_TOKEN:
         print("❌ [Fatal Error] FINMIND_TOKEN 未設定！", flush=True)
         return
 
-    # 前 200 大成交量
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
     
@@ -268,36 +276,37 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-            print(f"✅ 取得 Top 200 熱門股，開始進行 MACD 轉折與籌碼掃描...", flush=True)
+            print(f"✅ [TWSE Log] 成功取得成交量前 200 大個股清單！開始進行逐一分析...", flush=True)
     except Exception as e:
-        print(f"❌ 證交所 API 抓取失敗: {e}", flush=True)
+        print(f"❌ [TWSE Log] 證交所 API 讀取失敗: {e}", flush=True)
         return
 
     all_passed_stocks = []
     wash_breakout_stocks = []
 
     for idx, stock_info in enumerate(candidates, 1):
+        print(f"📊 [{idx}/{len(candidates)}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
         if res:
             all_passed_stocks.append(res)
             if res['is_wash_breakout']:
                 wash_breakout_stocks.append(res)
-            print(f"  └─ 🎯 [選中] {res['code']} {res['name']} 得分: {res['score']}", flush=True)
             
         time.sleep(0.3)
 
-    # 排序
+    # 分別按得分高低排序
     all_passed_stocks.sort(key=lambda x: x['score'], reverse=True)
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
 
-    # 取前 5 名
+    # 兩邊各取前 5 名
     top_bottom_turn = all_passed_stocks[:5]
     top_wash_breakout = wash_breakout_stocks[:5]
+
+    print(f"📈 [Log 統計] 滿足 MACD 轉折標的共 {len(all_passed_stocks)} 檔，符合洗盤突破標的共 {len(wash_breakout_stocks)} 檔", flush=True)
 
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
     today_str = datetime.datetime.now().strftime('%Y%m%d')
 
-    # 組合訊息
     lines = [
         f"📊 【AI 精選雙策略雙軌選股報告】({date_display})",
         "===================="
@@ -339,7 +348,7 @@ def run_precalculation():
     save_to_db(report, today_str)
     send_line_push(report)
     
-    print("🎉 排程選股與 LINE 推播發送完畢！", flush=True)
+    print("🎉 [Cron Job Log] 排程選股與推播全數完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
