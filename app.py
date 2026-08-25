@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg2
 import re
+import threading  # 👈 引入執行緒模組
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -59,7 +60,6 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查詢：🔓 無密鑰 (不帶 Token) """
     global STOCK_MAP
     if not STOCK_MAP: update_stock_map()
 
@@ -71,8 +71,6 @@ def query_single_stock(user_input):
         stock_name = user_input
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
-
-    print(f"🔍 [Query Log] 個股即時查詢: [{user_input}] -> {stock_id} (🔓無密鑰模式)", flush=True)
 
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
     try:
@@ -137,17 +135,26 @@ def callback():
         abort(400)
     return 'OK', 200
 
-# 🎯 解決 cron-job.org 404 的觸發端點
-@app.route("/run-job", methods=['GET', 'POST'])
-def trigger_job():
-    print("⏰ [Cron Endpoint] 收到排程觸發請求 /run-job！", flush=True)
+# 🎯 後台非同步執行選股任務的包裝函數
+def background_job():
     try:
         from cron_job import run_precalculation
         run_precalculation()
-        return "✅ AI選股排程與LINE推播已順利完成！", 200
+        print("✅ [Background] 後台 AI 選股與推播順利完成！", flush=True)
     except Exception as e:
-        print(f"❌ [Cron Endpoint] 執行失敗: {e}", flush=True)
-        return f"❌ 執行選股排程失敗: {e}", 500
+        print(f"❌ [Background] 後台執行失敗: {e}", flush=True)
+
+# 🎯 解決逾時：秒回 200 OK，然後丟到背景默默計算
+@app.route("/run-job", methods=['GET', 'POST'])
+def trigger_job():
+    print("⏰ [Cron Endpoint] 收到觸發請求，立即響應並丟至後台執行...", flush=True)
+    
+    # 建立獨立執行緒在背景跑
+    thread = threading.Thread(target=background_job)
+    thread.start()
+    
+    # 馬上回傳 200 讓 cron-job.org 測試合格
+    return "✅ 任務已在後台啟動！", 200
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
