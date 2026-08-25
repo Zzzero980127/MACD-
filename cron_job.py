@@ -8,7 +8,7 @@ import datetime
 import psycopg2
 
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 確保此處或環境變數有填入真 Token
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 請確認你的 FinMind Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -64,7 +64,6 @@ def save_to_db(report_text, date_str="LATEST"):
         print(f"❌ 寫入資料庫失敗: {e}", flush=True)
 
 def push_line_message(report_text):
-    """ LINE 自動主動推播 """
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
         print("⚠️ 未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID，跳過主動推播。", flush=True)
         return
@@ -87,17 +86,21 @@ def push_line_message(report_text):
     except Exception as e:
         print(f"❌ 發送 LINE 推播發生異常: {e}", flush=True)
 
-def fetch_finmind_data(stock_info):
-    """ stock_info 為字典 {"code": "2330", "name": "台積電"} """
+def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
+    # 🎯 標註：排程選股使用【有 TOKEN】模式
+    token_status = "🔑 [有Token模式]" if len(FINMIND_TOKEN) > 20 else "⚠️ [Token失效/未帶]"
+    print(f"⌛ [{current_idx}/{total_count}] 分析中: {stock_id} {stock_name} | {token_status}", flush=True)
+
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
         res_p = http.get(price_url, timeout=8.0)
         if res_p.status_code != 200 or not res_p.json().get("data"):
+            print(f"  └─ ❌ K線抓取失敗 (HTTP {res_p.status_code})", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
@@ -106,7 +109,6 @@ def fetch_finmind_data(stock_info):
         
         if len(df) < 35: return None
 
-        # 計算 MACD
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -124,7 +126,6 @@ def fetch_finmind_data(stock_info):
         
         macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
 
-        # 外資籌碼驗證
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
         chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
@@ -150,6 +151,7 @@ def fetch_finmind_data(stock_info):
                         prev_close = float(df.iloc[-2]['Close'])
                         pct_change = ((close_price - prev_close) / prev_close) * 100
 
+                        print(f"  └─ 🟢 數據抓取成功！符合標的: [{stock_id} {stock_name}] {macd_status} | {status_label}", flush=True)
                         return {
                             "code": stock_id,
                             "name": stock_name,
@@ -160,7 +162,7 @@ def fetch_finmind_data(stock_info):
                             "macd_status": macd_status
                         }
     except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id} {stock_name}] 分析異常: {e}", flush=True)
+        print(f"  └─ ❌ 分析異常: {e}", flush=True)
 
     return None
 
@@ -193,13 +195,12 @@ def run_precalculation():
 
     print(f"🔍 第二階段：開始針對 Top 200 進行 MACD 轉折與籌碼驗證...", flush=True)
     selected_stocks = []
+    total_count = len(candidates)
     
     for i, stock_info in enumerate(candidates, 1):
-        res = fetch_finmind_data(stock_info)
+        res = fetch_finmind_data(stock_info, i, total_count)
         if res:
-            print(f"  └─ 🎯 符合標的: [{res['code']} {res['name']}] {res['macd_status']} | {res['foreign_label']}", flush=True)
             selected_stocks.append(res)
-        
         time.sleep(1.2)
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
