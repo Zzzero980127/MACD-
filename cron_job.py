@@ -10,13 +10,9 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 # -----------------------------------------------------------------------------
-# 1. 環境變數設定
+# 1. 環境變數設定 (精準對齊你的控制台 Key 名稱)
 # -----------------------------------------------------------------------------
-FINMIND_TOKEN = (
-    os.environ.get('FINMIND_API_TOKEN', '').strip() or 
-    os.environ.get('FINMIND_TOKEN', '').strip()
-)
-
+FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
@@ -29,6 +25,10 @@ def create_robust_session():
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    # 帶上標準瀏覽器標頭，防 TWSE/FinMind 阻擋 Python requests
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
     return session
 
 http = create_robust_session()
@@ -102,8 +102,13 @@ def fetch_finmind_data(stock_info):
     
     try:
         res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
+        
+        # Token 異常自動退回匿名請求
+        if res_p.status_code in [401, 403]:
+            res_p = http.get(price_url, params=params, timeout=8.0)
+
         if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  ❌ [{stock_id} {stock_name}] K線 API 請求失敗", flush=True)
+            print(f"  ❌ [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -144,7 +149,7 @@ def fetch_finmind_data(stock_info):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 通用初始門檻 (當日 OSC 必須轉向上升，且防追高/急跌)
+        # 通用初始門檻 (當日 OSC 轉折 + 防追高)
         if osc_today <= osc_p1:
             print(f"  🚫 [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
@@ -170,6 +175,9 @@ def fetch_finmind_data(stock_info):
         today_trust = 0
 
         res_c = http.get(price_url, params=chip_params, headers=headers, timeout=6.0)
+        if res_c.status_code in [401, 403]:
+            res_c = http.get(price_url, params=chip_params, timeout=6.0)
+
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
@@ -188,15 +196,15 @@ def fetch_finmind_data(stock_info):
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
         # ---------------------------------------------------------------------
-        # 🎯 策略二專屬：防死貓跳與嚴格洗盤判定
+        # 🎯 策略二專屬：防死貓跳與洗盤結束判定
         # ---------------------------------------------------------------------
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
         
-        # 籌碼防死貓跳邏輯
+        # 外資買超反轉量能判定 (防死貓跳)
         if prev_foreign > 0:
             foreign_surge_valid = (today_foreign >= prev_foreign * 3)
         else:
-            # 若前日為賣超，今日買超量必須完全補回（大於前日賣超絕對值）
+            # 若前日賣超，今日買超量必須大於前日賣超的絕對值
             foreign_surge_valid = (today_foreign > abs(prev_foreign))
 
         is_wash_breakout = (
@@ -212,7 +220,7 @@ def fetch_finmind_data(stock_info):
         score = 50
         tags = []
 
-        # MACD 狀態正確比對
+        # MACD 狀態精確比對
         if osc_today > 0 and osc_p1 <= 0:
             score += 15
             tags.append("💥綠轉紅第1天(金叉形成)")
@@ -273,6 +281,12 @@ def run_precalculation():
     print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
+    if FINMIND_TOKEN:
+        masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
+        print(f"🔑 [Token Check] 載入 FINMIND_API_TOKEN 成功 ({masked_token})", flush=True)
+    else:
+        print("⚠️ [Token Check] 未偵測到 FINMIND_API_TOKEN，將以匿名模式執行", flush=True)
+
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
     
@@ -294,6 +308,9 @@ def run_precalculation():
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
             print(f"✅ [TWSE Log] 成功取得成交量前 200 大個股清單！", flush=True)
+        else:
+            print(f"❌ [TWSE Log] 證交所 API 拒絕存取，HTTP Code: {res.status_code}", flush=True)
+            return
     except Exception as e:
         print(f"❌ [TWSE Log] 讀取失敗: {e}", flush=True)
         return
@@ -304,17 +321,15 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(0.2)
+        time.sleep(0.4)
 
     # -------------------------------------------------------------------------
-    # 🎯 雙策略分流與互斥篩選 (關鍵修復段)
+    # 🎯 雙策略分流與互斥篩選
     # -------------------------------------------------------------------------
-    # 1. 策略二池：專門收納洗盤起漲股
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
     top_wash_breakout = wash_breakout_stocks[:5]
 
-    # 2. 策略一池：排除「已被策略二選中」的標的，避免搶位子與重複顯示
     strategy_1_candidates = [s for s in all_passed_stocks if not s['is_wash_breakout']]
     strategy_1_candidates.sort(key=lambda x: x['score'], reverse=True)
     top_bottom_turn = strategy_1_candidates[:5]
