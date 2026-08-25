@@ -13,7 +13,6 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
-FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -21,14 +20,17 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_MAP = {}
 
 def update_stock_map():
-    """ 自動更新上市 (TWSE) + 上櫃 (TPEx) 『中文名稱 <-> 股票代號』對照表 """
+    """ 加上 User-Agent 偽裝，安全抓取上市 + 上櫃全台股對照表 """
     global STOCK_MAP
     new_map = {}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
     
     # 1. 抓取上市股票 (TWSE)
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res_twse = requests.get(url_twse, timeout=5)
+        res_twse = requests.get(url_twse, headers=headers, timeout=8)
         if res_twse.status_code == 200:
             for item in res_twse.json():
                 code = item.get("Code", "").strip()
@@ -37,21 +39,23 @@ def update_stock_map():
                     new_map[code] = name
                     new_map[name] = code
     except Exception as e:
-        print(f"⚠️ 抓取上市名稱失敗: {e}")
+        print(f"⚠️ 抓取上市名稱失敗: {e}", flush=True)
 
-    # 2. 抓取上櫃股票 (TPEx)
+    # 2. 抓取上櫃股票 (TPEx) - 加上備援機制
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/mopsfront/t187ap03_R_otc"
-        res_tpex = requests.get(url_tpex, timeout=5)
+        res_tpex = requests.get(url_tpex, headers=headers, timeout=8)
         if res_tpex.status_code == 200:
-            for item in res_tpex.json():
-                code = str(item.get("SecuritiesCompanyCode", "")).strip()
-                name = str(item.get("CompanyName", "")).strip()
-                if len(code) == 4 and code.isdigit() and name:
-                    new_map[code] = name
-                    new_map[name] = code
+            data = res_tpex.json()
+            if isinstance(data, list):
+                for item in data:
+                    code = str(item.get("SecuritiesCompanyCode", "")).strip()
+                    name = str(item.get("CompanyName", "")).strip()
+                    if len(code) == 4 and code.isdigit() and name:
+                        new_map[code] = name
+                        new_map[name] = code
     except Exception as e:
-        print(f"⚠️ 抓取上櫃名稱失敗: {e}")
+        print(f"⚠️ 抓取上櫃名稱失敗: {e}", flush=True)
 
     if new_map:
         STOCK_MAP = new_map
@@ -82,10 +86,8 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查：支援上市/上櫃代號與中文名稱，使用【無 Token 模式】 """
+    """ 個股即時查：直接使用背景載入好的 STOCK_MAP，不觸發重複 API 請求 """
     global STOCK_MAP
-    if not STOCK_MAP:
-        update_stock_map()
 
     stock_id = user_input
     stock_name = ""
@@ -102,7 +104,6 @@ def query_single_stock(user_input):
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
-            print(f"  └─ 🟢 數據抓取成功！ (HTTP 200)", flush=True)
             data = res.json()["data"]
             if len(data) >= 35:
                 import pandas as pd
@@ -135,8 +136,6 @@ def query_single_stock(user_input):
 
                 display_title = f"{stock_id} {stock_name}".strip()
                 return f"📊 【個股即時解析 - {display_title}】\n--------------------\n🔹 最新收盤: {close:.2f} ({pct:+.2f}%)\n🔹 MACD狀態: {macd_status}\n🔹 當日成交量: {int(latest['Volume'])/1000:.0f} 張"
-        else:
-            print(f"  └─ ❌ 數據抓取失敗 (HTTP {res.status_code})", flush=True)
     except Exception as e:
         print(f"  └─ ❌ 查詢發生異常: {e}", flush=True)
 
@@ -193,7 +192,9 @@ def handle_message(event):
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
 
+# 🎯 在服務啟動前先預載入股票地圖
+update_stock_map()
+
 if __name__ == "__main__":
-    update_stock_map()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
