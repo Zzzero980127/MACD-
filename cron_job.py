@@ -87,13 +87,12 @@ def send_line_push(report_text):
 # -----------------------------------------------------------------------------
 # 3. 核心個股分析 (僅使用 Token 呼叫 API)
 # -----------------------------------------------------------------------------
-def fetch_finmind_data(stock_info):
+def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
+    prefix = f"[{current_idx}/{total_count}]"
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    
-    # 嚴格帶上 Bearer Token Header
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
     price_url = "https://api.finmindtrade.com/api/v4/data"
@@ -107,7 +106,7 @@ def fetch_finmind_data(stock_info):
         res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
 
         if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  ❌ [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
+            print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -118,7 +117,7 @@ def fetch_finmind_data(stock_info):
             
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 35:
-            print(f"  ⚠️ [{stock_id} {stock_name}] K線資料不足 35 天", flush=True)
+            print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] K線資料不足 35 天", flush=True)
             return None
 
         # --- MACD 與均線計算 ---
@@ -137,6 +136,7 @@ def fetch_finmind_data(stock_info):
         prev2 = df.iloc[-3]
         prev3 = df.iloc[-4]
 
+        dif_today = float(latest['DIF'])
         osc_today = float(latest['OSC'])
         osc_p1 = float(prev1['OSC'])
         osc_p2 = float(prev2['OSC'])
@@ -150,11 +150,11 @@ def fetch_finmind_data(stock_info):
 
         # 通用初始門檻 (當日 OSC 轉折 + 防追高/急跌)
         if osc_today <= osc_p1:
-            print(f"  🚫 [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
+            print(f"  🚫 {prefix} [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
 
         if pct_change > 6.5 or pct_change < -5.0:
-            print(f"  🚫 [{stock_id} {stock_name}] 濾除: 防追高/急跌門檻 ({pct_change:+.2f}%)", flush=True)
+            print(f"  🚫 {prefix} [{stock_id} {stock_name}] 濾除: 防追高/急跌門檻 ({pct_change:+.2f}%)", flush=True)
             return None
 
         # ---------------------------------------------------------------------
@@ -193,9 +193,12 @@ def fetch_finmind_data(stock_info):
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
         # ---------------------------------------------------------------------
-        # 🎯 策略二專屬：防死貓跳與洗盤結束判定
-        # ---------------------------------------------------------------------
+        # 🎯 策略二專屬：防死貓跳與洗盤結束判定 (含條件一：0 軸防線)
+        # -----------------------------------------------------------------------------
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
+        
+        # 條件一（0 軸防線）：OSC 必須已經翻紅 (> 0) 或 DIF 站在 0 軸以上，防止空頭綠柱內的假反彈
+        is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
         
         # 外資買超反轉量能判定 (防死貓跳)
         if prev_foreign > 0:
@@ -205,6 +208,7 @@ def fetch_finmind_data(stock_info):
             foreign_surge_valid = (today_foreign > abs(prev_foreign))
 
         is_wash_breakout = (
+            is_above_zero_axis and 
             osc_3day_declining and 
             (osc_today > osc_p1) and 
             foreign_surge_valid and 
@@ -225,7 +229,7 @@ def fetch_finmind_data(stock_info):
             score += 20
             tags.append("📉綠柱止跌")
         elif osc_today > 0 and osc_p1 > 0:
-            tags.append("🔥紅柱延伸") # 不加分
+            tags.append("🔥紅柱延伸")
 
         if close_price >= float(latest['MA20']):
             score += 10
@@ -256,7 +260,7 @@ def fetch_finmind_data(stock_info):
             score += 20
             tags.append("⚡洗盤結束起漲")
 
-        print(f"  ✅ [{stock_id} {stock_name}] 得分:{score} | 洗盤起漲:{is_wash_breakout} | 外資今日:{round(today_foreign)}張 (前日:{round(prev_foreign)}張)", flush=True)
+        print(f"  ✅ {prefix} [{stock_id} {stock_name}] 得分:{score} | 洗盤起漲:{is_wash_breakout} | 外資今日:{round(today_foreign)}張 (前日:{round(prev_foreign)}張)", flush=True)
 
         return {
             "code": stock_id,
@@ -268,7 +272,7 @@ def fetch_finmind_data(stock_info):
             "status_label": " ".join(tags)
         }
     except Exception as e:
-        print(f"  ❌ [{stock_id} {stock_name}] 運算異常: {e}", flush=True)
+        print(f"  ❌ {prefix} [{stock_id} {stock_name}] 運算異常: {e}", flush=True)
         return None
 
 # -----------------------------------------------------------------------------
@@ -310,9 +314,10 @@ def run_precalculation():
         return
 
     all_passed_stocks = []
+    total_candidates = len(candidates)
 
     for idx, stock_info in enumerate(candidates, 1):
-        res = fetch_finmind_data(stock_info)
+        res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
         time.sleep(0.4)
