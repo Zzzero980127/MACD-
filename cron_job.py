@@ -7,7 +7,7 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 🎯 FinMind Token (環境變數優先)
+# 🎯 FinMind Token (環境變數優先，否則使用預設)
 HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
 
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
@@ -88,23 +88,25 @@ def push_line_message(report_text):
     except Exception as e:
         print(f"❌ 發送 LINE 推播發生異常: {e}", flush=True)
 
-def safe_get_finmind(url):
-    """ 專門處理 FinMind API，遇到 402 (限流) 自動等待重試，嚴格保持帶 Token 模式 """
+def safe_get_finmind(dataset, stock_id, start_date):
+    """ 100% 純 Token 請求，遇 402 等待重試 """
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset={dataset}&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    
     for attempt in range(3):
         try:
             res = http.get(url, timeout=8.0)
-            if res.status_code == 200:
+            if res.status_code == 200 and res.json().get("data"):
                 return res
             elif res.status_code == 402:
-                # 遇到 402 頻率限制，冷卻 4 秒後重試
-                print(f"  └─ ⏳ 觸發 FinMind 頻率限制(402)，冷卻 4 秒後自動重試 ({attempt+1}/3)...", flush=True)
-                time.sleep(4.0)
+                print(f"  └─ ⚠️ Token 額度超限或觸發頻率限制(HTTP 402)，冷卻 6 秒重試 ({attempt+1}/3)...", flush=True)
+                time.sleep(6.0)
             else:
-                print(f"  └─ ⚠️ API 異常狀態碼: HTTP {res.status_code}", flush=True)
+                print(f"  └─ ⚠️ API 異常 (HTTP {res.status_code})", flush=True)
                 break
         except Exception as e:
             print(f"  └─ ⚠️ 連線異常: {e}", flush=True)
             time.sleep(2.0)
+
     return None
 
 def fetch_finmind_data(stock_info, current_idx, total_count):
@@ -113,15 +115,14 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     
-    # 1. 抓取 K 線資料（全程強制帶 Token）
-    price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-    res_p = safe_get_finmind(price_url)
+    # 1. 抓取 K 線資料 (純 Token)
+    res_p = safe_get_finmind("TaiwanStockPrice", stock_id, start_date)
 
     if not res_p or not res_p.json().get("data"):
-        print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | ❌ K線抓取失敗", flush=True)
+        print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | ❌ [Token模式] K線抓取失敗", flush=True)
         return None
     
-    print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | 🟢 K線資料取得成功！", flush=True)
+    print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | 🔑 [Token模式] K線資料取得成功！", flush=True)
 
     df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
     df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
@@ -146,13 +147,12 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     
     macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
 
-    # 稍微緩衝，避免請求太密被 API 擋
-    time.sleep(1.2)
+    time.sleep(1.0)
+
     chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
     
-    # 2. 抓取外資籌碼（全程強制帶 Token）
-    chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
-    res_c = safe_get_finmind(chip_url)
+    # 2. 抓取外資籌碼 (純 Token)
+    res_c = safe_get_finmind("TaiwanStockInstitutionalInvestorsBuySell", stock_id, chip_start)
 
     if res_c and res_c.json().get("data"):
         df_c = pd.DataFrame(res_c.json()["data"])
@@ -222,7 +222,6 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, i, total_count)
         if res:
             selected_stocks.append(res)
-        # 每檔之間冷卻 1.2 秒，順暢分散頻率
         time.sleep(1.2)
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
