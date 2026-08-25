@@ -7,7 +7,7 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 🎯 FinMind Token (寫死備援 + 環境變數優先)
+# 🎯 FinMind Token (環境變數優先)
 HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
 
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
@@ -21,8 +21,8 @@ def create_robust_session():
     session = requests.Session()
     retries = Retry(
         total=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=1.5,
+        status_forcelist=[500, 502, 503, 504],
         raise_on_status=False
     )
     adapter = HTTPAdapter(max_retries=retries)
@@ -88,95 +88,102 @@ def push_line_message(report_text):
     except Exception as e:
         print(f"❌ 發送 LINE 推播發生異常: {e}", flush=True)
 
+def safe_get_finmind(url):
+    """ 專門處理 FinMind API，遇到 402 (限流) 自動等待重試，嚴格保持帶 Token 模式 """
+    for attempt in range(3):
+        try:
+            res = http.get(url, timeout=8.0)
+            if res.status_code == 200:
+                return res
+            elif res.status_code == 402:
+                # 遇到 402 頻率限制，冷卻 4 秒後重試
+                print(f"  └─ ⏳ 觸發 FinMind 頻率限制(402)，冷卻 4 秒後自動重試 ({attempt+1}/3)...", flush=True)
+                time.sleep(4.0)
+            else:
+                print(f"  └─ ⚠️ API 異常狀態碼: HTTP {res.status_code}", flush=True)
+                break
+        except Exception as e:
+            print(f"  └─ ⚠️ 連線異常: {e}", flush=True)
+            time.sleep(2.0)
+    return None
+
 def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
     
-    # 1. 優先嘗試帶 Token
+    # 1. 抓取 K 線資料（全程強制帶 Token）
     price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+    res_p = safe_get_finmind(price_url)
+
+    if not res_p or not res_p.json().get("data"):
+        print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | ❌ K線抓取失敗", flush=True)
+        return None
     
-    try:
-        res_p = http.get(price_url, timeout=8.0)
-        
-        # ⚠️ 若 Token 驗證失敗 (400/403)，自動切換至無 Token 免費模式
-        if res_p.status_code in [400, 403]:
-            print(f"  └─ ⚠️ Token 驗證失敗 (HTTP {res_p.status_code})，自動切換至無 Token 免費模式...", flush=True)
-            fallback_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
-            res_p = http.get(fallback_url, timeout=8.0)
+    print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | 🟢 K線資料取得成功！", flush=True)
 
-        if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | ❌ K線抓取失敗 (HTTP {res_p.status_code})", flush=True)
-            return None
-        
-        print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | 🟢 K線資料取得成功！", flush=True)
+    df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+    df = df.dropna(subset=['Close'])
+    
+    if len(df) < 35: return None
 
-        df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df = df.dropna(subset=['Close'])
-        
-        if len(df) < 35: return None
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = exp1 - exp2
+    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['OSC'] = df['DIF'] - df['MACD']
 
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['DIF'] = exp1 - exp2
-        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['OSC'] = df['DIF'] - df['MACD']
+    osc_today = float(df.iloc[-1]['OSC'])
+    osc_prev = float(df.iloc[-2]['OSC'])
 
-        osc_today = float(df.iloc[-1]['OSC'])
-        osc_prev = float(df.iloc[-2]['OSC'])
+    is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
+    is_first_red = (osc_today > 0) and (osc_prev <= 0)
 
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
-        is_first_red = (osc_today > 0) and (osc_prev <= 0)
+    if not (is_green_shrinking or is_first_red):
+        return None
+    
+    macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
 
-        if not (is_green_shrinking or is_first_red):
-            return None
-        
-        macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
+    # 稍微緩衝，避免請求太密被 API 擋
+    time.sleep(1.2)
+    chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
+    
+    # 2. 抓取外資籌碼（全程強制帶 Token）
+    chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
+    res_c = safe_get_finmind(chip_url)
 
-        time.sleep(1.0)
-        chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-        
-        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
-        res_c = http.get(chip_url, timeout=8.0)
-        
-        if res_c.status_code in [400, 403]:
-            chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}"
-            res_c = http.get(chip_url, timeout=8.0)
-
-        if res_c.status_code == 200 and res_c.json().get("data"):
-            df_c = pd.DataFrame(res_c.json()["data"])
-            foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
-            if not foreign_df.empty:
-                foreign_df['net_buy'] = (foreign_df['buy'] - foreign_df['sell']) / 1000
-                daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
+    if res_c and res_c.json().get("data"):
+        df_c = pd.DataFrame(res_c.json()["data"])
+        foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
+        if not foreign_df.empty:
+            foreign_df['net_buy'] = (foreign_df['buy'] - foreign_df['sell']) / 1000
+            daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
+            
+            if len(daily_summary) >= 2:
+                today_foreign = float(daily_summary.iloc[-1]['net_buy'])
+                prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                 
-                if len(daily_summary) >= 2:
-                    today_foreign = float(daily_summary.iloc[-1]['net_buy'])
-                    prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
-                    
-                    is_turn_to_buy = (today_foreign > 50) and (prev_foreign <= 50)
-                    is_continuous_buy = (today_foreign > 200) and (prev_foreign > 200)
+                is_turn_to_buy = (today_foreign > 50) and (prev_foreign <= 50)
+                is_continuous_buy = (today_foreign > 200) and (prev_foreign > 200)
 
-                    if is_turn_to_buy or is_continuous_buy:
-                        status_label = "🔄 外資由賣轉買" if is_turn_to_buy else "🔥 外資連買加碼"
-                        close_price = float(df.iloc[-1]['Close'])
-                        prev_close = float(df.iloc[-2]['Close'])
-                        pct_change = ((close_price - prev_close) / prev_close) * 100
+                if is_turn_to_buy or is_continuous_buy:
+                    status_label = "🔄 外資由賣轉買" if is_turn_to_buy else "🔥 外資連買加碼"
+                    close_price = float(df.iloc[-1]['Close'])
+                    prev_close = float(df.iloc[-2]['Close'])
+                    pct_change = ((close_price - prev_close) / prev_close) * 100
 
-                        print(f"  └─ 🎯 符合標的: [{stock_id} {stock_name}] {macd_status} | {status_label}", flush=True)
-                        return {
-                            "code": stock_id,
-                            "name": stock_name,
-                            "close": close_price,
-                            "pct": pct_change,
-                            "foreign_shares": round(today_foreign),
-                            "foreign_label": status_label,
-                            "macd_status": macd_status
-                        }
-    except Exception as e:
-        print(f"  └─ ❌ 分析異常: {e}", flush=True)
+                    print(f"  └─ 🎯 符合標的: [{stock_id} {stock_name}] {macd_status} | {status_label}", flush=True)
+                    return {
+                        "code": stock_id,
+                        "name": stock_name,
+                        "close": close_price,
+                        "pct": pct_change,
+                        "foreign_shares": round(today_foreign),
+                        "foreign_label": status_label,
+                        "macd_status": macd_status
+                    }
 
     return None
 
@@ -215,6 +222,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, i, total_count)
         if res:
             selected_stocks.append(res)
+        # 每檔之間冷卻 1.2 秒，順暢分散頻率
         time.sleep(1.2)
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
@@ -231,7 +239,7 @@ def run_precalculation():
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
                 f"   👉 {item['macd_status']}\n"
                 f"   👉 {item['foreign_label']}: {item['foreign_shares']:+} 張\n"
-                f"────────────────────"  # 👈 兩檔個股之間的分隔線
+                f"────────────────────"
             )
         lines.append("💡 篩選核心：Top200 成交量 + MACD綠柱縮短/剛轉紅柱 + 外資突破性買超。")
         report = "\n".join(lines)
