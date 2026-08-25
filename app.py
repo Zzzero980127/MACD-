@@ -2,7 +2,9 @@ import os
 import requests
 import psycopg2
 import re
-import threading  # 引入執行緒模組以實現背景處理
+import datetime
+import threading
+import pandas as pd
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -10,7 +12,9 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 讀取環境變數
+# -----------------------------------------------------------------------------
+# 1. 讀取環境變數與 LINE 設定
+# -----------------------------------------------------------------------------
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -63,6 +67,9 @@ def get_report_by_date(date_key="LATEST"):
     except Exception as e:
         return f"❌ 讀取報告失敗: {e}"
 
+# -----------------------------------------------------------------------------
+# 2. 查詢單檔股票 (公開無 Token 請求，消耗 300次/小時 配額，避免占用 Token)
+# -----------------------------------------------------------------------------
 def query_single_stock(user_input):
     """查詢單檔股票的即時 MACD 動能狀態"""
     global STOCK_MAP
@@ -77,13 +84,15 @@ def query_single_stock(user_input):
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+
     try:
+        # 注意：此處故意完全不帶 headers 或 token 參數，走免費公開配額
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
             data = res.json()["data"]
-            if len(data) >= 35:
-                import pandas as pd
+            if len(data) >= 30:
                 df = pd.DataFrame(data).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
                 df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
                 df = df.dropna(subset=['Close'])
@@ -126,6 +135,9 @@ def query_single_stock(user_input):
         
     return f"⚠️ 無法取得個股 [{user_input}] 的數據，請確認名稱或代號是否正確。"
 
+# -----------------------------------------------------------------------------
+# 3. Flask 路由與事件處理
+# -----------------------------------------------------------------------------
 @app.route("/", methods=['GET'])
 def home():
     return "OK - LINE Bot Running!", 200
