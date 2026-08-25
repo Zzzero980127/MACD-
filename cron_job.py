@@ -7,13 +7,8 @@ import pandas as pd
 import datetime
 import psycopg2
 
-# 讀取環境變數中的 Token，請確保在 Render Environment 填入新申請的 Token
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-
-# 備援 Token (若 Render 沒讀到環境變數時使用)
-# ⚠️ 請把下方引號內的文字，替換成你在 FinMind 官網「新刷新」的完整 Token
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
-
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 確保此處或環境變數有填入真 Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
@@ -31,33 +26,6 @@ def create_robust_session():
     return session
 
 http = create_robust_session()
-
-def get_top_100_volume_stocks():
-    """ 從證交所 (TWSE) 官方 OpenAPI 動態抓取『全市場當日成交量前 100 名』 """
-    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    print("🔍 正在從臺灣證券交易所抓取今日成交量前 100 名個股...", flush=True)
-    try:
-        res = http.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            stocks = []
-            for item in data:
-                code = item.get("Code", "").strip()
-                if len(code) == 4 and code.isdigit():
-                    try:
-                        trade_volume = int(item.get("TradeVolume", 0))
-                        stocks.append({"code": code, "volume": trade_volume})
-                    except ValueError:
-                        continue
-            
-            df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
-            top_100 = df_stocks.head(100)["code"].tolist()
-            print("✅ 成功獲取今日成交量前 100 名個股！", flush=True)
-            return top_100
-    except Exception as e:
-        print(f"❌ 抓取證交所全市場數據失敗: {e}", flush=True)
-    
-    return []
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -92,46 +60,55 @@ def save_to_db(report_text, date_str="LATEST"):
     except Exception as e:
         print(f"❌ 寫入資料庫失敗: {e}", flush=True)
 
-def fetch_stock_price_with_retry(stock_id):
-    """ 抓取日 K 價量數據 """
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
+def fetch_finmind_data(stock_info):
+    """ stock_info 為字典 {"code": "2330", "name": "台積電"} """
+    stock_id = stock_info["code"]
+    stock_name = stock_info["name"]
+    
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
-        res = http.get(url, timeout=8.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-            df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-            df = df.dropna(subset=['Close'])
-            if len(df) >= 35: 
-                print(f"  └─ 🟢 [{stock_id}] 成功取得日 K 數據 ({len(df)}筆)", flush=True)
-                return df
-        else:
-            try:
-                err_msg = res.json().get("msg", res.text[:50])
-            except Exception:
-                err_msg = res.text[:50]
-            print(f"  └─ ⚠️ [{stock_id}] 價量 API 異常 (Code: {res.status_code}, Msg: {err_msg})", flush=True)
-    except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id}] 價量 API 失敗: {e}", flush=True)
+        res_p = http.get(price_url, timeout=8.0)
+        if res_p.status_code != 200 or not res_p.json().get("data"):
+            return None
+        
+        df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
+        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        df = df.dropna(subset=['Close'])
+        
+        if len(df) < 35: return None
 
-    return None
+        # 計算 MACD
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = exp1 - exp2
+        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['OSC'] = df['DIF'] - df['MACD']
 
-def fetch_foreign_investor_with_retry(stock_id):
-    """ 抓取外資籌碼數據 """
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
-    
-    try:
-        res = http.get(url, timeout=8.0)
-        if res.status_code == 200 and res.json().get("data"):
-            df = pd.DataFrame(res.json()["data"])
-            foreign_df = df[df['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
+        osc_today = float(df.iloc[-1]['OSC'])
+        osc_prev = float(df.iloc[-2]['OSC'])
+
+        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
+        is_first_red = (osc_today > 0) and (osc_prev <= 0)
+
+        if not (is_green_shrinking or is_first_red):
+            return None
+        
+        macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
+
+        # 外資籌碼驗證
+        time.sleep(0.8)
+        chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
+        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
+        
+        res_c = http.get(chip_url, timeout=8.0)
+        if res_c.status_code == 200 and res_c.json().get("data"):
+            df_c = pd.DataFrame(res_c.json()["data"])
+            foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
             if not foreign_df.empty:
                 foreign_df['net_buy'] = (foreign_df['buy'] - foreign_df['sell']) / 1000
-                daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index()
-                daily_summary = daily_summary.sort_values('date')
+                daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
                 
                 if len(daily_summary) >= 2:
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
@@ -142,76 +119,61 @@ def fetch_foreign_investor_with_retry(stock_id):
 
                     if is_turn_to_buy or is_continuous_buy:
                         status_label = "🔄 外資由賣轉買" if is_turn_to_buy else "🔥 外資連買加碼"
-                        print(f"  └─ 🔥 [{stock_id}] 發現外資籌碼訊號: {status_label} ({round(today_foreign)}張)", flush=True)
-                        return True, round(today_foreign), status_label
-                    else:
-                        return False, round(today_foreign), ""
+                        close_price = float(df.iloc[-1]['Close'])
+                        prev_close = float(df.iloc[-2]['Close'])
+                        pct_change = ((close_price - prev_close) / prev_close) * 100
+
+                        return {
+                            "code": stock_id,
+                            "name": stock_name,
+                            "close": close_price,
+                            "pct": pct_change,
+                            "foreign_shares": round(today_foreign),
+                            "foreign_label": status_label,
+                            "macd_status": macd_status
+                        }
     except Exception as e:
-        print(f"  └─ ⚠️ [{stock_id}] 外資 API 失敗: {e}", flush=True)
+        print(f"  └─ ⚠️ [{stock_id} {stock_name}] 分析異常: {e}", flush=True)
 
-    return False, 0, ""
-
-def analyze_single_stock(stock_id):
-    df = fetch_stock_price_with_retry(stock_id)
-    if df is None: return None
-
-    df['MA5'] = df['Close'].rolling(5).mean()
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA60'] = df['Close'].rolling(min(60, len(df))).mean()
-    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
-    
-    df['STD20'] = df['Close'].rolling(20).std(ddof=0)
-    df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
-
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = exp1 - exp2
-    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['OSC'] = df['DIF'] - df['MACD']
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    close = float(latest['Close'])
-    ma20, ma60 = float(latest['MA20']), float(latest['MA60'])
-    vol_today, vol_ma5 = float(latest['Volume']), float(latest['Vol_MA5'])
-    osc_today = float(latest['OSC'])
-    bb_upper = float(latest['BB_Upper'])
-
-    is_bull_trend = (close > ma20) and (ma20 >= ma60)
-    is_macd_good = (osc_today > 0)
-    is_vol_surge = (vol_today >= vol_ma5 * 1.1)
-    not_overheated = (close < bb_upper * 0.99)
-
-    if is_bull_trend and is_macd_good and is_vol_surge and not_overheated:
-        time.sleep(2.0)
-        has_foreign_signal, foreign_shares, foreign_label = fetch_foreign_investor_with_retry(stock_id)
-        
-        if has_foreign_signal:
-            pct_change = ((close - float(prev['Close'])) / float(prev['Close'])) * 100
-            return {
-                "code": stock_id,
-                "close": close,
-                "pct": pct_change,
-                "foreign_shares": foreign_shares,
-                "foreign_label": foreign_label
-            }
     return None
 
 def run_precalculation():
-    token_preview = FINMIND_TOKEN[:10] + "..." if len(FINMIND_TOKEN) > 10 else "無"
-    print(f"🚀 開始選股任務！(Token 帶入中: {token_preview})", flush=True)
+    print("🚀 開始 200 檔安全選股任務 (含中文名稱對照)...", flush=True)
     
-    target_stocks = get_top_100_volume_stocks()
+    twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    candidates = []
+    try:
+        res = http.get(twse_url, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            stocks = []
+            for item in data:
+                code = item.get("Code", "").strip()
+                name = item.get("Name", "").strip()
+                if len(code) == 4 and code.isdigit():
+                    try:
+                        vol = int(item.get("TradeVolume", 0))
+                        stocks.append({"code": code, "name": name, "volume": vol})
+                    except ValueError: continue
+            
+            df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
+            top_200 = df_stocks.head(200).to_dict('records') # 包含 code 與 name 的字典串列
+            print(f"✅ 第一階段完成，鎖定 Top 200 個股及其中文名稱！", flush=True)
+            candidates = top_200
+    except Exception as e:
+        print(f"❌ 證交所 API 抓取失敗: {e}", flush=True)
+        return
+
+    print(f"🔍 第二階段：開始針對 Top 200 進行深度驗證...", flush=True)
     selected_stocks = []
     
-    for i, stock_id in enumerate(target_stocks, 1):
-        print(f"[{i}/{len(target_stocks)}] 正在分析個股 {stock_id}...", flush=True)
-        res = analyze_single_stock(stock_id)
+    for i, stock_info in enumerate(candidates, 1):
+        res = fetch_finmind_data(stock_info)
         if res:
+            print(f"  └─ 🎯 符合標的: [{res['code']} {res['name']}] {res['macd_status']} | {res['foreign_label']}", flush=True)
             selected_stocks.append(res)
         
-        time.sleep(10.0)
+        time.sleep(1.2)
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
 
@@ -219,21 +181,21 @@ def run_precalculation():
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
 
     if not selected_stocks:
-        report = f"📅 【AI 今日熱門股外資轉買精選】({date_display})\n--------------------\n今日成交量前100熱門股中，未有符合「多頭技術面 + 外資由賣轉買」之個股，建議多看少做。"
+        report = f"📅 【AI 今日 Top200 轉折起漲精選】({date_display})\n--------------------\n今日 Top200 熱門股中，未有符合「MACD轉折/起漲 + 外資進場」之個股。"
     else:
-        lines = [f"🔥 【AI 精選：成交量爆量 + 外資轉買股】({date_display})", "--------------------"]
+        lines = [f"🔥 【AI 精選：Top200 底部轉折 + 外資加碼股】({date_display})", "--------------------"]
         for item in selected_stocks:
             lines.append(
-                f"🔹 {item['code']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 {item['foreign_label']}: {item['foreign_shares']:+} 張"
+                f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
+                f"   👉 {item['macd_status']} | {item['foreign_label']}: {item['foreign_shares']:+} 張"
             )
         lines.append("--------------------")
-        lines.append("💡 篩選核心：當日成交量 Top100 + 站穩月線 + MACD紅柱 + 外資突破性買超。")
+        lines.append("💡 篩選核心：Top200 成交量 + MACD綠柱縮短/剛轉紅柱 + 外資突破性買超。")
         report = "\n".join(lines)
 
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
-    print("🎉 動態成交量選股運算完畢並已成功寫入 DB！", flush=True)
+    print("🎉 200 檔轉折選股分析完畢，已成功帶中文名稱寫入 DB！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
