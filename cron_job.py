@@ -135,7 +135,7 @@ def fetch_finmind_data(stock_info):
         is_red_shrinking_3days = (osc_p1 > 0) and (osc_p3 > osc_p2 > osc_p1)
 
         if is_green_shrinking:
-            score += 30
+            score += 50
             macd_status = "📉綠柱縮短"
         elif is_first_red:
             score += 20
@@ -162,7 +162,7 @@ def fetch_finmind_data(stock_info):
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
-                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張)
+                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張，嚴格防試單)
                     is_foreign_turn_buy_surge = (prev_foreign <= 0) and (today_foreign >= 1000)
                     is_foreign_3x_surge = (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 1000)
                     is_foreign_surge = is_foreign_turn_buy_surge or is_foreign_3x_surge
@@ -178,7 +178,7 @@ def fetch_finmind_data(stock_info):
                         score += 40
                         tags.append("⚡2日洗盤突破+外資爆買")
                     elif is_macd_expanding and is_foreign_surge:
-                        score += 30
+                        score += 10
                         tags.append("⚡紅柱擴大+外資爆買")
 
                     if 1.0 <= pct_change <= 4.0:
@@ -228,18 +228,22 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
-            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！", flush=True)
+            print(f"✅ [TWSE Log] 成功取得 Top 200 熱門個股！開始逐一分析...", flush=True)
     except Exception as e:
         print(f"❌ [TWSE Log] 證交所 API 抓取失敗: {e}", flush=True)
         return
 
     selected_stocks = []
-    for stock_info in candidates:
+    total_count = len(candidates)
+    
+    # 💡 逐檔分析並即時顯示進度
+    for idx, stock_info in enumerate(candidates, 1):
+        print(f"📊 [{idx}/{total_count}] 分析中: {stock_info['code']} {stock_info['name']}", flush=True)
         res = fetch_finmind_data(stock_info)
         if res:
             print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 得分:{res['score']} | {res['macd_status']} | {res['status_label']}", flush=True)
             selected_stocks.append(res)
-        time.sleep(1.2)
+        time.sleep(0.5)
 
     selected_stocks.sort(key=lambda x: x['score'], reverse=True)
 
