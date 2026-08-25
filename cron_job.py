@@ -7,8 +7,11 @@ import pandas as pd
 import datetime
 import psycopg2
 
+# 🎯 這裡已幫你替換為最新的 Token！
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E"
+
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 請確認你的 FinMind Token
+# 優先使用環境變數，若無則自動帶入程式碼中的 Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -90,19 +93,26 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
-    # 🎯 標註：排程選股使用【有 TOKEN】模式
-    token_status = "🔑 [有Token模式]" if len(FINMIND_TOKEN) > 20 else "⚠️ [Token失效/未帶]"
-    print(f"⌛ [{current_idx}/{total_count}] 分析中: {stock_id} {stock_name} | {token_status}", flush=True)
-
     start_date = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    
+    # 1. 優先嘗試帶 Token
     price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}&token={FINMIND_TOKEN}"
     
     try:
         res_p = http.get(price_url, timeout=8.0)
+        
+        # ⚠️ 若 Token 依然報錯 (400/403)，自動切換至無 Token 免費模式
+        if res_p.status_code in [400, 403]:
+            print(f"  └─ ⚠️ Token 驗證失敗 (HTTP {res_p.status_code})，自動切換至無 Token 免費模式...", flush=True)
+            fallback_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start_date}"
+            res_p = http.get(fallback_url, timeout=8.0)
+
         if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  └─ ❌ K線抓取失敗 (HTTP {res_p.status_code})", flush=True)
+            print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | ❌ K線抓取失敗 (HTTP {res_p.status_code})", flush=True)
             return None
         
+        print(f"⌛ [{current_idx}/{total_count}] {stock_id} {stock_name} | 🟢 K線資料取得成功！", flush=True)
+
         df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
         df = df.dropna(subset=['Close'])
@@ -126,11 +136,16 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         
         macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
 
-        time.sleep(0.8)
+        time.sleep(1.0)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
-        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
         
+        chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
         res_c = http.get(chip_url, timeout=8.0)
+        
+        if res_c.status_code in [400, 403]:
+            chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}"
+            res_c = http.get(chip_url, timeout=8.0)
+
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             foreign_df = df_c[df_c['name'].str.contains('Foreign|外資', case=False, na=False)].copy()
@@ -151,7 +166,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
                         prev_close = float(df.iloc[-2]['Close'])
                         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-                        print(f"  └─ 🟢 數據抓取成功！符合標的: [{stock_id} {stock_name}] {macd_status} | {status_label}", flush=True)
+                        print(f"  └─ 🎯 符合標的: [{stock_id} {stock_name}] {macd_status} | {status_label}", flush=True)
                         return {
                             "code": stock_id,
                             "name": stock_name,
@@ -226,7 +241,7 @@ def run_precalculation():
 
     push_line_message(report)
 
-    print("🎉 200 檔選股、寫入 DB 與 LINE 推播皆順利完成！", flush=True)
+    print("🎉 200 档選股、寫入 DB 與 LINE 推播皆順利完成！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
