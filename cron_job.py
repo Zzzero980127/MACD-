@@ -9,12 +9,13 @@ import psycopg2
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
-# 🔐 100% 安全：完全從環境變數讀取，不留任何硬編碼 Token
+# 🔐 強制讀取環境變數 (自動去除前後空白)
 FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
 def create_robust_session():
+    """建立帶有自動重試機制的 HTTP Session，提升 API 連線穩定度"""
     session = requests.Session()
     retries = Retry(
         total=3, backoff_factor=1.0,
@@ -28,6 +29,7 @@ def create_robust_session():
 http = create_robust_session()
 
 def get_db_connection():
+    """建立 PostgreSQL 資料庫連線"""
     if not DATABASE_URL: return None
     try:
         url = DATABASE_URL
@@ -38,6 +40,7 @@ def get_db_connection():
     except Exception: return None
 
 def save_to_db(report_text, date_str="LATEST"):
+    """將產生的選股報告存入資料庫歷史紀錄"""
     conn = get_db_connection()
     if not conn:
         print("❌ [DB Log] 資料庫未連線，無法存入報告！", flush=True)
@@ -61,19 +64,19 @@ def save_to_db(report_text, date_str="LATEST"):
         print(f"❌ [DB Log] 寫入資料庫失敗: {e}", flush=True)
 
 def send_line_push(report_text):
-    """ 📢 自動發送 LINE 訊息給所有加好友的使用者 """
+    """將選股結果主動推播至 LINE"""
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("⚠️ [LINE Log] 未設定 LINE_CHANNEL_ACCESS_TOKEN，跳過主動推播！", flush=True)
         return
     try:
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-        # 使用廣播功能推播給所有追蹤者
         line_bot_api.broadcast(TextSendMessage(text=report_text))
         print("📣 [LINE Log] 已成功將選股結果推播至 LINE！", flush=True)
     except Exception as e:
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 def fetch_finmind_data(stock_info):
+    """分析單檔股票的 MACD 與籌碼條件並進行評分"""
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
@@ -90,38 +93,54 @@ def fetch_finmind_data(stock_info):
         df = df.dropna(subset=['Close'])
         if len(df) < 35: return None
 
+        # 計算 MACD 技術指標
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['OSC'] = df['DIF'] - df['MACD']
 
-        osc_today = float(df.iloc[-1]['OSC'])
-        osc_prev = float(df.iloc[-2]['OSC'])
-        close_price = float(df.iloc[-1]['Close'])
-        prev_close = float(df.iloc[-2]['Close'])
+        # 抓取近 4 天的 MACD 柱狀體 (OSC)
+        latest = df.iloc[-1]
+        prev1 = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        prev3 = df.iloc[-4]
+
+        osc_today = float(latest['OSC'])
+        osc_p1 = float(prev1['OSC'])
+        osc_p2 = float(prev2['OSC'])
+        osc_p3 = float(prev3['OSC'])
+
+        close_price = float(latest['Close'])
+        prev_close = float(prev1['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        if pct_change > 6.0: return None # 🛡️ 防追高：漲超過 6% 直接不考慮
+        # 過濾當天漲幅過高 (> 6%) 的股票，避免追高
+        if pct_change > 6.0: return None
 
         score = 0
         tags = []
 
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
-        is_first_red = (osc_today > 0) and (osc_prev <= 0)
-        is_macd_expanding = (osc_today > 0) and (osc_today > osc_prev)
+        # --- MACD 狀態判定 ---
+        is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1)
+        is_first_red = (osc_today > 0) and (osc_p1 <= 0)
+        is_macd_expanding = (osc_today > 0) and (osc_today > osc_p1)
+
+        # 🎯 洗盤判定：前幾天紅柱「連續遞減」
+        is_red_shrinking_2days = (osc_p1 > 0) and (osc_p2 > osc_p1)
+        is_red_shrinking_3days = (osc_p1 > 0) and (osc_p3 > osc_p2 > osc_p1)
 
         if is_green_shrinking:
-            score += 20
+            score += 30
             macd_status = "📉綠柱縮短"
         elif is_first_red:
-            score += 25
+            score += 20
             macd_status = "💥紅柱第1天"
         elif is_macd_expanding:
-            score += 15
+            score += 0   # 🎯 純紅柱擴大不給基礎分
             macd_status = "🔥紅柱擴大"
         else:
-            return None
+            return None  # 綠柱擴大或紅柱縮短直接排除
 
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
@@ -139,18 +158,37 @@ def fetch_finmind_data(stock_info):
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
+                    # 🎯 【外資爆量/轉買核心判定】(門檻提升至 1000 張，嚴格防試單)
+                    # 情境 A: 外資前日賣超(或<=0)，今日直接轉大買 >= 1000 張
+                    is_foreign_turn_buy_surge = (prev_foreign <= 0) and (today_foreign >= 1000)
+                    
+                    # 情境 B: 外資前日買超(>0)，今日買超張數為前日的 3 倍以上，且至少 >= 1000 張
+                    is_foreign_3x_surge = (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 1000)
+
+                    # 只要符合 A 或 B 其中一種外資爆發情境
+                    is_foreign_surge = is_foreign_turn_buy_surge or is_foreign_3x_surge
+
+                    # 基礎籌碼標籤
                     if today_foreign > 50 and prev_foreign <= 50:
-                        score += 20
                         tags.append("🔄外資轉買")
-                    elif today_foreign > 200 and prev_foreign > 200:
-                        score += 25
-                        tags.append("🔥外資連買")
 
-                    # ⚡ 裕民加分邏輯：外資買超比昨日暴增 3 倍
-                    if (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 500) and is_macd_expanding:
-                        score += 35
-                        tags.append("⚡外資爆買3倍")
+                    # 🎯 【組合條件大額加分】
+                    # 1. 3日洗盤遞減 + 今日紅柱突破 + 外資爆量(轉買千張或3倍)
+                    if is_macd_expanding and is_red_shrinking_3days and is_foreign_surge:
+                        score += 45
+                        tags.append("⚡3日洗盤突破+外資爆買")
 
+                    # 2. 2日洗盤遞減 + 今日紅柱突破 + 外資爆量(轉買千張或3倍)
+                    elif is_macd_expanding and is_red_shrinking_2days and is_foreign_surge:
+                        score += 40
+                        tags.append("⚡2日洗盤突破+外資爆買")
+
+                    # 3. 一般紅柱擴大 + 外資爆量(轉買千張或3倍)
+                    elif is_macd_expanding and is_foreign_surge:
+                        score += 30
+                        tags.append("⚡紅柱擴大+外資爆買")
+
+                    # 漲幅黃金位階 (1% ~ 4%)
                     if 1.0 <= pct_change <= 4.0:
                         score += 15
                         tags.append("🛡️黃金位階")
@@ -167,12 +205,17 @@ def fetch_finmind_data(stock_info):
     return None
 
 def run_precalculation():
+    """主執行函式：抓取 Top 200 個股進行篩選與推播"""
     print("==================================================", flush=True)
     print("🚀 [Cron Job] 開始執行 AI 排程選股與自動推播...", flush=True)
-    if FINMIND_TOKEN and len(FINMIND_TOKEN) > 20:
-        print(f"🔑 [Token Log] 成功由環境變數載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
+    
+    if not FINMIND_TOKEN:
+        print("❌ [Token Error] 未檢測到 FINMIND_TOKEN 環境變數！程式中止！", flush=True)
+        print("==================================================", flush=True)
+        return
     else:
-        print("⚠️ [Token Log] 未檢測到有效 Token，將以無密鑰模式運行！", flush=True)
+        print(f"🔑 [Token Log] 成功載入 FinMind Token (前5碼: {FINMIND_TOKEN[:5]}...)", flush=True)
+        
     print("==================================================", flush=True)
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -221,14 +264,12 @@ def run_precalculation():
                 f"   👉 得分: {item['score']}分 | {item['macd_status']} | {item['status_label']}"
             )
         lines.append("--------------------")
-        lines.append("💡 策略說明：採用評分架構，優先推薦兼具「外資急煞暴買、洗盤再起漲」之標的。")
+        lines.append("💡 策略說明：優先推薦經連日洗盤後，今日突破且外資暴買（>=1000張或前日3倍）之起漲標的。")
         report = "\n".join(lines)
 
-    # 1. 儲存資料庫
+    # 寫入資料庫並發送推播
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
-
-    # 2. 📢 執行 LINE 主動推播！
     send_line_push(report)
 
     print("🎉 [Cron Job Log] 排程選股與 LINE 推播發送完畢！", flush=True)
