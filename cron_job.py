@@ -65,6 +65,7 @@ def save_to_db(report_text, date_str="LATEST"):
         conn.commit()
         cursor.close()
         conn.close()
+        print(f"💾 [DB Log] 報告成功寫入資料庫 (Key: {date_str})", flush=True)
     except Exception as e:
         print(f"⚠️ [DB Log] 資料庫寫入失敗: {e}", flush=True)
 
@@ -102,6 +103,7 @@ def fetch_finmind_data(stock_info):
     try:
         res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
         if res_p.status_code != 200 or not res_p.json().get("data"):
+            print(f"  ❌ [{stock_id} {stock_name}] K線 API 請求失敗", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -112,6 +114,7 @@ def fetch_finmind_data(stock_info):
             
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 35:
+            print(f"  ⚠️ [{stock_id} {stock_name}] K線資料不足 35 天", flush=True)
             return None
 
         # --- MACD 與均線計算 ---
@@ -141,10 +144,13 @@ def fetch_finmind_data(stock_info):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # ---------------------------------------------------------------------
-        # 🎯 通用初始門檻 (第一關：擋掉過熱 > 6.5% 與巨幅下跌 < -5%)
-        # ---------------------------------------------------------------------
-        if osc_today <= osc_p1 or pct_change > 6.5 or pct_change < -5.0:
+        # 通用初始門檻 (當日 OSC 必須轉向上升，且防追高/急跌)
+        if osc_today <= osc_p1:
+            print(f"  🚫 [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
+            return None
+
+        if pct_change > 6.5 or pct_change < -5.0:
+            print(f"  🚫 [{stock_id} {stock_name}] 濾除: 防追高/急跌門檻 ({pct_change:+.2f}%)", flush=True)
             return None
 
         # ---------------------------------------------------------------------
@@ -182,41 +188,39 @@ def fetch_finmind_data(stock_info):
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
         # ---------------------------------------------------------------------
-        # 🎯 策略二專屬：【洗盤結束起漲點】獨立嚴格條件判定
-        # A. 前 3 日 OSC 連續下降 (osc_p3 > osc_p2 > osc_p1)
-        # B. 今日 OSC 轉向上升 (osc_today > osc_p1)
-        # C. 今日外資買超 >= 前一日 3 倍
-        # D. 當日漲幅控制在 +1.0% ~ +5.5% (確保是「剛發動起漲」)
+        # 🎯 策略二專屬：防死貓跳與嚴格洗盤判定
         # ---------------------------------------------------------------------
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
         
+        # 籌碼防死貓跳邏輯
         if prev_foreign > 0:
-            foreign_3x_surge = (today_foreign >= prev_foreign * 3)
+            foreign_surge_valid = (today_foreign >= prev_foreign * 3)
         else:
-            foreign_3x_surge = (today_foreign > 500)
+            # 若前日為賣超，今日買超量必須完全補回（大於前日賣超絕對值）
+            foreign_surge_valid = (today_foreign > abs(prev_foreign))
 
         is_wash_breakout = (
             osc_3day_declining and 
             (osc_today > osc_p1) and 
-            foreign_3x_surge and 
+            foreign_surge_valid and 
             (1.0 <= pct_change <= 5.5)
         )
 
         # ---------------------------------------------------------------------
-        # 計分與標籤
+        # 4. 基礎計分與 Tag 標記
         # ---------------------------------------------------------------------
         score = 50
         tags = []
 
+        # MACD 狀態正確比對
         if osc_today > 0 and osc_p1 <= 0:
             score += 15
-            tags.append("💥綠轉紅第1天")
-        elif osc_today < 0:
-            score += 10
+            tags.append("💥綠轉紅第1天(金叉形成)")
+        elif osc_today < 0 and osc_p1 < 0:
+            score += 20
             tags.append("📉綠柱止跌")
-        else:
-            score += 10
-            tags.append("🔥紅柱延伸")
+        elif osc_today > 0 and osc_p1 > 0:
+            tags.append("🔥紅柱延伸") # 不加分
 
         if close_price >= float(latest['MA20']):
             score += 10
@@ -247,6 +251,8 @@ def fetch_finmind_data(stock_info):
             score += 20
             tags.append("⚡洗盤結束起漲")
 
+        print(f"  ✅ [{stock_id} {stock_name}] 得分:{score} | 洗盤起漲:{is_wash_breakout} | 外資今日:{round(today_foreign)}張 (前日:{round(prev_foreign)}張)", flush=True)
+
         return {
             "code": stock_id,
             "name": stock_name,
@@ -261,11 +267,12 @@ def fetch_finmind_data(stock_info):
         return None
 
 # -----------------------------------------------------------------------------
-# 4. 主流程
+# 4. 主流程 (策略池互斥分流)
 # -----------------------------------------------------------------------------
 def run_precalculation():
+    print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
-    
+
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
     
@@ -286,27 +293,33 @@ def run_precalculation():
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
             candidates = df_stocks.head(200).to_dict('records')
+            print(f"✅ [TWSE Log] 成功取得成交量前 200 大個股清單！", flush=True)
     except Exception as e:
         print(f"❌ [TWSE Log] 讀取失敗: {e}", flush=True)
         return
 
     all_passed_stocks = []
-    wash_breakout_stocks = []
 
     for idx, stock_info in enumerate(candidates, 1):
         res = fetch_finmind_data(stock_info)
         if res:
             all_passed_stocks.append(res)
-            if res['is_wash_breakout']:
-                wash_breakout_stocks.append(res)
-            
         time.sleep(0.2)
 
-    all_passed_stocks.sort(key=lambda x: x['score'], reverse=True)
+    # -------------------------------------------------------------------------
+    # 🎯 雙策略分流與互斥篩選 (關鍵修復段)
+    # -------------------------------------------------------------------------
+    # 1. 策略二池：專門收納洗盤起漲股
+    wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
-
-    top_bottom_turn = all_passed_stocks[:5]
     top_wash_breakout = wash_breakout_stocks[:5]
+
+    # 2. 策略一池：排除「已被策略二選中」的標的，避免搶位子與重複顯示
+    strategy_1_candidates = [s for s in all_passed_stocks if not s['is_wash_breakout']]
+    strategy_1_candidates.sort(key=lambda x: x['score'], reverse=True)
+    top_bottom_turn = strategy_1_candidates[:5]
+
+    print(f"📈 [Log 統計] 策略一可選標的: {len(strategy_1_candidates)} 檔 | 策略二洗盤起漲標的: {len(wash_breakout_stocks)} 檔", flush=True)
 
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
     today_str = datetime.datetime.now().strftime('%Y%m%d')
@@ -317,7 +330,7 @@ def run_precalculation():
     ]
 
     lines.append("🌱 【策略一：底部止跌 + 法人合買翻多】")
-    lines.append("💡 特性：空轉多拐點，低基期、獲利空間極大")
+    lines.append("💡 特性：空轉多拐點，低基期、獲利空間極大 (已排除策略二標的)")
     lines.append("--------------------")
     if not top_bottom_turn:
         lines.append("今日暫無符合條件之標的。")
@@ -332,8 +345,8 @@ def run_precalculation():
 
     lines.append("\n====================\n")
 
-    lines.append("🔥 【策略二：洗盤結束 + 外資3倍暴買突破】")
-    lines.append("💡 特性：OSC連3跌後翻紅 + 外資買超擴大3倍以上 (當日漲幅<5.5%)")
+    lines.append("🔥 【策略二：洗盤結束 + 外資3倍/反轉暴買突破】")
+    lines.append("💡 特性：OSC連3跌後翻紅 + 外資買超大於前日賣超/3倍買超 (當日漲幅<5.5%)")
     lines.append("--------------------")
     if not top_wash_breakout:
         lines.append("今日暫無符合條件之標的。")
