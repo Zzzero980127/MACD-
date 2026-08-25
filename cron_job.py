@@ -7,10 +7,14 @@ import pandas as pd
 import datetime
 import psycopg2
 
+# 讀取環境變數
 ENV_TOKEN = os.environ.get('FINMIND_TOKEN', '').strip()
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoic2t5bGdkc0BnbWFpbC5jb20iLCJlbWFpbCI6InNreWxnZHNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6Mn0.QZb8bF7wtOVTB4GKr0gjm90pBagTHU4J7DMMLRNPu0E" # ⚠️ 確保此處或環境變數有填入真 Token
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..." # ⚠️ 請確認此處或環境變數有你正確的 FinMind Token
 FINMIND_TOKEN = ENV_TOKEN if len(ENV_TOKEN) > 20 else HARDCODED_TOKEN
+
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip() # 你的 LINE 推播 User ID
 
 def create_robust_session():
     session = requests.Session()
@@ -60,8 +64,32 @@ def save_to_db(report_text, date_str="LATEST"):
     except Exception as e:
         print(f"❌ 寫入資料庫失敗: {e}", flush=True)
 
+def push_line_message(report_text):
+    """ LINE 自動主動推播 """
+    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
+        print("⚠️ 未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID，跳過主動推播。", flush=True)
+        return
+    
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [{"type": "text", "text": report_text}]
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        if res.status_code == 200:
+            print("✅ 成功發送 LINE 主動推播訊息！", flush=True)
+        else:
+            print(f"❌ LINE 推播失敗 ({res.status_code}): {res.text}", flush=True)
+    except Exception as e:
+        print(f"❌ 發送 LINE 推播發生異常: {e}", flush=True)
+
 def fetch_finmind_data(stock_info):
-    """ stock_info 為字典 {"code": "2330", "name": "台積電"} """
+    """ 對個股進行 MACD 轉折與籌碼分析 """
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     
@@ -79,7 +107,7 @@ def fetch_finmind_data(stock_info):
         
         if len(df) < 35: return None
 
-        # 計算 MACD
+        # 🎯 MACD 轉折核心邏輯
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -89,15 +117,15 @@ def fetch_finmind_data(stock_info):
         osc_today = float(df.iloc[-1]['OSC'])
         osc_prev = float(df.iloc[-2]['OSC'])
 
-        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev)
-        is_first_red = (osc_today > 0) and (osc_prev <= 0)
+        is_green_shrinking = (osc_today < 0) and (osc_today > osc_prev) # 綠柱縮短（空方衰退）
+        is_first_red = (osc_today > 0) and (osc_prev <= 0)            # 紅柱第 1 天（剛起漲）
 
         if not (is_green_shrinking or is_first_red):
             return None
         
         macd_status = "📉 綠柱縮短(空退)" if is_green_shrinking else "💥 紅柱第1天(起漲)"
 
-        # 外資籌碼驗證
+        # 籌碼驗證
         time.sleep(0.8)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=12)).strftime("%Y-%m-%d")
         chip_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={chip_start}&token={FINMIND_TOKEN}"
@@ -138,7 +166,7 @@ def fetch_finmind_data(stock_info):
     return None
 
 def run_precalculation():
-    print("🚀 開始 200 檔安全選股任務 (含中文名稱對照)...", flush=True)
+    print("🚀 開始 Top 200 選股與自動推播任務...", flush=True)
     
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
@@ -157,14 +185,14 @@ def run_precalculation():
                     except ValueError: continue
             
             df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
-            top_200 = df_stocks.head(200).to_dict('records') # 包含 code 與 name 的字典串列
-            print(f"✅ 第一階段完成，鎖定 Top 200 個股及其中文名稱！", flush=True)
+            top_200 = df_stocks.head(200).to_dict('records') # 抓取前 200 名
+            print(f"✅ 第一階段完成，鎖定 Top 200 成交量個股！", flush=True)
             candidates = top_200
     except Exception as e:
         print(f"❌ 證交所 API 抓取失敗: {e}", flush=True)
         return
 
-    print(f"🔍 第二階段：開始針對 Top 200 進行深度驗證...", flush=True)
+    print(f"🔍 第二階段：開始針對 Top 200 進行 MACD 轉折與籌碼驗證...", flush=True)
     selected_stocks = []
     
     for i, stock_info in enumerate(candidates, 1):
@@ -173,7 +201,7 @@ def run_precalculation():
             print(f"  └─ 🎯 符合標的: [{res['code']} {res['name']}] {res['macd_status']} | {res['foreign_label']}", flush=True)
             selected_stocks.append(res)
         
-        time.sleep(1.2)
+        time.sleep(1.2) # 1.2 秒安全間隔
 
     selected_stocks.sort(key=lambda x: x['foreign_shares'], reverse=True)
 
@@ -193,9 +221,14 @@ def run_precalculation():
         lines.append("💡 篩選核心：Top200 成交量 + MACD綠柱縮短/剛轉紅柱 + 外資突破性買超。")
         report = "\n".join(lines)
 
+    # 1. 寫入資料庫歷史紀錄
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
-    print("🎉 200 檔轉折選股分析完畢，已成功帶中文名稱寫入 DB！", flush=True)
+
+    # 2. 執行自動 LINE 推播
+    push_line_message(report)
+
+    print("🎉 200 檔選股、寫入 DB 與 LINE 推播皆順利完成！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
