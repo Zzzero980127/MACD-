@@ -94,7 +94,8 @@ def fetch_finmind_data(stock_info):
         
         df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df = df.dropna(subset=['Close'])
+        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+        df = df.dropna(subset=['Close', 'Volume'])
         if len(df) < 35: return None
 
         # 計算 MACD 技術指標
@@ -104,7 +105,13 @@ def fetch_finmind_data(stock_info):
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['OSC'] = df['DIF'] - df['MACD']
 
-        # 抓取近 4 天的 MACD 柱狀體 (OSC)
+        # 計算布林通道 (20日 MA ± 2倍標準差)
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['STD20'] = df['Close'].rolling(window=20).std()
+        df['Boll_Upper'] = df['MA20'] + (df['STD20'] * 2)
+        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
+
+        # 抓取技術指標最新數據
         latest = df.iloc[-1]
         prev1 = df.iloc[-2]
         prev2 = df.iloc[-3]
@@ -119,15 +126,23 @@ def fetch_finmind_data(stock_info):
         prev_close = float(prev1['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 過濾當天漲幅過高 (> 6%) 的股票，避免追高
+        # 🛡️ 條件過濾：漲幅過高 (> 6%) 避免追高
         if pct_change > 6.0: return None
+
+        # 🛡️ 防追高機制 1：價頂布林上軌且無量衝高 (收盤 > 上軌*0.985 且 當日量 < 5日均量)
+        boll_upper = float(latest['Boll_Upper'])
+        vol_today = float(latest['Volume'])
+        vol_ma5 = float(latest['Vol_MA5'])
+        
+        if (close_price >= boll_upper * 0.985) and (vol_today < vol_ma5):
+            return None  # 高檔無量過頂，極易拉回，直接排除
 
         # MACD 型態定義
         is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1) # 📉 綠柱縮短（止跌）
         is_first_red = (osc_today > 0) and (osc_p1 <= 0)              # 💥 綠轉紅第1天
         is_macd_expanding = (osc_today > 0) and (osc_today > osc_p1) # 🔥 紅柱擴大
 
-        # 洗盤判定
+        # 洗盤型態判定
         is_red_shrinking_2days = (osc_p1 > 0) and (osc_p2 > osc_p1)
         is_red_shrinking_3days = (osc_p1 > 0) and (osc_p3 > osc_p2 > osc_p1)
 
@@ -144,17 +159,20 @@ def fetch_finmind_data(stock_info):
                 daily_summary = foreign_df.groupby('date')['net_buy'].sum().reset_index().sort_values('date')
                 
                 if len(daily_summary) >= 2:
-                    # 🛡️ 日期安全校驗：確認 API 最後一筆數據是否包含最新的價格日期
+                    # 🛡️ 日期安全校驗：確認 API 最後一筆數據包含最新價格交易日
                     last_chip_date = str(daily_summary.iloc[-1]['date'])
                     last_price_date = str(latest['date'])
                     
-                    # 若籌碼資料尚未更新至今日最新價格交易日，跳過避免拿舊數據誤判
                     if last_chip_date != last_price_date:
-                        return None
+                        return None # API 籌碼未更新完畢，跳過防舊資料誤判
 
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
+                    # 🛡️ 防追高機制 2：外資連買後力道明顯衰退 (昨日買超 > 3000張，今日買超減少 > 15%)
+                    if (prev_foreign >= 3000) and (today_foreign < prev_foreign * 0.85):
+                        return None # 外資高檔買盤力道收縮，排除
+
                     # 🎯 條件 1：籌碼強勢吞噬 (昨日大賣 <= -2000張，今日買超補回 80% 以上)
                     is_heavy_sell_yesterday = (prev_foreign <= -2000)
                     is_strong_rebound_cover = is_heavy_sell_yesterday and (today_foreign >= abs(prev_foreign) * 0.8)
@@ -173,7 +191,7 @@ def fetch_finmind_data(stock_info):
                     if (is_green_shrinking or is_first_red):
                         if is_strong_rebound_cover:
                             strategy_type = "BOTTOM_TURN"
-                            score = 90  # 強勢吞噬昨日賣壓，給予最高分
+                            score = 90
                             tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
                             tags.append(f"⚡籌碼強勢吞噬({round(today_foreign)}張)")
                         elif is_normal_turn_buy:
@@ -258,17 +276,16 @@ def run_precalculation():
             print(f"  └─ 🎯 [選中標的] [{res['code']} {res['name']}] 類型:{res['type']} 得分:{res['score']}", flush=True)
         time.sleep(0.5)
 
-    # 排序
+    # 依得分高低進行排序
     bottom_turn_stocks.sort(key=lambda x: x['score'], reverse=True)
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
 
     today_str = datetime.datetime.now().strftime('%Y%m%d')
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
 
-    # 組成兩大策略分區的 LINE 報告格式
     lines = [f"📊 【AI 精選雙策略雙軌選股報告】({date_display})", "===================="]
 
-    # 1. 顯示【🌱 底部轉折起漲區】
+    # 1. 🌱 底部轉折起漲區
     lines.append("🌱 【策略一：底部止跌 + 外資籌碼吞噬翻多】")
     lines.append("💡 特性：空轉多拐點，低基期、獲利空間極大")
     lines.append("--------------------")
@@ -283,7 +300,7 @@ def run_precalculation():
 
     lines.append("\n====================")
 
-    # 2. 顯示【🔥 洗盤突破爆發區】
+    # 2. 🔥 洗盤突破爆發區
     lines.append("🔥 【策略二：洗盤結束 + 外資暴買突破】")
     lines.append("💡 特性：主力洗盤完成，短線發動拉升即戰力")
     lines.append("--------------------")
@@ -298,7 +315,7 @@ def run_precalculation():
 
     report = "\n".join(lines)
 
-    # 儲存與發送
+    # 儲存與發送推播
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
