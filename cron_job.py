@@ -92,10 +92,13 @@ def fetch_finmind_data(stock_info):
         if res_p.status_code != 200 or not res_p.json().get("data"):
             return None
         
-        df = pd.DataFrame(res_p.json()["data"]).rename(columns={'close': 'Close', 'Trading_Volume': 'Volume'})
-        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-        df = df.dropna(subset=['Close', 'Volume'])
+        df = pd.DataFrame(res_p.json()["data"]).rename(columns={
+            'close': 'Close', 'Trading_Volume': 'Volume', 
+            'max': 'High', 'min': 'Low', 'open': 'Open'
+        })
+        for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 35: return None
 
         # 計算 MACD 技術指標
@@ -105,7 +108,7 @@ def fetch_finmind_data(stock_info):
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['OSC'] = df['DIF'] - df['MACD']
 
-        # 計算布林通道 (20日 MA ± 2倍標準差)
+        # 計算布林通道與 20 MA 均線
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['STD20'] = df['Close'].rolling(window=20).std()
         df['Boll_Upper'] = df['MA20'] + (df['STD20'] * 2)
@@ -123,19 +126,33 @@ def fetch_finmind_data(stock_info):
         osc_p3 = float(prev3['OSC'])
 
         close_price = float(latest['Close'])
+        open_price = float(latest['Open'])
+        high_price = float(latest['High'])
+        low_price = float(latest['Low'])
         prev_close = float(prev1['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 🛡️ 條件過濾：漲幅過高 (> 6%) 避免追高
+        # 🛡️ 條件過濾 1：單日漲幅過高 (> 6%) 避免追高
         if pct_change > 6.0: return None
 
-        # 🛡️ 防追高機制 1：價頂布林上軌且無量衝高 (收盤 > 上軌*0.985 且 當日量 < 5日均量)
+        # 🛡️ 條件過濾 2：防萬海型態——長上影線（高檔避雷針）
+        upper_shadow = high_price - max(open_price, close_price)
+        body_length = abs(close_price - open_price)
+        if body_length == 0: body_length = 0.01  # 避免除以零
+        if (upper_shadow / body_length) > 1.5 and upper_shadow > (close_price * 0.015):
+            return None  # 上影線過長且賣壓重，直接剔除
+
+        # 🛡️ 條件過濾 3：防萬海型態——20日 MA 乖離率過高 (> 20%)
+        ma20_val = float(latest['MA20'])
+        if ma20_val > 0 and (close_price / ma20_val) > 1.20:
+            return None  # 股價離均線過遠，高檔風險大，直接剔除
+
+        # 🛡️ 條件過濾 4：價頂布林上軌且無量衝高
         boll_upper = float(latest['Boll_Upper'])
         vol_today = float(latest['Volume'])
         vol_ma5 = float(latest['Vol_MA5'])
-        
         if (close_price >= boll_upper * 0.985) and (vol_today < vol_ma5):
-            return None  # 高檔無量過頂，極易拉回，直接排除
+            return None  # 無量過頂，極易拉回，排除
 
         # MACD 型態定義
         is_green_shrinking = (osc_today < 0) and (osc_today > osc_p1) # 📉 綠柱縮短（止跌）
@@ -164,30 +181,30 @@ def fetch_finmind_data(stock_info):
                     last_price_date = str(latest['date'])
                     
                     if last_chip_date != last_price_date:
-                        return None # API 籌碼未更新完畢，跳過防舊資料誤判
+                        return None # API 籌碼未更新完畢，跳過
 
                     today_foreign = float(daily_summary.iloc[-1]['net_buy'])
                     prev_foreign = float(daily_summary.iloc[-2]['net_buy'])
                     
-                    # 🛡️ 防追高機制 2：外資連買後力道明顯衰退 (昨日買超 > 3000張，今日買超減少 > 15%)
+                    # 🛡️ 條件過濾 5：外資連買後力道衰退 (昨日買超 > 3000張，今日買超減少 > 15%)
                     if (prev_foreign >= 3000) and (today_foreign < prev_foreign * 0.85):
-                        return None # 外資高檔買盤力道收縮，排除
+                        return None # 外資高檔買盤收縮，排除
 
-                    # 🎯 條件 1：籌碼強勢吞噬 (昨日大賣 <= -2000張，今日買超補回 80% 以上)
+                    # 🎯 條件 1：籌碼強勢吞噬
                     is_heavy_sell_yesterday = (prev_foreign <= -2000)
                     is_strong_rebound_cover = is_heavy_sell_yesterday and (today_foreign >= abs(prev_foreign) * 0.8)
 
-                    # 🎯 條件 2：標準翻多買超 (昨日小賣或微買，今日買超 >= 2000 張)
+                    # 🎯 條件 2：標準翻多買超
                     is_normal_turn_buy = (prev_foreign > -2000) and (today_foreign >= 2000)
 
-                    # 🎯 條件 3：外資暴買突破 (買超為昨日 3 倍以上且 >= 1000 張)
+                    # 🎯 條件 3：外資暴買突破
                     is_foreign_3x_surge = (prev_foreign > 0) and (today_foreign >= prev_foreign * 3) and (today_foreign >= 1000)
 
                     score = 0
                     strategy_type = None
                     tags = []
 
-                    # 🎯 【策略 A：底部轉折起漲區】 (空轉多拐點)
+                    # 🎯 【策略 A：底部轉折起漲區】
                     if (is_green_shrinking or is_first_red):
                         if is_strong_rebound_cover:
                             strategy_type = "BOTTOM_TURN"
@@ -200,7 +217,7 @@ def fetch_finmind_data(stock_info):
                             tags.append("📉綠柱止跌" if is_green_shrinking else "💥綠轉紅第1天")
                             tags.append(f"🔄外資買超{round(today_foreign)}張")
 
-                    # 🎯 【策略 B：洗盤突破爆發區】 (即戰力飆股)
+                    # 🎯 【策略 B：洗盤突破爆發區】
                     elif is_macd_expanding and (is_strong_rebound_cover or is_normal_turn_buy or is_foreign_3x_surge):
                         strategy_type = "WASH_BREAKOUT"
                         score = 70
@@ -297,7 +314,6 @@ def run_precalculation():
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
                 f"   👉 得分:{item['score']}分 | {item['status_label']}"
             )
-            # 💡 只有非最後一檔時才插入卡片分隔線
             if idx < len(bottom_turn_stocks) - 1:
                 lines.append("┈┈┈┈┈┈┈┈┈┈")
 
@@ -315,7 +331,6 @@ def run_precalculation():
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
                 f"   👉 得分:{item['score']}分 | {item['status_label']}"
             )
-            # 💡 只有非最後一檔時才插入卡片分隔線
             if idx < len(wash_breakout_stocks) - 1:
                 lines.append("┈┈┈┈┈┈┈┈┈┈")
 
