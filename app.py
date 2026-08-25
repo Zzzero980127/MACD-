@@ -2,7 +2,7 @@ import os
 import requests
 import psycopg2
 import re
-import threading  # 背景執行核心
+import threading
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -21,7 +21,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 STOCK_MAP = {}
 
 def update_stock_map():
-    """ 自動向證交所更新『中文名稱 <-> 股票代號』對照表 """
     global STOCK_MAP
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
@@ -62,7 +61,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 def query_single_stock(user_input):
-    """ 個股即時查：只用無密鑰（不帶 Token），節省 API 額度 """
+    """ 個股即時查：明確標註使用【無 Token 模式】與請求狀態 """
     global STOCK_MAP
     if not STOCK_MAP:
         update_stock_map()
@@ -76,11 +75,14 @@ def query_single_stock(user_input):
     elif user_input in STOCK_MAP and user_input.isdigit():
         stock_name = STOCK_MAP[user_input]
 
-    # 🎯 完全不帶 token
+    # 🎯 無 TOKEN 個股查詢 Endpoint
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id={stock_id}"
+    print(f"🔍 [個股即時查] 標的: {stock_id} {stock_name} | 🆓 [無Token模式]", flush=True)
+
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200 and res.json().get("data"):
+            print(f"  └─ 🟢 數據抓取成功！ (HTTP 200)", flush=True)
             data = res.json()["data"]
             if len(data) >= 35:
                 import pandas as pd
@@ -113,8 +115,11 @@ def query_single_stock(user_input):
 
                 display_title = f"{stock_id} {stock_name}".strip()
                 return f"📊 【個股即時解析 - {display_title}】\n--------------------\n🔹 最新收盤: {close:.2f} ({pct:+.2f}%)\n🔹 MACD狀態: {macd_status}\n🔹 當日成交量: {int(latest['Volume'])/1000:.0f} 張"
+        else:
+            print(f"  └─ ❌ 數據抓取失敗 (HTTP {res.status_code})", flush=True)
     except Exception as e:
-        print(f"查詢個股失敗: {e}")
+        print(f"  └─ ❌ 查詢發生異常: {e}", flush=True)
+
     return f"⚠️ 無法取得個股 [{user_input}] 的數據，請確認名稱或代號是否正確。"
 
 @app.route("/", methods=['GET'])
@@ -131,7 +136,6 @@ def callback():
         abort(400)
     return 'OK', 200
 
-# 🎯 正確的背景觸發：接到請求立刻回傳 200，任務交給背景線程處理
 @app.route("/run-cron-job-secret", methods=['GET', 'POST'])
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
