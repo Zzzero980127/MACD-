@@ -313,11 +313,43 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
+    today_date_str = datetime.datetime.now().strftime('%Y-%m-%d')
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
     masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
     print(f"🔑 [Token Check] 載入 FINMIND_API_TOKEN 成功 ({masked_token})", flush=True)
 
+    # -------------------------------------------------------------------------
+    # 🛡️ 防護罩：預先檢查 FinMind 是否已更新「今日」數據
+    # -------------------------------------------------------------------------
+    check_url = "https://api.finmindtrade.com/api/v4/data"
+    check_params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": "2330",
+        "start_date": today_date_str,
+        "token": FINMIND_TOKEN
+    }
+    
+    try:
+        check_res = http.get(check_url, params=check_params, timeout=8.0)
+        if check_res.status_code == 200 and check_res.json().get("data"):
+            latest_date_in_api = check_res.json()["data"][-1]["date"]
+            if latest_date_in_api != today_date_str:
+                print(f"🛑 [安全退場] FinMind 數據尚未更新至今日 ({today_date_str})！最新資料日期為: {latest_date_in_api}", flush=True)
+                print("💡 提示：目前為舊數據，為防產生錯選報表與誤下單，終止本次執行。", flush=True)
+                return
+            else:
+                print(f"✅ [資料驗證通過] FinMind 今日 ({today_date_str}) 股價數據已上架，開始計算！", flush=True)
+        else:
+            print(f"🛑 [安全退場] 無法獲取 FinMind 今日 ({today_date_str}) 之最新數據，取消本次運算。", flush=True)
+            return
+    except Exception as check_e:
+        print(f"🛑 [安全退場] 防護檢查時發生異常: {check_e}，中斷執行。", flush=True)
+        return
+
+    # -------------------------------------------------------------------------
+    # 證交所資料與個股評分
+    # -------------------------------------------------------------------------
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
     
@@ -385,7 +417,7 @@ def run_precalculation():
         for idx, item in enumerate(top_bottom_turn):
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 得分:{item['score']}分 | {item['status_label']}"
+                f"    👉 得分:{item['score']}分 | {item['status_label']}"
             )
             if idx < len(top_bottom_turn) - 1:
                 lines.append("┈┈┈┈┈┈┈┈┈┈")
@@ -401,7 +433,7 @@ def run_precalculation():
         for idx, item in enumerate(top_wash_breakout):
             lines.append(
                 f"🔹 {item['code']} {item['name']} | 收: {item['close']:.2f} ({item['pct']:+.2f}%)\n"
-                f"   👉 得分:{item['score']}分 | {item['status_label']}"
+                f"    👉 得分:{item['score']}分 | {item['status_label']}"
             )
             if idx < len(top_wash_breakout) - 1:
                 lines.append("┈┈┈┈┈┈┈┈┈┈")
@@ -418,15 +450,14 @@ def run_precalculation():
     if sim_portfolio:
         try:
             print("\n🤖 [Sim Log] 開始連動執行模擬倉交易更新...", flush=True)
-            # 自動呼叫 sim_portfolio 的主要進入點 (嘗試常用函式名)
-            if hasattr(sim_portfolio, 'run_simulation'):
+            if hasattr(sim_portfolio, 'process_simulation'):
+                sim_portfolio.process_simulation()
+            elif hasattr(sim_portfolio, 'run_simulation'):
                 sim_portfolio.run_simulation()
             elif hasattr(sim_portfolio, 'main'):
                 sim_portfolio.main()
-            elif hasattr(sim_portfolio, 'run_trade'):
-                sim_portfolio.run_trade()
             else:
-                print("⚠️ [Sim Log] 找不到 sim_portfolio 的進入點函式 (請確認 sim_portfolio.py 內是否有 run_simulation/main 函式)", flush=True)
+                print("⚠️ [Sim Log] 找不到 sim_portfolio 的進入點函式", flush=True)
         except Exception as e:
             print(f"❌ [Sim Log] 模擬倉執行失敗: {e}", flush=True)
     else:
