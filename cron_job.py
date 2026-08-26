@@ -98,7 +98,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         "dataset": "TaiwanStockPrice",
         "data_id": stock_id,
         "start_date": start_date,
-        "token": FINMIND_TOKEN  # 🔑 正確帶入 FinMind API Token
+        "token": FINMIND_TOKEN
     }
     
     try:
@@ -165,7 +165,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
             "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
             "data_id": stock_id,
             "start_date": chip_start,
-            "token": FINMIND_TOKEN  # 🔑 籌碼 API 同樣正確帶入 Token
+            "token": FINMIND_TOKEN
         }
         
         today_total = 0
@@ -321,7 +321,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(1.2)
+        time.sleep(2.5)  # 👈 僅修改此處：間隔改為 2.5 秒
 
     # -------------------------------------------------------------------------
     # 🎯 雙策略分流與互斥篩選
