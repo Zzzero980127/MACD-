@@ -44,8 +44,7 @@ except IOError:
 # -----------------------------------------------------------------------------
 def create_robust_session():
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=1)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({
@@ -106,7 +105,7 @@ def send_line_push(report_text):
 # 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
 
-# ⚡ 第一階段：快速技術面初篩（含完整即時 LOG 輸出）
+# ⚡ 第一階段：技術面初篩 (Timeout 設為 3.0 秒)
 def check_technical_pass(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
@@ -122,18 +121,15 @@ def check_technical_pass(stock_info, current_idx, total_count):
     }
     
     res = None
-    for retry in range(3):
-        try:
-            res = http.get(api_url, params=params, timeout=6.0)
-            if res.status_code == 200 and res.json().get("data"):
-                break
-            elif res.status_code == 402:
-                time.sleep(5.0)
-        except Exception:
-            time.sleep(1.0)
-            
+    try:
+        res = http.get(api_url, params=params, timeout=3.0)
+    except Exception:
+        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 連線超時，跳過", flush=True)
+        return None
+
     if not res or res.status_code != 200 or not res.json().get("data"):
-        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 無資料或 API 異常，跳過", flush=True)
+        status_msg = res.status_code if res else "No Response"
+        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 無資料或 API 異常 (Status: {status_msg})，跳過", flush=True)
         return None
         
     df = pd.DataFrame(res.json()["data"]).rename(
@@ -169,13 +165,12 @@ def check_technical_pass(stock_info, current_idx, total_count):
     prev_close = float(prev1['Close'])
     pct_change = ((close_price - prev_close) / prev_close) * 100
 
-    # 硬性技術面快速濾除門檻
     if osc_today <= osc_p1:
         print(f"  🔍 {prefix} [{stock_id} {stock_name}] MACD 未轉折，淘汰", flush=True)
         return None  
 
     if pct_change > 6.5 or pct_change < -5.0:
-        print(f"  🔍 {prefix} [{stock_id} {stock_name}] 漲跌幅超過門檻 ({pct_change:+.2f}%)，淘汰", flush=True)
+        print(f"  🔍 {prefix} [{stock_id} {stock_name}] 漲跌幅過大 ({pct_change:+.2f}%)，淘汰", flush=True)
         return None  
 
     print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過初篩 (漲跌: {pct_change:+.2f}%)，入圍！", flush=True)
@@ -215,7 +210,7 @@ def fetch_chip_and_score(tech_data):
     today_total, today_foreign, prev_foreign, today_trust = 0, 0, 0, 0
 
     try:
-        res_c = http.get(api_url, params=chip_params, timeout=6.0)
+        res_c = http.get(api_url, params=chip_params, timeout=3.0)
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
@@ -359,7 +354,8 @@ def run_precalculation():
         pass_data = check_technical_pass(stock_info, idx, total_candidates)
         if pass_data:
             tech_passed_list.append(pass_data)
-        time.sleep(0.3)
+        # ⚠️ 嚴格控速：每檔間隔 6.0 秒，確保 1 小時不超過 600 次請求限制！
+        time.sleep(6.0)
 
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
@@ -371,7 +367,7 @@ def run_precalculation():
         scored_stock = fetch_chip_and_score(tech_data)
         all_passed_stocks.append(scored_stock)
         print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
-        time.sleep(0.5)
+        time.sleep(6.0)
 
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
