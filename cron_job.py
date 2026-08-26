@@ -102,10 +102,18 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     }
     
     try:
-        res_p = http.get(api_url, params=params, timeout=8.0)
+        # 🛡️ K線 API：遇到 402 自動冷卻重試機制
+        res_p = None
+        for retry in range(3):
+            res_p = http.get(api_url, params=params, timeout=8.0)
+            if res_p.status_code == 402:
+                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 觸發頻率限制 (HTTP 402)，冷卻 8 秒後重試 ({retry+1}/3)...", flush=True)
+                time.sleep(8.0)
+            else:
+                break
 
-        if res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
+        if not res_p or res_p.status_code != 200 or not res_p.json().get("data"):
+            print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code if res_p else 'No Res'})", flush=True)
             return None
         
         df = pd.DataFrame(res_p.json()["data"]).rename(
@@ -173,9 +181,17 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev_foreign = 0
         today_trust = 0
 
-        res_c = http.get(api_url, params=chip_params, timeout=6.0)
+        # 🛡️ 籌碼 API：遇到 402 自動冷卻重試機制
+        res_c = None
+        for retry in range(3):
+            res_c = http.get(api_url, params=chip_params, timeout=6.0)
+            if res_c.status_code == 402:
+                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 籌碼 API 觸發頻率限制 (HTTP 402)，冷卻 8 秒後重試 ({retry+1}/3)...", flush=True)
+                time.sleep(8.0)
+            else:
+                break
 
-        if res_c.status_code == 200 and res_c.json().get("data"):
+        if res_c and res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
                 df_c['net_buy'] = (pd.to_numeric(df_c['buy'], errors='coerce').fillna(0) - pd.to_numeric(df_c['sell'], errors='coerce').fillna(0)) / 1000
@@ -321,7 +337,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(2.5)  # 👈 僅修改此處：間隔改為 2.5 秒
+        time.sleep(2.5)
 
     # -------------------------------------------------------------------------
     # 🎯 雙策略分流與互斥篩選
