@@ -10,6 +10,9 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
+# 匯入模擬倉模組
+from sim_portfolio import init_sim_db, process_simulation
+
 app = Flask(__name__)
 
 # -----------------------------------------------------------------------------
@@ -30,7 +33,7 @@ def update_stock_map():
     global STOCK_MAP
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=8)
         if res.status_code == 200:
             for item in res.json():
                 code = item.get("Code", "").strip()
@@ -106,7 +109,7 @@ def get_sim_portfolio_report():
                     if res.status_code == 200 and res.json().get("data"):
                         df_p = pd.DataFrame(res.json()["data"])
                         curr_price = float(df_p.iloc[-1]['close'])
-                except:
+                except Exception:
                     pass
 
                 # 計算 10 萬元買入的股數與即時損益
@@ -208,7 +211,7 @@ def query_single_stock(user_input):
                 elif osc_today > 0 and osc_prev <= 0:
                     macd_status = "💥 紅柱第1天 (剛起漲轉折)"
                 elif osc_today > 0 and osc_today > osc_prev:
-                    macd_status = "🔥 紅柱擴大中 (多頭動態強)"
+                    macd_status = "🔥 紅柱擴態強 (多頭動態強)"
                 elif osc_today > 0:
                     macd_status = "⚠️ 紅柱縮短中 (多頭力道減弱)"
                 else:
@@ -245,13 +248,22 @@ def callback():
     return 'OK', 200
 
 def background_job():
-    """在背景執行選股任務的封裝函式"""
+    """在背景執行選股任務與模擬倉運算的封裝函式"""
+    # 1. 執行每日 AI 選股與 LINE 推播
     try:
         from cron_job import run_precalculation
         run_precalculation()
         print("✅ [Background] 後台 AI 選股與推播順利完成！", flush=True)
     except Exception as e:
-        print(f"❌ [Background] 後台執行失敗: {e}", flush=True)
+        print(f"❌ [Background] 後台選股執行失敗: {e}", flush=True)
+
+    # 2. 執行模擬倉更新與計算 (獨立隔離，避免互相干擾)
+    try:
+        init_sim_db()
+        process_simulation()
+        print("✅ [Background] 後台模擬倉結算與掃描順利完成！", flush=True)
+    except Exception as e:
+        print(f"❌ [Background] 後台模擬倉執行失敗: {e}", flush=True)
 
 @app.route("/run-job", methods=['GET', 'POST'])
 def trigger_job():
@@ -265,8 +277,8 @@ def trigger_job():
 def handle_message(event):
     user_msg = event.message.text.strip()
     
-    # 🎯 新增：模擬倉與勝率戰報查詢
-    if user_msg in ["模擬倉", "持倉", "模擬倉持倉", "勝率", "戰績"]:
+    # 🎯 模擬倉與勝率戰報查詢 (支援多種常見關鍵字)
+    if user_msg in ["模擬倉", "持倉", "模擬倉持倉", "勝率", "戰績", "戰報"]:
         report = get_sim_portfolio_report()
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=report))
     
@@ -287,8 +299,8 @@ def handle_message(event):
         hint = (
             "🤖 AI 選股機器人使用指南：\n"
             "1. 輸入「選股」：查看今日 Top 200 加分精選強勢股\n"
-            "2. 輸入「模擬倉」或「勝率」：查看目前持倉明細與測試戰績\n"
-            "3. 輸入「代號或中文名」(如 2606 或 裕民)：即時解析單檔動能狀態\n"
+            "2. 輸入「戰報」或「模擬倉」：查看持倉明細與回測勝率\n"
+            "3. 輸入「代號或中文名」(如 2606 或 裕民)：即時解析單檔動態\n"
             "4. 輸入「8位西元年日期」(如 20260825)：查詢歷史選股紀錄"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
