@@ -2,7 +2,6 @@ import os
 import time
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import pandas as pd
 import datetime
 import psycopg2
@@ -105,7 +104,7 @@ def send_line_push(report_text):
 # 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
 
-# ⚡ 第一階段：技術面初篩 (Timeout 設為 3.0 秒)
+# ⚡ 第一階段：技術面初篩 (1秒1檔)
 def check_technical_pass(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
@@ -122,8 +121,8 @@ def check_technical_pass(stock_info, current_idx, total_count):
     
     res = None
     try:
-        res = http.get(api_url, params=params, timeout=3.0)
-    except Exception:
+        res = http.get(api_url, params=params, timeout=5.0)
+    except Exception as e:
         print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 連線超時，跳過", flush=True)
         return None
 
@@ -210,7 +209,7 @@ def fetch_chip_and_score(tech_data):
     today_total, today_foreign, prev_foreign, today_trust = 0, 0, 0, 0
 
     try:
-        res_c = http.get(api_url, params=chip_params, timeout=3.0)
+        res_c = http.get(api_url, params=chip_params, timeout=5.0)
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
@@ -354,8 +353,8 @@ def run_precalculation():
         pass_data = check_technical_pass(stock_info, idx, total_candidates)
         if pass_data:
             tech_passed_list.append(pass_data)
-        # ⚠️ 嚴格控速：每檔間隔 6.0 秒，確保 1 小時不超過 600 次請求限制！
-        time.sleep(6.0)
+        # 1 秒 1 檔黃金節奏
+        time.sleep(1.0)
 
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
@@ -367,7 +366,7 @@ def run_precalculation():
         scored_stock = fetch_chip_and_score(tech_data)
         all_passed_stocks.append(scored_stock)
         print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
-        time.sleep(6.0)
+        time.sleep(1.0)
 
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
