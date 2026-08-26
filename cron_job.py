@@ -92,17 +92,17 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     prefix = f"[{current_idx}/{total_count}]"
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-    headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
     api_url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockPrice",
         "data_id": stock_id,
-        "start_date": start_date
+        "start_date": start_date,
+        "token": FINMIND_TOKEN  # 🔑 正確帶入 FinMind API Token
     }
     
     try:
-        res_p = http.get(api_url, params=params, headers=headers, timeout=8.0)
+        res_p = http.get(api_url, params=params, timeout=8.0)
 
         if res_p.status_code != 200 or not res_p.json().get("data"):
             print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
@@ -159,12 +159,13 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         # ---------------------------------------------------------------------
         # 籌碼面資料（三大法人與外資買超）
         # ---------------------------------------------------------------------
-        time.sleep(0.5)  # 籌碼請求適當間隔
+        time.sleep(0.5)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
         chip_params = {
             "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
             "data_id": stock_id,
-            "start_date": chip_start
+            "start_date": chip_start,
+            "token": FINMIND_TOKEN  # 🔑 籌碼 API 同樣正確帶入 Token
         }
         
         today_total = 0
@@ -172,7 +173,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev_foreign = 0
         today_trust = 0
 
-        res_c = http.get(api_url, params=chip_params, headers=headers, timeout=6.0)
+        res_c = http.get(api_url, params=chip_params, timeout=6.0)
 
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
@@ -213,7 +214,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         )
 
         # ---------------------------------------------------------------------
-        # 4. 基礎計分與 Tag 標記 (加入綠柱極限止跌 V 轉高分權重)
+        # 4. 基礎計分與 Tag 標記
         # ---------------------------------------------------------------------
         score = 50
         tags = []
@@ -222,9 +223,8 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
             score += 15
             tags.append("💥綠轉紅第1天(金叉形成)")
         elif osc_today < 0 and osc_p1 < 0:
-            # 🎯 檢查是否符合【綠柱縮短 V 型止跌拐點】（今日 > 昨天 且 前天 > 昨天）
             if (osc_today > osc_p1) and (osc_p2 > osc_p1):
-                score += 30  # 見底訊號最強，給予高權重加分
+                score += 30
                 tags.append("📉綠柱極限止跌V轉")
             else:
                 score += 20
@@ -321,7 +321,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(1.2)  # 👈 恢復原本安全的 1.2 秒間隔！
+        time.sleep(1.2)
 
     # -------------------------------------------------------------------------
     # 🎯 雙策略分流與互斥篩選
