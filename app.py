@@ -72,7 +72,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 # -----------------------------------------------------------------------------
-# 2. 模擬倉戰報生成邏輯 (固定投入 10 萬元測試)
+# 2. 模擬倉戰報生成邏輯 (固定投入 10 萬元測試，升級加入當前持倉總損益與勝率)
 # -----------------------------------------------------------------------------
 def get_sim_portfolio_report():
     """計算並組合模擬倉當前持股明細與歷史勝率戰報"""
@@ -93,11 +93,19 @@ def get_sim_portfolio_report():
             "===================="
         ]
 
-        lines.append("🛒 【當前持股明細】")
         if not holds:
-            lines.append("目前空倉中（無持股）")
+            lines.append("🛒 【當前持股明細】\n目前空倉中（無持股）")
         else:
             headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"} if FINMIND_TOKEN else {}
+            
+            # 用於計算當前持倉總體戰力
+            total_hold_cost = 0.0
+            total_hold_market_val = 0.0
+            hold_winning_count = 0
+            total_hold_stocks = len(holds)
+            
+            hold_lines_temp = []
+
             for item in holds:
                 trade_id, code, name, st_type, buy_date, buy_price = item
                 buy_price = float(buy_price)
@@ -117,16 +125,39 @@ def get_sim_portfolio_report():
                 cost_actual = shares * buy_price
                 curr_val = shares * curr_price
                 pnl_dollars = curr_val - cost_actual
-                pnl_pct = ((curr_price - buy_price) / buy_price) * 100
+                pnl_pct = ((curr_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0.0
+
+                total_hold_cost += cost_actual
+                total_hold_market_val += curr_val
+                if pnl_dollars > 0:
+                    hold_winning_count += 1
 
                 emoji = "🔺" if pnl_dollars >= 0 else "🔻"
-                lines.append(
+                sign = "+" if pnl_dollars >= 0 else ""
+
+                hold_lines_temp.append(
                     f"🔹 {code} {name} ({st_type[:3]})\n"
                     f"   📅 買入: {buy_date} | 成本: ${buy_price:.2f}\n"
                     f"   📈 現價: ${curr_price:.2f} | 股數: {shares:,}股\n"
-                    f"   👉 損益: {emoji} ${pnl_dollars:+,.0f} ({pnl_pct:+.2f}%)"
+                    f"   👉 損益: {emoji} {sign}${pnl_dollars:,.0f} ({sign}{pnl_pct:.2f}%)"
                 )
-                lines.append("┈┈┈┈┈┈┈┈┈┈")
+
+            # 計算當前持股統計
+            hold_total_pnl = total_hold_market_val - total_hold_cost
+            hold_total_return = (hold_total_pnl / total_hold_cost * 100) if total_hold_cost > 0 else 0.0
+            hold_win_rate = (hold_winning_count / total_hold_stocks * 100) if total_hold_stocks > 0 else 0.0
+
+            total_emoji = "🔺" if hold_total_pnl >= 0 else "🔻"
+            total_sign = "+" if hold_total_pnl >= 0 else ""
+
+            # 組合頂部總計看板
+            lines.append(f"🏆 當前未實現勝率：{hold_win_rate:.1f}% ({hold_winning_count}/{total_hold_stocks} 檔獲利)")
+            lines.append(f"💵 當前持股總成本：${total_hold_cost:,.0f}")
+            lines.append(f"💼 當前持股總市值：${total_hold_market_val:,.0f}")
+            lines.append(f"📈 未實現總損益：{total_emoji} {total_sign}${hold_total_pnl:,.0f} ({total_sign}{hold_total_return:.2f}%)")
+            lines.append("--------------------")
+            lines.append("🛒 【當前持股明細】")
+            lines.append("\n┈┈┈┈┈┈┈┈┈┈\n".join(hold_lines_temp))
 
         lines.append("\n====================\n")
 
@@ -134,7 +165,7 @@ def get_sim_portfolio_report():
         cursor.execute("SELECT buy_price, sell_price, return_rate FROM sim_trades WHERE status = 'CLOSED';")
         closed = cursor.fetchall()
 
-        lines.append("📈 【歷史回測戰績彙整】")
+        lines.append("📈 【歷史已平倉戰績彙整】")
         if not closed:
             lines.append("尚無已平倉交易紀錄")
         else:
@@ -153,7 +184,7 @@ def get_sim_portfolio_report():
             pnl_emoji = "🎉" if total_pnl >= 0 else "📉"
 
             lines.append(f"🔹 總已平倉筆數: {total_trades} 筆")
-            lines.append(f"🏆 策略勝率 (Win Rate): {win_rate:.1f}% ({wins}勝 / {total_trades - wins}敗)")
+            lines.append(f"🏆 平倉勝率 (Win Rate): {win_rate:.1f}% ({wins}勝 / {total_trades - wins}敗)")
             lines.append(f"{pnl_emoji} 累計淨損益: ${total_pnl:+,.0f} 元")
 
         cursor.close()
