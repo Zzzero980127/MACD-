@@ -159,7 +159,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         # ---------------------------------------------------------------------
         # 籌碼面資料（三大法人與外資買超）
         # ---------------------------------------------------------------------
-        time.sleep(0.2)
+        time.sleep(0.5)  # 籌碼請求適當間隔
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
         chip_params = {
             "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
@@ -172,7 +172,6 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev_foreign = 0
         today_trust = 0
 
-        # 🔑 修正點：使用正確的 api_url 與 chip_params，帶上完整 headers
         res_c = http.get(api_url, params=chip_params, headers=headers, timeout=6.0)
 
         if res_c.status_code == 200 and res_c.json().get("data"):
@@ -322,7 +321,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(0.4)
+        time.sleep(1.2)  # 👈 恢復原本安全的 1.2 秒間隔！
 
     # -------------------------------------------------------------------------
     # 🎯 雙策略分流與互斥篩選
