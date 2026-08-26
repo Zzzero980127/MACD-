@@ -122,14 +122,13 @@ def check_technical_pass(stock_info, current_idx, total_count):
     }
     
     res = None
-    # 🛡️ 加入 3 次自動重試，避免網路波動或 402 造成漏抓
     for retry in range(3):
         try:
             res = http.get(api_url, params=params, timeout=6.0)
             if res.status_code == 200 and res.json().get("data"):
                 break
             elif res.status_code == 402:
-                time.sleep(5.0)  # 遇頻率限制小等 5 秒
+                time.sleep(5.0)
         except Exception:
             time.sleep(1.0)
             
@@ -319,47 +318,7 @@ def fetch_chip_and_score(tech_data):
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
-    today_date_str = datetime.datetime.now().strftime('%Y-%m-%d')
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
-
-    # -------------------------------------------------------------------------
-    # 🛡️ 雙重穩固防護罩：多標的 (2330/2317/2454) 抽驗 FinMind 今日資料是否上架
-    # -------------------------------------------------------------------------
-    check_url = "https://api.finmindtrade.com/api/v4/data"
-    sample_stocks = ["2330", "2317", "2454"]
-    data_ready = False
-    
-    print(f"🔍 [防護檢查] 開始驗證 FinMind 今日 ({today_date_str}) 資料是否已完成上架...", flush=True)
-
-    for check_retry in range(3):
-        for stock_id in sample_stocks:
-            check_params = {
-                "dataset": "TaiwanStockPrice",
-                "data_id": stock_id,
-                "start_date": today_date_str,
-                "token": FINMIND_TOKEN
-            }
-            try:
-                check_res = http.get(check_url, params=check_params, timeout=6.0)
-                if check_res.status_code == 200 and check_res.json().get("data"):
-                    latest_date = check_res.json()["data"][-1]["date"]
-                    if latest_date == today_date_str:
-                        print(f"✅ [資料驗證成功] 抽驗 {stock_id} 成功！FinMind 今日 ({today_date_str}) 數據已上架，開始執行選股！", flush=True)
-                        data_ready = True
-                        break
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-        if data_ready:
-            break
-            
-        print(f"⏳ [防護等待] FinMind 資料尚未完備或連線忙碌，等待 10 秒後進行第 {check_retry+1}/3 次重試...", flush=True)
-        time.sleep(10.0)
-
-    if not data_ready:
-        print(f"🛑 [安全退場] FinMind 今日數據確定尚未上架完畢，為防誤算舊資料，安全終止本次執行。", flush=True)
-        return
 
     # -------------------------------------------------------------------------
     # 取得證交所成交量前 200 大
@@ -382,7 +341,6 @@ def run_precalculation():
                     except ValueError:
                         continue
             
-            # 加 Secondary Sort 確保排序 100% 固定
             df_stocks = pd.DataFrame(stocks).sort_values(by=["volume", "code"], ascending=[False, True])
             candidates = df_stocks.head(200).to_dict('records')
             print(f"✅ [TWSE Log] 成功取得成交量前 200 大個股清單！", flush=True)
@@ -405,7 +363,7 @@ def run_precalculation():
         pass_data = check_technical_pass(stock_info, idx, total_candidates)
         if pass_data:
             tech_passed_list.append(pass_data)
-        time.sleep(0.3)  # 快查無須長等待
+        time.sleep(0.3)
 
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
