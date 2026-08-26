@@ -79,14 +79,13 @@ def process_simulation():
             if res.get("data"):
                 df = pd.DataFrame(res["data"])
                 
-                # 🎯 調整：早上 09:00 執行時，取倒數第二筆（即昨日收盤價）做結算，避免早盤未收盤數據影響
+                # 早上 09:00 執行時，取倒數第二筆（即昨日收盤價）做結算
                 curr_price = float(df.iloc[-2]['close']) if len(df) >= 2 else float(df.iloc[-1]['close'])
                 
                 exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
                 exp2 = pd.to_numeric(df['close']).ewm(span=26, adjust=False).mean()
                 osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
                 
-                # 同理：讀取昨日與前日的 MACD 指標
                 osc_today, osc_p1 = float(osc.iloc[-2]), float(osc.iloc[-3]) if len(osc) >= 3 else (float(osc.iloc[-1]), float(osc.iloc[-2]))
 
                 ret = ((curr_price - buy_price) / buy_price) * 100
@@ -136,20 +135,17 @@ def process_simulation():
                 buy_targets = []
 
                 for line in lines:
-                    # 🎯 精確相容阿拉伯數字 (1/2) 與國字 (一/二) 的策略標籤切換
                     if "策略二" in line or "策略2" in line:
                         current_strategy = "策略二"
                     elif "策略一" in line or "策略1" in line:
                         current_strategy = "策略一"
                     
-                    # 🎯 完整正則解析：相容 • 與 🔹 前綴符號
                     match = re.search(r'[•🔹]\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
                         buy_targets.append((code, name, price, current_strategy))
 
-                # 🎯 週四買進（週三選股）精選邏輯：
-                # 優先挑選洗盤結束的「策略二」，最多 2 檔；若無策略二，則僅取「策略一」的第一檔（高勝率標的）
+                # 週四買進（週三選股）精選邏輯：
                 if weekday == 3:
                     st2_targets = [t for t in buy_targets if t[3] == "策略二"]
                     if st2_targets:
@@ -158,15 +154,27 @@ def process_simulation():
                         buy_targets = buy_targets[:1]
                     print(f"🔥 [週四短線精選] 鎖定週三最佳標的 {len(buy_targets)} 檔進場！", flush=True)
 
-                # 寫入模擬倉資料庫
+                # 寫入模擬倉資料庫 (加入「當週買賣過即跳過」防護機制)
                 for code, name, price, st_type in buy_targets:
-                    cursor.execute("SELECT id FROM sim_trades WHERE stock_code = %s AND buy_date = %s;", (code, today_str))
-                    if not cursor.fetchone():
-                        cursor.execute('''
-                            INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
-                            VALUES (%s, %s, %s, %s, %s, 'HOLD');
-                        ''', (code, name, st_type, today_str, price))
-                        print(f"🛒 [模擬買入] [{st_type}] {code} {name} | 成本價: ${price}", flush=True)
+                    # 🛡️ 檢查該個股在「本週（週一～今天）」是否曾有買入 (buy_date) 或賣出 (sell_date) 紀錄
+                    cursor.execute('''
+                        SELECT id FROM sim_trades 
+                        WHERE stock_code = %s 
+                        AND (
+                            DATE_TRUNC('week', buy_date::date) = DATE_TRUNC('week', %s::date)
+                            OR (sell_date IS NOT NULL AND DATE_TRUNC('week', sell_date::date) = DATE_TRUNC('week', %s::date))
+                        );
+                    ''', (code, today_str, today_str))
+                    
+                    if cursor.fetchone():
+                        print(f"🚫 [當週防護跳過] {code} {name} 本週已有買賣紀錄，不再重複建倉！", flush=True)
+                        continue
+
+                    cursor.execute('''
+                        INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
+                        VALUES (%s, %s, %s, %s, %s, 'HOLD');
+                    ''', (code, name, st_type, today_str, price))
+                    print(f"🛒 [模擬買入] [{st_type}] {code} {name} | 成本價: ${price}", flush=True)
 
         conn.commit()
         cursor.close()
