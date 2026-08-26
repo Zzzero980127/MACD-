@@ -17,14 +17,14 @@ except ImportError:
     sim_portfolio = None
 
 # -----------------------------------------------------------------------------
-# 1. 環境變數設定與嚴格 Token 檢查
+# 1. 環境變數設定與 Token 檢查
 # -----------------------------------------------------------------------------
-FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
+FINMIND_TOKEN = (os.environ.get('FINMIND_API_TOKEN') or os.environ.get('FINMIND_TOKEN', '')).strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
 if not FINMIND_TOKEN:
-    print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN！程式強制終止。", flush=True)
+    print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN 或 FINMIND_TOKEN！程式強制終止。", flush=True)
     exit(1)
 
 # -----------------------------------------------------------------------------
@@ -36,7 +36,7 @@ lock_file = open(LOCK_FILE_PATH, "w")
 try:
     fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except IOError:
-    print("⚠️ [Lock Log] 偵測到已有另一個選股程序正在執行中，自動終止本次執行以防重複刷 API！", flush=True)
+    print("⚠️ [Lock Log] 偵測到已有另一個選股程序正在執行中，自動終止！", flush=True)
     exit(0)
 
 # -----------------------------------------------------------------------------
@@ -49,7 +49,7 @@ def create_robust_session():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
     return session
 
@@ -103,15 +103,16 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 核心個股分析
+# 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
-def fetch_finmind_data(stock_info, current_idx, total_count):
+
+# ⚡ 第一階段：快速技術面初篩（僅打 K 線 API）
+def check_technical_pass(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
     prefix = f"[{current_idx}/{total_count}]"
     
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
-
     api_url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockPrice",
@@ -121,21 +122,11 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     }
     
     try:
-        # 🛡️ K線 API：402 自動冷卻重試
-        res_p = None
-        for retry in range(3):
-            res_p = http.get(api_url, params=params, timeout=8.0)
-            if res_p.status_code == 402:
-                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 觸發頻率限制 (HTTP 402)，冷卻 15 秒後重試 ({retry+1}/3)...", flush=True)
-                time.sleep(15.0)
-            else:
-                break
-
-        if not res_p or res_p.status_code != 200 or not res_p.json().get("data"):
-            print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code if res_p else 'No Res'})", flush=True)
+        res = http.get(api_url, params=params, timeout=6.0)
+        if res.status_code != 200 or not res.json().get("data"):
             return None
         
-        df = pd.DataFrame(res_p.json()["data"]).rename(
+        df = pd.DataFrame(res.json()["data"]).rename(
             columns={'close': 'Close', 'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'}
         )
         for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
@@ -143,10 +134,9 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
             
         df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
         if len(df) < 35:
-            print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] K線資料不足 35 天", flush=True)
             return None
 
-        # --- MACD 與均線計算 ---
+        # MACD & 均線
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp1 - exp2
@@ -162,54 +152,60 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev2 = df.iloc[-3]
         prev3 = df.iloc[-4]
 
-        dif_today = float(latest['DIF'])
         osc_today = float(latest['OSC'])
         osc_p1 = float(prev1['OSC'])
-        osc_p2 = float(prev2['OSC'])
-        osc_p3 = float(prev3['OSC'])
-
         close_price = float(latest['Close'])
         prev_close = float(prev1['Close'])
-        today_volume = float(latest['Volume'])
-        vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
+        # 硬性技術面快速濾除門檻
         if osc_today <= osc_p1:
-            print(f"  🚫 {prefix} [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
-            return None
+            return None  # MACD 未轉折直接淘汰
 
         if pct_change > 6.5 or pct_change < -5.0:
-            print(f"  🚫 {prefix} [{stock_id} {stock_name}] 濾除: 防追高/急跌門檻 ({pct_change:+.2f}%)", flush=True)
-            return None
+            return None  # 急跌或追高直接淘汰
 
-        # ---------------------------------------------------------------------
-        # 籌碼面資料
-        # ---------------------------------------------------------------------
-        time.sleep(0.5)
-        chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
-        chip_params = {
-            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
-            "data_id": stock_id,
-            "start_date": chip_start,
-            "token": FINMIND_TOKEN
+        print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過技術初篩 (漲跌: {pct_change:+.2f}%)，進入籌碼深度分析！", flush=True)
+
+        return {
+            "code": stock_id,
+            "name": stock_name,
+            "df": df,
+            "latest": latest,
+            "prev1": prev1,
+            "prev2": prev2,
+            "prev3": prev3,
+            "pct_change": pct_change,
+            "close_price": close_price
         }
-        
-        today_total = 0
-        today_foreign = 0
-        prev_foreign = 0
-        today_trust = 0
+    except Exception as e:
+        return None
 
-        # 🛡️ 籌碼 API：402 自動冷卻重試
-        res_c = None
-        for retry in range(3):
-            res_c = http.get(api_url, params=chip_params, timeout=6.0)
-            if res_c.status_code == 402:
-                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 籌碼 API 觸發頻率限制 (HTTP 402)，冷卻 15 秒後重試 ({retry+1}/3)...", flush=True)
-                time.sleep(15.0)
-            else:
-                break
+# 🔍 第二階段：籌碼與綜合評分（僅對通過初篩者執行）
+def fetch_chip_and_score(tech_data):
+    stock_id = tech_data["code"]
+    stock_name = tech_data["name"]
+    latest = tech_data["latest"]
+    prev1 = tech_data["prev1"]
+    prev2 = tech_data["prev2"]
+    prev3 = tech_data["prev3"]
+    close_price = tech_data["close_price"]
+    pct_change = tech_data["pct_change"]
 
-        if res_c and res_c.status_code == 200 and res_c.json().get("data"):
+    api_url = "https://api.finmindtrade.com/api/v4/data"
+    chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+    chip_params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": stock_id,
+        "start_date": chip_start,
+        "token": FINMIND_TOKEN
+    }
+    
+    today_total, today_foreign, prev_foreign, today_trust = 0, 0, 0, 0
+
+    try:
+        res_c = http.get(api_url, params=chip_params, timeout=6.0)
+        if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
             if not df_c.empty:
                 df_c['net_buy'] = (pd.to_numeric(df_c['buy'], errors='coerce').fillna(0) - pd.to_numeric(df_c['sell'], errors='coerce').fillna(0)) / 1000
@@ -225,88 +221,90 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
                     today_foreign = float(daily_chip.iloc[-1]['foreign_net'])
                     prev_foreign = float(daily_chip.iloc[-2]['foreign_net'])
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
-
-        # ---------------------------------------------------------------------
-        # 🎯 策略二專屬判定
-        # ---------------------------------------------------------------------
-        osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
-        is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
-        
-        if prev_foreign > 0:
-            foreign_surge_valid = (today_foreign >= prev_foreign * 3)
-        else:
-            foreign_surge_valid = (today_foreign > abs(prev_foreign))
-
-        is_wash_breakout = (
-            is_above_zero_axis and 
-            osc_3day_declining and 
-            (osc_today > osc_p1) and 
-            foreign_surge_valid and 
-            (1.0 <= pct_change <= 5.5)
-        )
-
-        # ---------------------------------------------------------------------
-        # 計分與 Tag
-        # ---------------------------------------------------------------------
-        score = 50
-        tags = []
-
-        if osc_today > 0 and osc_p1 <= 0:
-            score += 15
-            tags.append("💥綠轉紅第1天(金叉形成)")
-        elif osc_today < 0 and osc_p1 < 0:
-            if (osc_today > osc_p1) and (osc_p2 > osc_p1):
-                score += 30
-                tags.append("📉綠柱極限止跌V轉")
-            else:
-                score += 20
-                tags.append("📉綠柱止跌")
-        elif osc_today > 0 and osc_p1 > 0:
-            tags.append("🔥紅柱延伸")
-
-        if close_price >= float(latest['MA20']):
-            score += 10
-            tags.append("🛡️站上月線")
-        elif close_price > float(latest['MA5']):
-            score += 5
-            tags.append("⚡站上5日線")
-
-        if today_volume >= vol_ma5 * 1.2:
-            score += 10
-            tags.append("🚀帶量攻擊")
-
-        if today_total >= 10000:
-            score += 25
-            tags.append(f"⚡萬張爆買({round(today_total)}張)")
-        elif today_total >= 3000:
-            score += 15
-            tags.append(f"🔥法人大買({round(today_total)}張)")
-        elif today_total >= 800:
-            score += 10
-            tags.append(f"🔄法人買超({round(today_total)}張)")
-
-        if today_foreign > 0 and today_trust > 0:
-            score += 10
-            tags.append("🤝土洋同買")
-
-        if is_wash_breakout:
-            score += 20
-            tags.append("⚡洗盤結束起漲")
-
-        print(f"  ✅ {prefix} [{stock_id} {stock_name}] 得分:{score} | 洗盤起漲:{is_wash_breakout} | 外資今日:{round(today_foreign)}張 (前日:{round(prev_foreign)}張)", flush=True)
-
-        return {
-            "code": stock_id,
-            "name": stock_name,
-            "close": close_price,
-            "pct": pct_change,
-            "score": score,
-            "is_wash_breakout": is_wash_breakout,
-            "status_label": " ".join(tags)
-        }
     except Exception as e:
-        print(f"  ❌ {prefix} [{stock_id} {stock_name}] 運算異常: {e}", flush=True)
-        return None
+        print(f"  ⚠️ [{stock_id} {stock_name}] 籌碼抓取失敗，以 0 計算: {e}", flush=True)
+
+    # ---------------------------------------------------------------------
+    # 策略計算與計分
+    # ---------------------------------------------------------------------
+    dif_today = float(latest['DIF'])
+    osc_today = float(latest['OSC'])
+    osc_p1 = float(prev1['OSC'])
+    osc_p2 = float(prev2['OSC'])
+    osc_p3 = float(prev3['OSC'])
+    today_volume = float(latest['Volume'])
+    vol_ma5 = float(latest['Vol_MA5'])
+
+    osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
+    is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
+    
+    if prev_foreign > 0:
+        foreign_surge_valid = (today_foreign >= prev_foreign * 3)
+    else:
+        foreign_surge_valid = (today_foreign > abs(prev_foreign))
+
+    is_wash_breakout = (
+        is_above_zero_axis and 
+        osc_3day_declining and 
+        (osc_today > osc_p1) and 
+        foreign_surge_valid and 
+        (1.0 <= pct_change <= 5.5)
+    )
+
+    score = 50
+    tags = []
+
+    if osc_today > 0 and osc_p1 <= 0:
+        score += 15
+        tags.append("💥綠轉紅第1天(金叉形)")
+    elif osc_today < 0 and osc_p1 < 0:
+        if (osc_today > osc_p1) and (osc_p2 > osc_p1):
+            score += 30
+            tags.append("📉綠柱極限止跌V轉")
+        else:
+            score += 20
+            tags.append("📉綠柱止跌")
+    elif osc_today > 0 and osc_p1 > 0:
+        tags.append("🔥紅柱延伸")
+
+    if close_price >= float(latest['MA20']):
+        score += 10
+        tags.append("🛡️站上月線")
+    elif close_price > float(latest['MA5']):
+        score += 5
+        tags.append("⚡站上5日線")
+
+    if today_volume >= vol_ma5 * 1.2:
+        score += 10
+        tags.append("🚀帶量攻擊")
+
+    if today_total >= 10000:
+        score += 25
+        tags.append(f"⚡萬張爆買({round(today_total)}張)")
+    elif today_total >= 3000:
+        score += 15
+        tags.append(f"🔥法人大買({round(today_total)}張)")
+    elif today_total >= 800:
+        score += 10
+        tags.append(f"🔄法人買超({round(today_total)}張)")
+
+    if today_foreign > 0 and today_trust > 0:
+        score += 10
+        tags.append("🤝土洋同買")
+
+    if is_wash_breakout:
+        score += 20
+        tags.append("⚡洗盤結束起漲")
+
+    return {
+        "code": stock_id,
+        "name": stock_name,
+        "close": close_price,
+        "pct": pct_change,
+        "score": score,
+        "is_wash_breakout": is_wash_breakout,
+        "status_label": " ".join(tags)
+    }
 
 # -----------------------------------------------------------------------------
 # 4. 主流程
@@ -316,11 +314,8 @@ def run_precalculation():
     today_date_str = datetime.datetime.now().strftime('%Y-%m-%d')
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
-    masked_token = FINMIND_TOKEN[:4] + "..." + FINMIND_TOKEN[-4:] if len(FINMIND_TOKEN) > 8 else "***"
-    print(f"🔑 [Token Check] 載入 FINMIND_API_TOKEN 成功 ({masked_token})", flush=True)
-
     # -------------------------------------------------------------------------
-    # 🛡️ 防護罩：預先檢查 FinMind 是否已更新「今日」數據
+    # 防護罩：預先檢查 FinMind 是否已更新「今日」數據
     # -------------------------------------------------------------------------
     check_url = "https://api.finmindtrade.com/api/v4/data"
     check_params = {
@@ -336,19 +331,18 @@ def run_precalculation():
             latest_date_in_api = check_res.json()["data"][-1]["date"]
             if latest_date_in_api != today_date_str:
                 print(f"🛑 [安全退場] FinMind 數據尚未更新至今日 ({today_date_str})！最新資料日期為: {latest_date_in_api}", flush=True)
-                print("💡 提示：目前為舊數據，為防產生錯選報表與誤下單，終止本次執行。", flush=True)
                 return
             else:
                 print(f"✅ [資料驗證通過] FinMind 今日 ({today_date_str}) 股價數據已上架，開始計算！", flush=True)
         else:
-            print(f"🛑 [安全退場] 無法獲取 FinMind 今日 ({today_date_str}) 之最新數據，取消本次運算。", flush=True)
+            print(f"🛑 [安全退場] 無法獲取 FinMind 今日最新數據，取消本次運算。", flush=True)
             return
     except Exception as check_e:
-        print(f"🛑 [安全退場] 防護檢查時發生異常: {check_e}，中斷執行。", flush=True)
+        print(f"🛑 [安全退場] 防護檢查異常: {check_e}，中斷執行。", flush=True)
         return
 
     # -------------------------------------------------------------------------
-    # 證交所資料與個股評分
+    # 取得證交所成交量前 200 大
     # -------------------------------------------------------------------------
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
@@ -378,17 +372,37 @@ def run_precalculation():
         print(f"❌ [TWSE Log] 讀取失敗: {e}", flush=True)
         return
 
-    all_passed_stocks = []
+    # -------------------------------------------------------------------------
+    # ⚡ 第一階段：200 檔技術面極速篩選 (只需 ~0.5 秒/檔)
+    # -------------------------------------------------------------------------
+    print("--------------------------------------------------", flush=True)
+    print("⚡ [Phase 1] 開始進行技術面形態極速初篩 (排除 MACD 未轉折/急漲跌)...", flush=True)
+    tech_passed_list = []
     total_candidates = len(candidates)
 
     for idx, stock_info in enumerate(candidates, 1):
-        res = fetch_finmind_data(stock_info, idx, total_candidates)
-        if res:
-            all_passed_stocks.append(res)
-        time.sleep(2.5)
+        pass_data = check_technical_pass(stock_info, idx, total_candidates)
+        if pass_data:
+            tech_passed_list.append(pass_data)
+        time.sleep(0.3)  # 快查無須長等待
+
+    print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
     # -------------------------------------------------------------------------
-    # 🎯 雙策略分流與互斥篩選
+    # 🔍 第二階段：籌碼分析與評分 (僅分析通過初篩的 20~30 檔)
+    # -------------------------------------------------------------------------
+    print("--------------------------------------------------", flush=True)
+    print("🔍 [Phase 2] 開始對入圍個股進行法人籌碼深度分析...", flush=True)
+    all_passed_stocks = []
+
+    for idx, tech_data in enumerate(tech_passed_list, 1):
+        scored_stock = fetch_chip_and_score(tech_data)
+        all_passed_stocks.append(scored_stock)
+        print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
+        time.sleep(0.5)
+
+    # -------------------------------------------------------------------------
+    # 🎯 雙策略分流與輸出
     # -------------------------------------------------------------------------
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
@@ -397,8 +411,6 @@ def run_precalculation():
     strategy_1_candidates = [s for s in all_passed_stocks if not s['is_wash_breakout']]
     strategy_1_candidates.sort(key=lambda x: x['score'], reverse=True)
     top_bottom_turn = strategy_1_candidates[:5]
-
-    print(f"📈 [Log 統計] 策略一可選標的: {len(strategy_1_candidates)} 檔 | 策略二洗盤起漲標的: {len(wash_breakout_stocks)} 檔", flush=True)
 
     date_display = datetime.datetime.now().strftime('%Y/%m/%d')
     today_str = datetime.datetime.now().strftime('%Y%m%d')
@@ -444,11 +456,7 @@ def run_precalculation():
     save_to_db(report, today_str)
     send_line_push(report)
 
-    # -------------------------------------------------------------------------
-    # 🤖 模擬倉提示 (已解耦：模擬倉排程設定於隔日早上 09:00 獨立執行)
-    # -------------------------------------------------------------------------
-    print("\n💡 [Sim Notice] 選股報告已寫入 DB (Key: LATEST)。模擬倉將於隔日 09:00 獨立讀取並執行交易。", flush=True)
-    print("🎉 [Cron Job Log] 排程選股與 LINE 推播全數完畢！", flush=True)
+    print("\n🎉 [Cron Job Log] 排程選股與 LINE 推播全數完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
