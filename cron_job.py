@@ -226,6 +226,11 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
             score += 15
             tags.append("💥綠轉紅第1天(金叉形成)")
         elif osc_today < 0 and osc_p1 < 0:
+        # 🎯 檢查是否符合【綠柱縮短 V 型止跌拐點】（今日 > 昨天 且 前天 > 昨天）
+        if (osc_today > osc_p1) and (osc_p2 > osc_p1):
+            score += 30  # 給予最高權重加分（見底訊號最強、獲利空間最大）
+            tags.append("📉綠柱極限止跌V轉")
+        elif osc_today < 0 and osc_p1 < 0:
             score += 20
             tags.append("📉綠柱止跌")
         elif osc_today > 0 and osc_p1 > 0:
