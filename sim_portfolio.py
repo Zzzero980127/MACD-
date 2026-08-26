@@ -35,7 +35,6 @@ def init_sim_db():
     if not conn: return
     try:
         cursor = conn.cursor()
-        # 建立模擬倉交易紀錄表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sim_trades (
                 id SERIAL PRIMARY KEY,
@@ -47,8 +46,8 @@ def init_sim_db():
                 sell_date VARCHAR(10),
                 sell_price NUMERIC,
                 return_rate NUMERIC,
-                status VARCHAR(20), -- 'HOLD' (持股中) 或 'CLOSED' (已平倉)
-                exit_reason VARCHAR(50) -- 出場原因
+                status VARCHAR(20),
+                exit_reason VARCHAR(50)
             );
         ''')
         conn.commit()
@@ -85,7 +84,6 @@ def analyze_stock(stock_info, current_idx, total_count):
         df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['OSC'] = df['DIF'] - df['MACD']
         df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
 
         latest, prev1, prev2, prev3 = df.iloc[-1], df.iloc[-2], df.iloc[-3], df.iloc[-4]
         dif_today = float(latest['DIF'])
@@ -98,7 +96,7 @@ def analyze_stock(stock_info, current_idx, total_count):
         prev_close = float(prev1['Close'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 通用門檻
+        # 通用濾除門檻
         if osc_today <= osc_p1 or pct_change > 6.5 or pct_change < -5.0: return None
 
         # 籌碼面資料
@@ -116,13 +114,13 @@ def analyze_stock(stock_info, current_idx, total_count):
                     today_foreign = float(foreign_df.iloc[-1]['foreign_net'])
                     prev_foreign = float(foreign_df.iloc[-2]['foreign_net'])
 
-        # 策略二判定
+        # 策略二洗盤起漲判定
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
         is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
         foreign_surge_valid = (today_foreign >= prev_foreign * 3) if prev_foreign > 0 else (today_foreign > abs(prev_foreign))
         is_wash_breakout = (is_above_zero_axis and osc_3day_declining and (osc_today > osc_p1) and foreign_surge_valid and (1.0 <= pct_change <= 5.5))
 
-        # 計分邏輯 (綠柱極限止跌 +30)
+        # 綠柱極限止跌 (+30分)
         score = 50
         if osc_today < 0 and osc_p1 < 0 and (osc_today > osc_p1) and (osc_p2 > osc_p1):
             score += 30
@@ -143,10 +141,10 @@ def analyze_stock(stock_info, current_idx, total_count):
         return None
 
 # -----------------------------------------------------------------------------
-# 4. 模擬倉買進與檢查賣出邏輯
+# 4. 模擬倉核心流程
 # -----------------------------------------------------------------------------
 def process_simulation():
-    weekday = datetime.datetime.now().weekday() # 0: 週一, 1: 週二, ..., 3: 週四
+    weekday = datetime.datetime.now().weekday()  # 0:週一, 1:週二, 2:週三, 3:週四
     today_str = datetime.datetime.now().strftime('%Y-%m-%d')
     conn = get_db_connection()
     if not conn: return
@@ -164,7 +162,6 @@ def process_simulation():
         trade_id, code, name, buy_price, buy_date = item
         buy_price = float(buy_price)
 
-        # 抓取最新股價與 OSC
         headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
         start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
         res = requests.get("https://api.finmindtrade.com/api/v4/data", params={"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}, headers=headers).json()
@@ -173,7 +170,6 @@ def process_simulation():
             df = pd.DataFrame(res["data"])
             curr_price = float(df.iloc[-1]['close'])
             
-            # 計算 MACD
             exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
             exp2 = pd.to_numeric(df['close']).ewm(span=26, adjust=False).mean()
             osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
@@ -184,16 +180,13 @@ def process_simulation():
             should_sell = False
             exit_reason = ""
 
-            # 出場規則 1：大跌止損 (<= -5.0%)
             if ret <= -5.0:
                 should_sell = True
                 exit_reason = "🚨 大跌觸發止損 (-5%)"
-            # 出場規則 2：MACD比前日低 (多頭減弱)
             elif osc_today < osc_p1:
                 should_sell = True
                 exit_reason = "📉 MACD多頭減弱出場"
-            # 出場規則 3：週四強制結算 (避開 T+2 與跨週)
-            elif weekday == 3: # 星期四
+            elif weekday == 3:  # 週四例行清倉
                 should_sell = True
                 exit_reason = "📅 週四例行清倉結算"
 
@@ -206,11 +199,10 @@ def process_simulation():
                 print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
     # -------------------------------------------------------------------------
-    # B. 週一至週三：進行買入動作 (策略一前5名 + 策略二前5名，最多10檔)
+    # B. 週一至週三：進行買入動作 (策略一前5名 + 策略二前5名)
     # -------------------------------------------------------------------------
-    if weekday in [0, 1, 2]: # 週一到週三
-        print("🛒 [模擬買進] 開始掃描今日符合條件之標的...", flush=True)
-        
+    if weekday in [0, 1, 2]:
+        print("🛒 [模擬買進] 開始掃描今日符合條件標的...", flush=True)
         res_twse = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=10).json()
         stocks = []
         for item in res_twse:
@@ -226,7 +218,6 @@ def process_simulation():
             res = analyze_stock(stock, idx, len(candidates))
             if res: analyzed_results.append(res)
 
-        # 策略分流
         s2_list = [s for s in analyzed_results if s['is_wash_breakout']]
         s2_list.sort(key=lambda x: x['score'], reverse=True)
         top_s2 = s2_list[:5]
@@ -240,32 +231,39 @@ def process_simulation():
         for item in top_s2: buy_targets.append((item, "策略二(洗盤起漲)"))
 
         for target, st_type in buy_targets:
-            # 檢查今日是否已買過，避免重複進場
             cursor.execute("SELECT id FROM sim_trades WHERE stock_code = %s AND buy_date = %s;", (target['code'], today_str))
             if not cursor.fetchone():
                 cursor.execute('''
                     INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
                     VALUES (%s, %s, %s, %s, %s, 'HOLD');
                 ''', (target['code'], target['name'], st_type, today_str, target['close']))
-                print(f"🛒 [模擬買入成功] [{st_type}] {target['code']} {target['name']} | 價格: {target['close']}", flush=True)
+                print(f"🛒 [模擬買入] [{st_type}] {target['code']} {target['name']} | 價格: {target['close']}", flush=True)
 
     conn.commit()
-    
+
     # -------------------------------------------------------------------------
-    # C. 印出模擬倉戰績統計
+    # C. 平倉戰績統計 (固定每檔 10 萬元)
     # -------------------------------------------------------------------------
-    cursor.execute("SELECT return_rate FROM sim_trades WHERE status = 'CLOSED';")
+    cursor.execute("SELECT buy_price, sell_price, return_rate FROM sim_trades WHERE status = 'CLOSED';")
     closed_trades = cursor.fetchall()
     if closed_trades:
-        returns = [float(r[0]) for r in closed_trades]
-        wins = [r for r in returns if r > 0]
-        win_rate = (len(wins) / len(returns)) * 100
-        avg_ret = sum(returns) / len(returns)
+        total_pnl_dollars = 0
+        win_count = 0
+        total_count = len(closed_trades)
+
+        for buy_p, sell_p, ret in closed_trades:
+            buy_p, sell_p = float(buy_p), float(sell_p)
+            shares = int(100000 / buy_p)
+            pnl = (shares * sell_p) - (shares * buy_p)
+            total_pnl_dollars += pnl
+            if pnl > 0: win_count += 1
+
+        win_rate = (win_count / total_count) * 100
         print(f"\n==========================================", flush=True)
-        print(f"📊 【模擬倉總累計戰績】", flush=True)
-        print(f"🔹 已平倉筆數: {len(returns)} 筆", flush=True)
-        print(f"🔹 模擬勝率: {win_rate:.1f}%", flush=True)
-        print(f"🔹 平均每筆報酬率: {avg_ret:+.2f}%", flush=True)
+        print(f"📊 【模擬倉累計戰績 (每檔10萬)】", flush=True)
+        print(f"🔹 平倉筆數: {total_count} 筆", flush=True)
+        print(f"🔹 勝率: {win_rate:.1f}% ({win_count}勝 / {total_count - win_count}敗)", flush=True)
+        print(f"🔹 累計總損益: ${total_pnl_dollars:+,.0f} 元", flush=True)
         print(f"==========================================\n", flush=True)
 
     cursor.close()
