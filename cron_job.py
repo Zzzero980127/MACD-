@@ -106,7 +106,7 @@ def send_line_push(report_text):
 # 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
 
-# ⚡ 第一階段：快速技術面初篩（僅打 K 線 API）
+# ⚡ 第一階段：快速技術面初篩（僅打 K 線 API，含防丟封包重試）
 def check_technical_pass(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
@@ -121,65 +121,73 @@ def check_technical_pass(stock_info, current_idx, total_count):
         "token": FINMIND_TOKEN
     }
     
-    try:
-        res = http.get(api_url, params=params, timeout=6.0)
-        if res.status_code != 200 or not res.json().get("data"):
-            return None
-        
-        df = pd.DataFrame(res.json()["data"]).rename(
-            columns={'close': 'Close', 'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'}
-        )
-        for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    res = None
+    # 🛡️ 加入 3 次自動重試，避免網路波動或 402 造成漏抓
+    for retry in range(3):
+        try:
+            res = http.get(api_url, params=params, timeout=6.0)
+            if res.status_code == 200 and res.json().get("data"):
+                break
+            elif res.status_code == 402:
+                time.sleep(5.0)  # 遇頻率限制小等 5 秒
+        except Exception:
+            time.sleep(1.0)
             
-        df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
-        if len(df) < 35:
-            return None
-
-        # MACD & 均線
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['DIF'] = exp1 - exp2
-        df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['OSC'] = df['DIF'] - df['MACD']
-
-        df['MA5'] = df['Close'].rolling(window=5).mean()
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
-
-        latest = df.iloc[-1]
-        prev1 = df.iloc[-2]
-        prev2 = df.iloc[-3]
-        prev3 = df.iloc[-4]
-
-        osc_today = float(latest['OSC'])
-        osc_p1 = float(prev1['OSC'])
-        close_price = float(latest['Close'])
-        prev_close = float(prev1['Close'])
-        pct_change = ((close_price - prev_close) / prev_close) * 100
-
-        # 硬性技術面快速濾除門檻
-        if osc_today <= osc_p1:
-            return None  # MACD 未轉折直接淘汰
-
-        if pct_change > 6.5 or pct_change < -5.0:
-            return None  # 急跌或追高直接淘汰
-
-        print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過技術初篩 (漲跌: {pct_change:+.2f}%)，進入籌碼深度分析！", flush=True)
-
-        return {
-            "code": stock_id,
-            "name": stock_name,
-            "df": df,
-            "latest": latest,
-            "prev1": prev1,
-            "prev2": prev2,
-            "prev3": prev3,
-            "pct_change": pct_change,
-            "close_price": close_price
-        }
-    except Exception as e:
+    if not res or res.status_code != 200 or not res.json().get("data"):
         return None
+        
+    df = pd.DataFrame(res.json()["data"]).rename(
+        columns={'close': 'Close', 'Trading_Volume': 'Volume', 'max': 'High', 'min': 'Low', 'open': 'Open'}
+    )
+    for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+    df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
+    if len(df) < 35:
+        return None
+
+    # MACD & 均線
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = exp1 - exp2
+    df['MACD'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['OSC'] = df['DIF'] - df['MACD']
+
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['Vol_MA5'] = df['Volume'].rolling(window=5).mean()
+
+    latest = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    prev3 = df.iloc[-4]
+
+    osc_today = float(latest['OSC'])
+    osc_p1 = float(prev1['OSC'])
+    close_price = float(latest['Close'])
+    prev_close = float(prev1['Close'])
+    pct_change = ((close_price - prev_close) / prev_close) * 100
+
+    # 硬性技術面快速濾除門檻
+    if osc_today <= osc_p1:
+        return None  # MACD 未轉折直接淘汰
+
+    if pct_change > 6.5 or pct_change < -5.0:
+        return None  # 急跌或追高直接淘汰
+
+    print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過技術初篩 (漲跌: {pct_change:+.2f}%)，進入籌碼深度分析！", flush=True)
+
+    return {
+        "code": stock_id,
+        "name": stock_name,
+        "df": df,
+        "latest": latest,
+        "prev1": prev1,
+        "prev2": prev2,
+        "prev3": prev3,
+        "pct_change": pct_change,
+        "close_price": close_price
+    }
 
 # 🔍 第二階段：籌碼與綜合評分（僅對通過初篩者執行）
 def fetch_chip_and_score(tech_data):
@@ -315,30 +323,42 @@ def run_precalculation():
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
     # -------------------------------------------------------------------------
-    # 防護罩：預先檢查 FinMind 是否已更新「今日」數據
+    # 🛡️ 雙重穩固防護罩：多標的 (2330/2317/2454) 抽驗 FinMind 今日資料是否上架
     # -------------------------------------------------------------------------
     check_url = "https://api.finmindtrade.com/api/v4/data"
-    check_params = {
-        "dataset": "TaiwanStockPrice",
-        "data_id": "2330",
-        "start_date": today_date_str,
-        "token": FINMIND_TOKEN
-    }
+    sample_stocks = ["2330", "2317", "2454"]
+    data_ready = False
     
-    try:
-        check_res = http.get(check_url, params=check_params, timeout=8.0)
-        if check_res.status_code == 200 and check_res.json().get("data"):
-            latest_date_in_api = check_res.json()["data"][-1]["date"]
-            if latest_date_in_api != today_date_str:
-                print(f"🛑 [安全退場] FinMind 數據尚未更新至今日 ({today_date_str})！最新資料日期為: {latest_date_in_api}", flush=True)
-                return
-            else:
-                print(f"✅ [資料驗證通過] FinMind 今日 ({today_date_str}) 股價數據已上架，開始計算！", flush=True)
-        else:
-            print(f"🛑 [安全退場] 無法獲取 FinMind 今日最新數據，取消本次運算。", flush=True)
-            return
-    except Exception as check_e:
-        print(f"🛑 [安全退場] 防護檢查異常: {check_e}，中斷執行。", flush=True)
+    print(f"🔍 [防護檢查] 開始驗證 FinMind 今日 ({today_date_str}) 資料是否已完成上架...", flush=True)
+
+    for check_retry in range(3):
+        for stock_id in sample_stocks:
+            check_params = {
+                "dataset": "TaiwanStockPrice",
+                "data_id": stock_id,
+                "start_date": today_date_str,
+                "token": FINMIND_TOKEN
+            }
+            try:
+                check_res = http.get(check_url, params=check_params, timeout=6.0)
+                if check_res.status_code == 200 and check_res.json().get("data"):
+                    latest_date = check_res.json()["data"][-1]["date"]
+                    if latest_date == today_date_str:
+                        print(f"✅ [資料驗證成功] 抽驗 {stock_id} 成功！FinMind 今日 ({today_date_str}) 數據已上架，開始執行選股！", flush=True)
+                        data_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if data_ready:
+            break
+            
+        print(f"⏳ [防護等待] FinMind 資料尚未完備或連線忙碌，等待 10 秒後進行第 {check_retry+1}/3 次重試...", flush=True)
+        time.sleep(10.0)
+
+    if not data_ready:
+        print(f"🛑 [安全退場] FinMind 今日數據確定尚未上架完畢，為防誤算舊資料，安全終止本次執行。", flush=True)
         return
 
     # -------------------------------------------------------------------------
@@ -362,7 +382,8 @@ def run_precalculation():
                     except ValueError:
                         continue
             
-            df_stocks = pd.DataFrame(stocks).sort_values(by="volume", ascending=False)
+            # 加 Secondary Sort 確保排序 100% 固定
+            df_stocks = pd.DataFrame(stocks).sort_values(by=["volume", "code"], ascending=[False, True])
             candidates = df_stocks.head(200).to_dict('records')
             print(f"✅ [TWSE Log] 成功取得成交量前 200 大個股清單！", flush=True)
         else:
