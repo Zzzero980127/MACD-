@@ -106,7 +106,7 @@ def send_line_push(report_text):
 # 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
 
-# ⚡ 第一階段：快速技術面初篩（僅打 K 線 API，含防丟封包重試）
+# ⚡ 第一階段：快速技術面初篩（含完整即時 LOG 輸出）
 def check_technical_pass(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
     stock_name = stock_info["name"]
@@ -133,6 +133,7 @@ def check_technical_pass(stock_info, current_idx, total_count):
             time.sleep(1.0)
             
     if not res or res.status_code != 200 or not res.json().get("data"):
+        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 無資料或 API 異常，跳過", flush=True)
         return None
         
     df = pd.DataFrame(res.json()["data"]).rename(
@@ -143,6 +144,7 @@ def check_technical_pass(stock_info, current_idx, total_count):
         
     df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
     if len(df) < 35:
+        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] K線天數不足 35 天，跳過", flush=True)
         return None
 
     # MACD & 均線
@@ -169,12 +171,14 @@ def check_technical_pass(stock_info, current_idx, total_count):
 
     # 硬性技術面快速濾除門檻
     if osc_today <= osc_p1:
-        return None  # MACD 未轉折直接淘汰
+        print(f"  🔍 {prefix} [{stock_id} {stock_name}] MACD 未轉折，淘汰", flush=True)
+        return None  
 
     if pct_change > 6.5 or pct_change < -5.0:
-        return None  # 急跌或追高直接淘汰
+        print(f"  🔍 {prefix} [{stock_id} {stock_name}] 漲跌幅超過門檻 ({pct_change:+.2f}%)，淘汰", flush=True)
+        return None  
 
-    print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過技術初篩 (漲跌: {pct_change:+.2f}%)，進入籌碼深度分析！", flush=True)
+    print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過初篩 (漲跌: {pct_change:+.2f}%)，入圍！", flush=True)
 
     return {
         "code": stock_id,
@@ -188,7 +192,7 @@ def check_technical_pass(stock_info, current_idx, total_count):
         "close_price": close_price
     }
 
-# 🔍 第二階段：籌碼與綜合評分（僅對通過初篩者執行）
+# 🔍 第二階段：籌碼與綜合評分
 def fetch_chip_and_score(tech_data):
     stock_id = tech_data["code"]
     stock_name = tech_data["name"]
@@ -231,9 +235,7 @@ def fetch_chip_and_score(tech_data):
     except Exception as e:
         print(f"  ⚠️ [{stock_id} {stock_name}] 籌碼抓取失敗，以 0 計算: {e}", flush=True)
 
-    # ---------------------------------------------------------------------
     # 策略計算與計分
-    # ---------------------------------------------------------------------
     dif_today = float(latest['DIF'])
     osc_today = float(latest['OSC'])
     osc_p1 = float(prev1['OSC'])
@@ -320,9 +322,6 @@ def run_precalculation():
     print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
-    # -------------------------------------------------------------------------
-    # 取得證交所成交量前 200 大
-    # -------------------------------------------------------------------------
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
     
@@ -351,9 +350,6 @@ def run_precalculation():
         print(f"❌ [TWSE Log] 讀取失敗: {e}", flush=True)
         return
 
-    # -------------------------------------------------------------------------
-    # ⚡ 第一階段：200 檔技術面極速篩選 (只需 ~0.5 秒/檔)
-    # -------------------------------------------------------------------------
     print("--------------------------------------------------", flush=True)
     print("⚡ [Phase 1] 開始進行技術面形態極速初篩 (排除 MACD 未轉折/急漲跌)...", flush=True)
     tech_passed_list = []
@@ -367,9 +363,6 @@ def run_precalculation():
 
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
-    # -------------------------------------------------------------------------
-    # 🔍 第二階段：籌碼分析與評分 (僅分析通過初篩的 20~30 檔)
-    # -------------------------------------------------------------------------
     print("--------------------------------------------------", flush=True)
     print("🔍 [Phase 2] 開始對入圍個股進行法人籌碼深度分析...", flush=True)
     all_passed_stocks = []
@@ -380,9 +373,6 @@ def run_precalculation():
         print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
         time.sleep(0.5)
 
-    # -------------------------------------------------------------------------
-    # 🎯 雙策略分流與輸出
-    # -------------------------------------------------------------------------
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
     top_wash_breakout = wash_breakout_stocks[:5]
