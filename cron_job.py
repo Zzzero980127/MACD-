@@ -94,7 +94,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
-    price_url = "https://api.finmindtrade.com/api/v4/data"
+    api_url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockPrice",
         "data_id": stock_id,
@@ -102,7 +102,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     }
     
     try:
-        res_p = http.get(price_url, params=params, headers=headers, timeout=8.0)
+        res_p = http.get(api_url, params=params, headers=headers, timeout=8.0)
 
         if res_p.status_code != 200 or not res_p.json().get("data"):
             print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線 API 請求失敗 (HTTP {res_p.status_code})", flush=True)
@@ -172,7 +172,8 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev_foreign = 0
         today_trust = 0
 
-        res_c = http.get(price_url, params=chip_params, headers=headers, timeout=6.0)
+        # 🔑 修正點：使用正確的 api_url 與 chip_params，帶上完整 headers
+        res_c = http.get(api_url, params=chip_params, headers=headers, timeout=6.0)
 
         if res_c.status_code == 200 and res_c.json().get("data"):
             df_c = pd.DataFrame(res_c.json()["data"])
