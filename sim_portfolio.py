@@ -97,13 +97,22 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}%", flush=True)
 
         # -------------------------------------------------------------------------
-        # B. 週一至週三：直接抓歷史選股報表 (零 API 計算耗損)
+        # B. 週一至週三：獲利「前一交易日」歷史選股報表
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2]:
-            print("🛒 [模擬買進] 直接從庫存 LATEST 報表獲取今日標的...", flush=True)
-            cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
+            # 計算前一個交易日的 Date Key (例如 20260825)
+            yesterday_dt = datetime.datetime.now() - datetime.timedelta(days=3 if weekday == 0 else 1)
+            yesterday_str = yesterday_dt.strftime('%Y%m%d')
+
+            print(f"🛒 [模擬買進] 撈取前一交易日 ({yesterday_str}) 報表獲取買入標的...", flush=True)
+            cursor.execute("SELECT content FROM history WHERE date = %s;", (yesterday_str,))
             row = cursor.fetchone()
             
+            # 若撈不到前一日備份，退回讀取 LATEST
+            if not row or not row[0]:
+                cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
+                row = cursor.fetchone()
+
             if row and row[0]:
                 content = row[0]
                 lines = content.split('\n')
@@ -114,8 +123,8 @@ def process_simulation():
                     if "策略二" in line:
                         current_strategy = "策略二"
                     
-                    # 匹配格式如：1. 2330 台積電 ... 價格: 850.0元
-                    match = re.search(r'(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9]+).*?(\d+\.?\d*)元', line)
+                    # 🎯 精確修正：匹配格式 "🔹 2489 瑞軒 | 收: 22.50 (+1.20%)"
+                    match = re.search(r'🔹\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*收:\s*(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
                         buy_targets.append((code, name, price, current_strategy))
