@@ -78,12 +78,16 @@ def process_simulation():
             
             if res.get("data"):
                 df = pd.DataFrame(res["data"])
-                curr_price = float(df.iloc[-1]['close'])
+                
+                # 🎯 調整：早上 09:00 執行時，取倒數第二筆（即昨日收盤價）做結算，避免早盤未收盤數據影響
+                curr_price = float(df.iloc[-2]['close']) if len(df) >= 2 else float(df.iloc[-1]['close'])
                 
                 exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
                 exp2 = pd.to_numeric(df['close']).ewm(span=26, adjust=False).mean()
                 osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
-                osc_today, osc_p1 = float(osc.iloc[-1]), float(osc.iloc[-2])
+                
+                # 同理：讀取昨日與前日的 MACD 指標
+                osc_today, osc_p1 = float(osc.iloc[-2]), float(osc.iloc[-3]) if len(osc) >= 3 else (float(osc.iloc[-1]), float(osc.iloc[-2]))
 
                 ret = ((curr_price - buy_price) / buy_price) * 100
                 should_sell, exit_reason = False, ""
