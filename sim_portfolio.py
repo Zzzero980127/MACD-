@@ -3,6 +3,7 @@ import datetime
 import requests
 import pandas as pd
 import psycopg2
+import re
 
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -55,7 +56,7 @@ def process_simulation():
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1})", flush=True)
 
         # -------------------------------------------------------------------------
-        # A. 檢查當前持股 (止損 / MACD減弱 / 週四週五清倉)
+        # A. 檢查當前持股 (止損 -5% / MACD減弱 / 週四週五清倉)
         # -------------------------------------------------------------------------
         cursor.execute("SELECT id, stock_code, stock_name, buy_price FROM sim_trades WHERE status = 'HOLD';")
         holding_stocks = cursor.fetchall()
@@ -96,32 +97,30 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}%", flush=True)
 
         # -------------------------------------------------------------------------
-        # B. 週一至週三：直接讀取主選股結果 (零算力耗損)
+        # B. 週一至週三：直接抓歷史選股報表 (零 API 計算耗損)
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2]:
-            print("🛒 [模擬買進] 直接從歷史選股報表讀取今日標的...", flush=True)
+            print("🛒 [模擬買進] 直接從庫存 LATEST 報表獲取今日標的...", flush=True)
             cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
             row = cursor.fetchone()
             
             if row and row[0]:
                 content = row[0]
-                # 解析選股文字報表中的股票 (格式範例: 2330 台積電)
                 lines = content.split('\n')
-                current_strategy = "策略一(底部止跌)"
+                current_strategy = "策略一"
                 buy_targets = []
 
                 for line in lines:
-                    if "策略二" in line or "洗盤起漲" in line:
-                        current_strategy = "策略二(洗盤起漲)"
+                    if "策略二" in line:
+                        current_strategy = "策略二"
                     
-                    # 匹配股票代號與名稱 (如: 1. 2330 台積電 85.0元)
-                    import re
-                    match = re.search(r'(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9]+)\s+.*?(\d+\.?\d*)元', line)
+                    # 匹配格式如：1. 2330 台積電 ... 價格: 850.0元
+                    match = re.search(r'(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9]+).*?(\d+\.?\d*)元', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
                         buy_targets.append((code, name, price, current_strategy))
 
-                # 買入標的寫入模擬倉
+                # 寫入模擬倉資料庫
                 for code, name, price, st_type in buy_targets:
                     cursor.execute("SELECT id FROM sim_trades WHERE stock_code = %s AND buy_date = %s;", (code, today_str))
                     if not cursor.fetchone():
@@ -129,7 +128,7 @@ def process_simulation():
                             INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
                             VALUES (%s, %s, %s, %s, %s, 'HOLD');
                         ''', (code, name, st_type, today_str, price))
-                        print(f"🛒 [模擬買入] [{st_type}] {code} {name} | 價格: {price}", flush=True)
+                        print(f"🛒 [模擬買入] [{st_type}] {code} {name} | 成本價: ${price}", flush=True)
 
         conn.commit()
         cursor.close()
