@@ -5,7 +5,8 @@ import pandas as pd
 import psycopg2
 import re
 
-FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
+# 自動相容兩種常見的環境變數命名方式
+FINMIND_TOKEN = (os.environ.get('FINMIND_API_TOKEN') or os.environ.get('FINMIND_TOKEN', '')).strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 def get_db_connection():
@@ -72,9 +73,18 @@ def process_simulation():
             buy_dt = datetime.datetime.strptime(buy_date_str, '%Y-%m-%d')
             buy_weekday = buy_dt.weekday()
 
-            headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"} if FINMIND_TOKEN else {}
             start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
-            res = requests.get("https://api.finmindtrade.com/api/v4/data", params={"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}, headers=headers).json()
+            
+            # 🎯 核心修復：正確將 Token 帶入 URL params，避免觸發 402 免費版速率限制
+            params = {
+                "dataset": "TaiwanStockPrice",
+                "data_id": code,
+                "start_date": start_date
+            }
+            if FINMIND_TOKEN:
+                params["token"] = FINMIND_TOKEN
+
+            res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params).json()
             
             if res.get("data"):
                 df = pd.DataFrame(res["data"])
@@ -154,9 +164,9 @@ def process_simulation():
                         buy_targets = buy_targets[:1]
                     print(f"🔥 [週四短線精選] 鎖定週三最佳標的 {len(buy_targets)} 檔進場！", flush=True)
 
-                # 寫入模擬倉資料庫 (加入「當週買賣過即跳過」防護機制)
+                # 寫入模擬倉資料庫 (加入當週防護)
                 for code, name, price, st_type in buy_targets:
-                    # 🛡️ 檢查該個股在「本週（週一～今天）」是否曾有買入 (buy_date) 或賣出 (sell_date) 紀錄
+                    # 🛡️ 當週防護：若本週已買過或賣過該檔股票，則直接跳過
                     cursor.execute('''
                         SELECT id FROM sim_trades 
                         WHERE stock_code = %s 
