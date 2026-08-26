@@ -10,7 +10,7 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 # -----------------------------------------------------------------------------
-# 1. 環境變數設定與嚴格 Token 檢查 (防止無 Token 導致 IP 被鎖)
+# 1. 環境變數設定與嚴格 Token 檢查
 # -----------------------------------------------------------------------------
 FINMIND_TOKEN = os.environ.get('FINMIND_API_TOKEN', '').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
@@ -29,7 +29,6 @@ def create_robust_session():
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    # 帶上標準瀏覽器標頭，防 TWSE/FinMind 阻擋 Python requests
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     })
@@ -85,7 +84,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 核心個股分析 (僅使用 Token 呼叫 API)
+# 3. 核心個股分析
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
@@ -194,17 +193,15 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
 
         # ---------------------------------------------------------------------
         # 🎯 策略二專屬：防死貓跳與洗盤結束判定 (含條件一：0 軸防線)
-        # -----------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
         
-        # 條件一（0 軸防線）：OSC 必須已經翻紅 (> 0) 或 DIF 站在 0 軸以上，防止空頭綠柱內的假反彈
+        # 條件一（0 軸防線）：OSC 必須已經翻紅 (> 0) 或 DIF 站在 0 軸以上
         is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
         
-        # 外資買超反轉量能判定 (防死貓跳)
         if prev_foreign > 0:
             foreign_surge_valid = (today_foreign >= prev_foreign * 3)
         else:
-            # 若前日賣超，今日買超量必須大於前日賣超的絕對值
             foreign_surge_valid = (today_foreign > abs(prev_foreign))
 
         is_wash_breakout = (
@@ -216,23 +213,22 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         )
 
         # ---------------------------------------------------------------------
-        # 4. 基礎計分與 Tag 標記
+        # 4. 基礎計分與 Tag 標記 (加入綠柱極限止跌 V 轉高分權重)
         # ---------------------------------------------------------------------
         score = 50
         tags = []
 
-        # MACD 狀態精確比對
         if osc_today > 0 and osc_p1 <= 0:
             score += 15
             tags.append("💥綠轉紅第1天(金叉形成)")
         elif osc_today < 0 and osc_p1 < 0:
-        # 🎯 檢查是否符合【綠柱縮短 V 型止跌拐點】（今日 > 昨天 且 前天 > 昨天）
-        if (osc_today > osc_p1) and (osc_p2 > osc_p1):
-            score += 30  # 給予最高權重加分（見底訊號最強、獲利空間最大）
-            tags.append("📉綠柱極限止跌V轉")
-        elif osc_today < 0 and osc_p1 < 0:
-            score += 20
-            tags.append("📉綠柱止跌")
+            # 🎯 檢查是否符合【綠柱縮短 V 型止跌拐點】（今日 > 昨天 且 前天 > 昨天）
+            if (osc_today > osc_p1) and (osc_p2 > osc_p1):
+                score += 30  # 見底訊號最強，給予高權重加分
+                tags.append("📉綠柱極限止跌V轉")
+            else:
+                score += 20
+                tags.append("📉綠柱止跌")
         elif osc_today > 0 and osc_p1 > 0:
             tags.append("🔥紅柱延伸")
 
@@ -281,7 +277,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         return None
 
 # -----------------------------------------------------------------------------
-# 4. 主流程 (策略池互斥分流)
+# 4. 主流程
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
