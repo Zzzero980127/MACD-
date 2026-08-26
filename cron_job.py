@@ -6,6 +6,7 @@ from urllib3.util.retry import Retry
 import pandas as pd
 import datetime
 import psycopg2
+import fcntl  # Linux / Render 防重複執行鎖
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
@@ -17,8 +18,21 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
 if not FINMIND_TOKEN:
-    print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN！為防止無 Token 請求導致 IP 被封鎖，程式強制終止。", flush=True)
+    print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN！程式強制終止。", flush=True)
     exit(1)
+
+# -----------------------------------------------------------------------------
+# 🔒 防重複執行機制 (File Locking)
+# -----------------------------------------------------------------------------
+LOCK_FILE_PATH = "/tmp/cron_job.lock"
+lock_file = open(LOCK_FILE_PATH, "w")
+
+try:
+    # 嘗試取得非阻塞鎖，如果已有其他實例在跑，會直接失敗進入 except
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    print("⚠️ [Lock Log] 偵測到已有另一個選股程序正在執行中，自動終止本次執行以防重複刷 API！", flush=True)
+    exit(0)
 
 # -----------------------------------------------------------------------------
 # 2. 連線與工具函式
@@ -102,13 +116,13 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     }
     
     try:
-        # 🛡️ K線 API：遇到 402 自動冷卻重試機制
+        # 🛡️ K線 API：402 自動冷卻重試
         res_p = None
         for retry in range(3):
             res_p = http.get(api_url, params=params, timeout=8.0)
             if res_p.status_code == 402:
-                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 觸發頻率限制 (HTTP 402)，冷卻 8 秒後重試 ({retry+1}/3)...", flush=True)
-                time.sleep(8.0)
+                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 觸發頻率限制 (HTTP 402)，冷卻 15 秒後重試 ({retry+1}/3)...", flush=True)
+                time.sleep(15.0)
             else:
                 break
 
@@ -155,7 +169,6 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         vol_ma5 = float(latest['Vol_MA5'])
         pct_change = ((close_price - prev_close) / prev_close) * 100
 
-        # 通用初始門檻 (當日 OSC 轉折 + 防追高/急跌)
         if osc_today <= osc_p1:
             print(f"  🚫 {prefix} [{stock_id} {stock_name}] 濾除: MACD未轉折 (OSC {osc_today:.3f} <= 昨天 {osc_p1:.3f})", flush=True)
             return None
@@ -165,7 +178,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
             return None
 
         # ---------------------------------------------------------------------
-        # 籌碼面資料（三大法人與外資買超）
+        # 籌碼面資料
         # ---------------------------------------------------------------------
         time.sleep(0.5)
         chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
@@ -181,13 +194,13 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         prev_foreign = 0
         today_trust = 0
 
-        # 🛡️ 籌碼 API：遇到 402 自動冷卻重試機制
+        # 🛡️ 籌碼 API：402 自動冷卻重試
         res_c = None
         for retry in range(3):
             res_c = http.get(api_url, params=chip_params, timeout=6.0)
             if res_c.status_code == 402:
-                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 籌碼 API 觸發頻率限制 (HTTP 402)，冷卻 8 秒後重試 ({retry+1}/3)...", flush=True)
-                time.sleep(8.0)
+                print(f"  ⚠️ {prefix} [{stock_id} {stock_name}] 籌碼 API 觸發頻率限制 (HTTP 402)，冷卻 15 秒後重試 ({retry+1}/3)...", flush=True)
+                time.sleep(15.0)
             else:
                 break
 
@@ -209,11 +222,9 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
                     today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
         # ---------------------------------------------------------------------
-        # 🎯 策略二專屬：防死貓跳與洗盤結束判定 (含條件一：0 軸防線)
+        # 🎯 策略二專屬判定
         # ---------------------------------------------------------------------
         osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
-        
-        # 條件一（0 軸防線）：OSC 必須已經翻紅 (> 0) 或 DIF 站在 0 軸以上
         is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
         
         if prev_foreign > 0:
@@ -230,7 +241,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
         )
 
         # ---------------------------------------------------------------------
-        # 4. 基礎計分與 Tag 標記
+        # 計分與 Tag
         # ---------------------------------------------------------------------
         score = 50
         tags = []
