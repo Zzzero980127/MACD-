@@ -445,25 +445,10 @@ def run_precalculation():
     send_line_push(report)
 
     # -------------------------------------------------------------------------
-    # 🤖 自動觸發模擬倉下單與更新
+    # 🤖 模擬倉提示 (已解耦：模擬倉排程設定於隔日早上 09:00 獨立執行)
     # -------------------------------------------------------------------------
-    if sim_portfolio:
-        try:
-            print("\n🤖 [Sim Log] 開始連動執行模擬倉交易更新...", flush=True)
-            if hasattr(sim_portfolio, 'process_simulation'):
-                sim_portfolio.process_simulation()
-            elif hasattr(sim_portfolio, 'run_simulation'):
-                sim_portfolio.run_simulation()
-            elif hasattr(sim_portfolio, 'main'):
-                sim_portfolio.main()
-            else:
-                print("⚠️ [Sim Log] 找不到 sim_portfolio 的進入點函式", flush=True)
-        except Exception as e:
-            print(f"❌ [Sim Log] 模擬倉執行失敗: {e}", flush=True)
-    else:
-        print("⚠️ [Sim Log] 未偵測到 sim_portfolio.py，跳過模擬倉更新", flush=True)
-    
-    print("🎉 [Cron Job Log] 排程選股、推播與模擬倉更新全數完畢！", flush=True)
+    print("\n💡 [Sim Notice] 選股報告已寫入 DB (Key: LATEST)。模擬倉將於隔日 09:00 獨立讀取並執行交易。", flush=True)
+    print("🎉 [Cron Job Log] 排程選股與 LINE 推播全數完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
