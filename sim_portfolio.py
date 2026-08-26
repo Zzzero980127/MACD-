@@ -56,14 +56,21 @@ def process_simulation():
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1})", flush=True)
 
         # -------------------------------------------------------------------------
-        # A. 檢查當前持股 (止損 -5% / MACD減弱 / 週四週五清倉)
+        # A. 賣出邏輯：
+        # - 每日常規：-5% 止損 / MACD 減弱
+        # - 週四（weekday == 3）：清倉週一至週三買入的部位（確保週五交割款入帳）
+        # - 週五（weekday == 4）：清倉週四進場的短線部位
         # -------------------------------------------------------------------------
-        cursor.execute("SELECT id, stock_code, stock_name, buy_price FROM sim_trades WHERE status = 'HOLD';")
+        cursor.execute("SELECT id, stock_code, stock_name, buy_price, buy_date FROM sim_trades WHERE status = 'HOLD';")
         holding_stocks = cursor.fetchall()
 
         for item in holding_stocks:
-            trade_id, code, name, buy_price = item
+            trade_id, code, name, buy_price, buy_date_str = item
             buy_price = float(buy_price)
+
+            # 計算該持股是在週幾買進的
+            buy_dt = datetime.datetime.strptime(buy_date_str, '%Y-%m-%d')
+            buy_weekday = buy_dt.weekday()
 
             headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"} if FINMIND_TOKEN else {}
             start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
@@ -81,12 +88,17 @@ def process_simulation():
                 ret = ((curr_price - buy_price) / buy_price) * 100
                 should_sell, exit_reason = False, ""
 
+                # 判定賣出條件
                 if ret <= -5.0:
                     should_sell, exit_reason = True, "🚨 大跌觸發止損 (-5%)"
                 elif osc_today < osc_p1:
                     should_sell, exit_reason = True, "📉 MACD多頭減弱出場"
-                elif weekday in [3, 4]:
-                    should_sell, exit_reason = True, f"📅 週{weekday + 1}例行清倉結算"
+                elif weekday == 3 and buy_weekday in [0, 1, 2]:
+                    # 週四例行清倉（出清週一～週三持股）
+                    should_sell, exit_reason = True, "📅 週四結算週一至週三持股（T+2週五入帳）"
+                elif weekday == 4 and buy_weekday == 3:
+                    # 週五例行清倉（出清週四進場的短線股）
+                    should_sell, exit_reason = True, "📅 週五週末結算週四短線持股"
 
                 if should_sell:
                     cursor.execute('''
@@ -94,13 +106,14 @@ def process_simulation():
                         SET sell_date = %s, sell_price = %s, return_rate = %s, status = 'CLOSED', exit_reason = %s
                         WHERE id = %s;
                     ''', (today_str, curr_price, ret, exit_reason, trade_id))
-                    print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}%", flush=True)
+                    print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # B. 週一至週三：獲利「前一交易日」歷史選股報表
+        # B. 買進邏輯：
+        # 週一至週四（weekday 0~3）皆買進前一日選股
+        # 週四（weekday 3，對應週三選股）採用「精選短線標的」機制
         # -------------------------------------------------------------------------
-        if weekday in [0, 1, 2]:
-            # 計算前一個交易日的 Date Key (例如 20260825)
+        if weekday in [0, 1, 2, 3]:
             yesterday_dt = datetime.datetime.now() - datetime.timedelta(days=3 if weekday == 0 else 1)
             yesterday_str = yesterday_dt.strftime('%Y%m%d')
 
@@ -108,7 +121,6 @@ def process_simulation():
             cursor.execute("SELECT content FROM history WHERE date = %s;", (yesterday_str,))
             row = cursor.fetchone()
             
-            # 若撈不到前一日備份，退回讀取 LATEST
             if not row or not row[0]:
                 cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
                 row = cursor.fetchone()
@@ -120,20 +132,29 @@ def process_simulation():
                 buy_targets = []
 
                 for line in lines:
-                    # 🎯 精確策略切換：完整捕捉數字 (1/2) 與中文 (一/二)
+                    # 🎯 精確相容阿拉伯數字 (1/2) 與國字 (一/二) 的策略標籤切換
                     if "策略二" in line or "策略2" in line:
                         current_strategy = "策略二"
                     elif "策略一" in line or "策略1" in line:
                         current_strategy = "策略一"
                     
-                    # 🎯 解析標的格式：
-                    # 相容 • 2330 台積電 | 現價: $980.00 與 🔹 2489 瑞軒 | 收: 22.50
+                    # 🎯 完整正則解析：相容 • 與 🔹 前綴符號
                     match = re.search(r'[•🔹]\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
                         buy_targets.append((code, name, price, current_strategy))
 
-                # 寫入模擬仓資料庫
+                # 🎯 週四買進（週三選股）精選邏輯：
+                # 優先挑選洗盤結束的「策略二」，最多 2 檔；若無策略二，則僅取「策略一」的第一檔（高勝率標的）
+                if weekday == 3:
+                    st2_targets = [t for t in buy_targets if t[3] == "策略二"]
+                    if st2_targets:
+                        buy_targets = st2_targets[:2]
+                    else:
+                        buy_targets = buy_targets[:1]
+                    print(f"🔥 [週四短線精選] 鎖定週三最佳標的 {len(buy_targets)} 檔進場！", flush=True)
+
+                # 寫入模擬倉資料庫
                 for code, name, price, st_type in buy_targets:
                     cursor.execute("SELECT id FROM sim_trades WHERE stock_code = %s AND buy_date = %s;", (code, today_str))
                     if not cursor.fetchone():
