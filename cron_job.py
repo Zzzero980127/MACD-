@@ -82,7 +82,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] 推播失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 兩階段精準個股分析 (不漏抓、Timeout 放寬至 10 秒)
+# 3. 兩階段精準個股分析
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
@@ -101,13 +101,10 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     }
     
     res_p = None
-    for attempt in range(2):
-        try:
-            res_p = http.get(api_url, params=params_k, timeout=10.0) # 放寬連線上限至 10 秒
-            if res_p.status_code == 200: break
-            time.sleep(1.0)
-        except Exception:
-            time.sleep(1.0)
+    try:
+        res_p = http.get(api_url, params=params_k, timeout=8.0)
+    except Exception:
+        pass
 
     if not res_p or res_p.status_code != 200 or not res_p.json().get("data"):
         print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線讀取失敗 (HTTP {res_p.status_code if res_p else 'Timeout'})", flush=True)
@@ -153,6 +150,9 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     if osc_today <= osc_p1 or pct_change > 6.5 or pct_change < -5.0:
         return None
 
+    # 第一關通過後，緩衝 0.5 秒再抓籌碼
+    time.sleep(0.5)
+
     # --- 階段二：籌碼數據請求 ---
     chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
     params_chip = {
@@ -165,13 +165,10 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     today_total, today_foreign, prev_foreign, today_trust = 0, 0, 0, 0
     
     res_c = None
-    for attempt in range(2):
-        try:
-            res_c = http.get(api_url, params=params_chip, timeout=10.0) # 放寬連線上限至 10 秒
-            if res_c.status_code == 200: break
-            time.sleep(1.0)
-        except Exception:
-            time.sleep(1.0)
+    try:
+        res_c = http.get(api_url, params=params_chip, timeout=8.0)
+    except Exception:
+        pass
 
     if res_c and res_c.status_code == 200 and res_c.json().get("data"):
         df_c = pd.DataFrame(res_c.json()["data"])
@@ -297,7 +294,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(0.3)
+        time.sleep(0.8)  # 👈 保持 0.8 秒平穩請求，絕不被黑名單封鎖
 
     # 雙策略分類
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
