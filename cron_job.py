@@ -355,3 +355,5 @@ def run_precalculation():
 
 if __name__ == "__main__":
     run_precalculation()
+    import clean_db
+    clean_db.clean_specific_stocks()
