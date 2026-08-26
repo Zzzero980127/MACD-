@@ -10,6 +10,12 @@ import fcntl  # Linux / Render 防重複執行鎖
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
+# 🤖 匯入模擬倉模組
+try:
+    import sim_portfolio
+except ImportError:
+    sim_portfolio = None
+
 # -----------------------------------------------------------------------------
 # 1. 環境變數設定與嚴格 Token 檢查
 # -----------------------------------------------------------------------------
@@ -28,7 +34,6 @@ LOCK_FILE_PATH = "/tmp/cron_job.lock"
 lock_file = open(LOCK_FILE_PATH, "w")
 
 try:
-    # 嘗試取得非阻塞鎖，如果已有其他實例在跑，會直接失敗進入 except
     fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except IOError:
     print("⚠️ [Lock Log] 偵測到已有另一個選股程序正在執行中，自動終止本次執行以防重複刷 API！", flush=True)
@@ -406,8 +411,28 @@ def run_precalculation():
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
     send_line_push(report)
+
+    # -------------------------------------------------------------------------
+    # 🤖 自動觸發模擬倉下單與更新
+    # -------------------------------------------------------------------------
+    if sim_portfolio:
+        try:
+            print("\n🤖 [Sim Log] 開始連動執行模擬倉交易更新...", flush=True)
+            # 自動呼叫 sim_portfolio 的主要進入點 (嘗試常用函式名)
+            if hasattr(sim_portfolio, 'run_simulation'):
+                sim_portfolio.run_simulation()
+            elif hasattr(sim_portfolio, 'main'):
+                sim_portfolio.main()
+            elif hasattr(sim_portfolio, 'run_trade'):
+                sim_portfolio.run_trade()
+            else:
+                print("⚠️ [Sim Log] 找不到 sim_portfolio 的進入點函式 (請確認 sim_portfolio.py 內是否有 run_simulation/main 函式)", flush=True)
+        except Exception as e:
+            print(f"❌ [Sim Log] 模擬倉執行失敗: {e}", flush=True)
+    else:
+        print("⚠️ [Sim Log] 未偵測到 sim_portfolio.py，跳過模擬倉更新", flush=True)
     
-    print("🎉 [Cron Job Log] 排程選股與推播全數完畢！", flush=True)
+    print("🎉 [Cron Job Log] 排程選股、推播與模擬倉更新全數完畢！", flush=True)
 
 if __name__ == "__main__":
     run_precalculation()
