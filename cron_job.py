@@ -40,7 +40,7 @@ except IOError:
 # -----------------------------------------------------------------------------
 def create_robust_session():
     session = requests.Session()
-    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+    retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -56,7 +56,7 @@ def get_db_connection():
             sep = "&" if "?" in url else "?"
             url += f"{sep}sslmode=require"
         return psycopg2.connect(url, connect_timeout=10)
-    except Exception as e:
+    except Exception:
         return None
 
 def save_to_db(report_text, date_str="LATEST"):
@@ -82,7 +82,7 @@ def send_line_push(report_text):
         print(f"❌ [LINE Log] 推播失敗: {e}", flush=True)
 
 # -----------------------------------------------------------------------------
-# 3. 兩階段精準個股分析 (不漏抓、不浪費 API)
+# 3. 兩階段精準個股分析 (不漏抓、Timeout 放寬至 10 秒)
 # -----------------------------------------------------------------------------
 def fetch_finmind_data(stock_info, current_idx, total_count):
     stock_id = stock_info["code"]
@@ -103,11 +103,11 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     res_p = None
     for attempt in range(2):
         try:
-            res_p = http.get(api_url, params=params_k, timeout=4.0)
+            res_p = http.get(api_url, params=params_k, timeout=10.0) # 放寬連線上限至 10 秒
             if res_p.status_code == 200: break
-            time.sleep(0.5)
+            time.sleep(1.0)
         except Exception:
-            time.sleep(0.5)
+            time.sleep(1.0)
 
     if not res_p or res_p.status_code != 200 or not res_p.json().get("data"):
         print(f"  ❌ {prefix} [{stock_id} {stock_name}] K線讀取失敗 (HTTP {res_p.status_code if res_p else 'Timeout'})", flush=True)
@@ -122,7 +122,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     df = df.dropna(subset=['Close', 'Volume'])
     if len(df) < 35: return None
 
-    # 指標技術面計算
+    # 技術指標計算
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['DIF'] = exp1 - exp2
@@ -149,11 +149,11 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
     vol_ma5 = float(latest['Vol_MA5'])
     pct_change = ((close_price - prev_close) / prev_close) * 100
 
-    # 🛑 技術面第一關快速攔截 (不合條件就直接結束，省下籌碼 API 次數)
+    # 🛑 技術面第一關攔截
     if osc_today <= osc_p1 or pct_change > 6.5 or pct_change < -5.0:
         return None
 
-    # --- 階段二：籌碼數據請求 (僅對技術面合格股票發起) ---
+    # --- 階段二：籌碼數據請求 ---
     chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
     params_chip = {
         "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
@@ -164,15 +164,14 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
 
     today_total, today_foreign, prev_foreign, today_trust = 0, 0, 0, 0
     
-    # 精密重試，確保籌碼不漏抓
     res_c = None
     for attempt in range(2):
         try:
-            res_c = http.get(api_url, params=params_chip, timeout=4.0)
+            res_c = http.get(api_url, params=params_chip, timeout=10.0) # 放寬連線上限至 10 秒
             if res_c.status_code == 200: break
-            time.sleep(0.5)
+            time.sleep(1.0)
         except Exception:
-            time.sleep(0.5)
+            time.sleep(1.0)
 
     if res_c and res_c.status_code == 200 and res_c.json().get("data"):
         df_c = pd.DataFrame(res_c.json()["data"])
@@ -190,7 +189,7 @@ def fetch_finmind_data(stock_info, current_idx, total_count):
                 prev_foreign = float(daily_chip.iloc[-2]['foreign_net'])
                 today_trust = float(daily_chip.iloc[-1]['trust_net'])
 
-    # 策略判定與計分
+    # 策略評分邏輯
     osc_3day_declining = (osc_p3 > osc_p2) and (osc_p2 > osc_p1)
     is_above_zero_axis = (osc_today > 0) or (dif_today > 0)
     
@@ -270,7 +269,7 @@ def run_precalculation():
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     try:
-        res = http.get(twse_url, timeout=8)
+        res = http.get(twse_url, timeout=10)
         if res.status_code == 200:
             stocks = []
             for item in res.json():
@@ -298,7 +297,7 @@ def run_precalculation():
         res = fetch_finmind_data(stock_info, idx, total_candidates)
         if res:
             all_passed_stocks.append(res)
-        time.sleep(0.2)  # 輕量間隔
+        time.sleep(0.3)
 
     # 雙策略分類
     wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
@@ -345,7 +344,7 @@ def run_precalculation():
     save_to_db(report, today_str)
     send_line_push(report)
 
-    # 連動模擬倉
+    # 🤖 自動更新模擬倉
     if sim_portfolio:
         try:
             print("\n🤖 [Sim Log] 開始執行模擬倉交易更新...", flush=True)
@@ -354,7 +353,7 @@ def run_precalculation():
             elif hasattr(sim_portfolio, 'run_trade'): sim_portfolio.run_trade()
         except Exception as e:
             print(f"❌ [Sim Log] 模擬倉執行失敗: {e}", flush=True)
-    
+
     print("🎉 [Cron Job Log] 排程與模擬倉完畢！", flush=True)
 
 if __name__ == "__main__":
