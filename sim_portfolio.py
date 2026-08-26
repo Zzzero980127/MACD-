@@ -120,16 +120,20 @@ def process_simulation():
                 buy_targets = []
 
                 for line in lines:
-                    if "策略二" in line:
+                    # 🎯 精確策略切換：完整捕捉數字 (1/2) 與中文 (一/二)
+                    if "策略二" in line or "策略2" in line:
                         current_strategy = "策略二"
+                    elif "策略一" in line or "策略1" in line:
+                        current_strategy = "策略一"
                     
-                    # 🎯 精確修正：匹配格式 "🔹 2489 瑞軒 | 收: 22.50 (+1.20%)"
-                    match = re.search(r'🔹\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*收:\s*(\d+\.?\d*)', line)
+                    # 🎯 解析標的格式：
+                    # 相容 • 2330 台積電 | 現價: $980.00 與 🔹 2489 瑞軒 | 收: 22.50
+                    match = re.search(r'[•🔹]\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
                         buy_targets.append((code, name, price, current_strategy))
 
-                # 寫入模擬倉資料庫
+                # 寫入模擬仓資料庫
                 for code, name, price, st_type in buy_targets:
                     cursor.execute("SELECT id FROM sim_trades WHERE stock_code = %s AND buy_date = %s;", (code, today_str))
                     if not cursor.fetchone():
