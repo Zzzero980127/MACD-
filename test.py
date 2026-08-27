@@ -12,18 +12,18 @@ def test_sync():
         return msg
 
     try:
-        # 1. 金鑰解析
+        # 1. 金鑰處理
         creds_raw = GOOGLE_CREDS_JSON.replace('\\n', '\n')
         creds_dict = json.loads(creds_raw, strict=False)
 
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
 
-        # 2. 連線 Google Sheets
+        # 2. 開啟指定試算表的第一個工作表 (工作表1)
         gc = gspread.service_account_from_dict(creds_dict)
-        sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").sheet1
+        sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").get_worksheet(0)
 
-        # 3. 純粹寫入固定測試資料
+        # 3. 寫入測試資料
         test_row = [
             datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), # 結算日期
             10,       # 交易總筆數
