@@ -137,9 +137,9 @@ def get_sim_portfolio_report():
 
                 hold_lines_temp.append(
                     f"🔹 {code} {name} ({st_type[:3]})\n"
-                    f"   📅 買入: {buy_date} | 成本: ${buy_price:.2f}\n"
-                    f"   📈 現價: ${curr_price:.2f} | 股數: {shares:,}股\n"
-                    f"   👉 損益: {emoji} {sign}${pnl_dollars:,.0f} ({sign}{pnl_pct:.2f}%)"
+                    f"    📅 買入: {buy_date} | 成本: ${buy_price:.2f}\n"
+                    f"    📈 現價: ${curr_price:.2f} | 股數: {shares:,}股\n"
+                    f"    👉 損益: {emoji} {sign}${pnl_dollars:,.0f} ({sign}{pnl_pct:.2f}%)"
                 )
 
             # 計算當前持股統計
@@ -335,13 +335,6 @@ def handle_message(event):
             "4. 輸入「8位西元年日期」(如 20260825)：查詢歷史選股紀錄"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
-
-from test import test_sync
-
-@app.route('/test')
-def trigger_test():
-    test_sync()
-    return "✅ 測試指令已發送！請去 Google 試算表確認是否有新資料。", 200
 
 if __name__ == "__main__":
     update_stock_map()
