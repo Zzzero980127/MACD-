@@ -172,6 +172,19 @@ def check_technical_pass(stock_info, current_idx, total_count):
         print(f"  🔍 {prefix} [{stock_id} {stock_name}] 漲跌幅過大 ({pct_change:+.2f}%)，淘汰", flush=True)
         return None  
 
+    # 🛑 新增：上影線過長檢測（第一階段直接淘汰極端上影線）
+    high_p = float(latest['High'])
+    low_p = float(latest['Low'])
+    open_p = float(latest['Open'])
+    
+    total_range = high_p - low_p
+    upper_shadow = high_p - max(open_p, close_price)
+    
+    # 若當日上影線佔總波幅超過 60%，代表衝高大回吐，直接淘汰
+    if total_range > 0 and (upper_shadow / total_range) > 0.60:
+        print(f"  🔍 {prefix} [{stock_id} {stock_name}] 衝高大砸盤(上影線過長: {(upper_shadow/total_range)*100:.1f}%)，淘汰", flush=True)
+        return None
+
     print(f"  🎯 {prefix} [{stock_id} {stock_name}] 通過初篩 (漲跌: {pct_change:+.2f}%)，入圍！", flush=True)
 
     return {
@@ -299,6 +312,20 @@ def fetch_chip_and_score(tech_data):
         score += 20
         tags.append("⚡洗盤結束起漲")
 
+    # 🛑 新增：中度上影線扣分機制（大幅扣分 -30 分，避免高檔套牢股高居第一名）
+    high_p = float(latest['High'])
+    low_p = float(latest['Low'])
+    open_p = float(latest['Open'])
+    
+    total_range = high_p - low_p
+    upper_shadow = high_p - max(open_p, close_price)
+    
+    if total_range > 0:
+        shadow_ratio = upper_shadow / total_range
+        if shadow_ratio >= 0.40:
+            score -= 30
+            tags.append("⚠️留長上影線(-30分)")
+
     return {
         "code": stock_id,
         "name": stock_name,
@@ -345,7 +372,7 @@ def run_precalculation():
         return
 
     print("--------------------------------------------------", flush=True)
-    print("⚡ [Phase 1] 開始進行技術面形態極速初篩 (排除 MACD 未轉折/急漲跌)...", flush=True)
+    print("⚡ [Phase 1] 開始進行技術面形態極速初篩 (排除 MACD 未轉折/急漲跌/極端上影線)...", flush=True)
     tech_passed_list = []
     total_candidates = len(candidates)
 
@@ -359,7 +386,7 @@ def run_precalculation():
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
     print("--------------------------------------------------", flush=True)
-    print("🔍 [Phase 2] 開始對入圍個股進行法人籌碼深度分析...", flush=True)
+    print("🔍 [Phase 2] 開始對入圍個股進行法人籌碼深度分析與扣分評估...", flush=True)
     all_passed_stocks = []
 
     for idx, tech_data in enumerate(tech_passed_list, 1):
