@@ -123,7 +123,9 @@ def process_simulation():
         # -------------------------------------------------------------------------
         # B. 買進邏輯：
         # 週一至週三（weekday 0~2）：策略一與策略二各買入前五名 (最多 10 檔)
-        # 週四（weekday 3，對應週三選股）：優先策略二前2名，若無則策略一第1名
+        # 週四（weekday 3，對應週三選股）：
+        #   - 策略二需 >= 100 分（同分全買）
+        #   - 若策略二無達標標的，改買策略一前 3 名
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2, 3]:
             yesterday_dt = datetime.datetime.now() - datetime.timedelta(days=3 if weekday == 0 else 1)
@@ -149,29 +151,42 @@ def process_simulation():
                     elif "策略一" in line or "策略1" in line:
                         current_strategy = "策略一"
                     
+                    # 抓取：代號, 名稱, 價格, 分數(若有)
                     match = re.search(r'[•🔹]\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
-                        raw_targets.append((code, name, price, current_strategy))
+                        
+                        # 從行內嘗試解析分數 (格式如: 100分, 105 pts, 分數:100)
+                        score_match = re.search(r'(\d+)\s*(?:分|pts)', line)
+                        score = int(score_match.group(1)) if score_match else 0
+                        
+                        raw_targets.append((code, name, price, current_strategy, score))
 
                 buy_targets = []
 
                 # 週一至週三買進：兩個策略各前 5 名全買 (最多 10 檔)
                 if weekday in [0, 1, 2]:
-                    st1_targets = [t for t in raw_targets if t[3] == "策略一"][:5]
-                    st2_targets = [t for t in raw_targets if t[3] == "策略二"][:5]
+                    st1_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略一"][:5]
+                    st2_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略二"][:5]
                     buy_targets = st1_targets + st2_targets
                     print(f"🔥 [週一~週三正常建倉] 鎖定策略一 ({len(st1_targets)}檔) + 策略二 ({len(st2_targets)}檔) 準備進場！", flush=True)
 
-                # 週四買進（週三選股）：優先策略二前2名，若無則策略一第1名
+                # 週四買進（週三選股）新精選邏輯：
                 elif weekday == 3:
-                    st2_targets = [t for t in raw_targets if t[3] == "策略二"]
-                    if st2_targets:
-                        buy_targets = st2_targets[:2]
+                    # 1. 篩選策略二且分數 >= 100 的標的
+                    st2_qualified = [t for t in raw_targets if t[3] == "策略二" and t[4] >= 100]
+
+                    if st2_qualified:
+                        # 找出最高分數
+                        max_score = max(t[4] for t in st2_qualified)
+                        # 買入所有達到最高分的標的 (最高分同分者全買)
+                        buy_targets = [(t[0], t[1], t[2], t[3]) for t in st2_qualified if t[4] == max_score]
+                        print(f"🔥 [週四短線精選] 策略二有 {len(buy_targets)} 檔達 100 分以上 (最高分: {max_score})，同分全數進場！", flush=True)
                     else:
-                        st1_targets = [t for t in raw_targets if t[3] == "策略一"]
-                        buy_targets = st1_targets[:1]
-                    print(f"🔥 [週四短線精選] 鎖定週三最佳標的 {len(buy_targets)} 檔進場！", flush=True)
+                        # 2. 若策略二無達 100 分標的，改買策略一前 3 名
+                        st1_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略一"]
+                        buy_targets = st1_targets[:3]
+                        print(f"⚠️ [週四短線精選] 策略二無標的達 100 分，啟動備案：買入策略一前 {len(buy_targets)} 名！", flush=True)
 
                 # 寫入模擬倉資料庫 (加入當週防護 + 採用前日收盤價當做掛單買入成本)
                 for code, name, price, st_type in buy_targets:
