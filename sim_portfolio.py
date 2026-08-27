@@ -40,7 +40,7 @@ def get_0050_weekly_return():
     return 0.0
 
 def sync_to_google_sheets(summary_data):
-    """將每週五結算戰報寫入 Google Sheets"""
+    """將每週五結算戰報（含風報比與 0050 比對）寫入 Google Sheets"""
     if not GOOGLE_CREDS_JSON:
         print("⚠️ 未設定 GOOGLE_CREDS_JSON 環境變數，跳過雲端同步", flush=True)
         return
@@ -49,6 +49,16 @@ def sync_to_google_sheets(summary_data):
         gc = gspread.service_account_from_dict(creds_dict)
         sh = gc.open("AI模擬倉週績效紀錄表").sheet1
         
+        # 計算當週模擬倉整體投報率 (%)：當週損益 / (平倉筆數 * 10萬)
+        weekly_trades_count = summary_data.get('weekly_trades_count', 1)
+        invested_capital = max(weekly_trades_count * 100000, 100000)
+        sim_weekly_return_pct = (summary_data['weekly_pnl'] / invested_capital) * 100
+
+        # 判定是否擊敗 0050
+        is_beat = "🏆 贏過0050" if sim_weekly_return_pct > summary_data['benchmark_0050'] else "❌ 落後0050"
+
+        # 寫入 12 個欄位：
+        # [日期, 總筆數, 勝, 敗, 勝率, 週損益, 累計損益, 均賺%, 均賠%, 風報比, 0050漲跌%, 是否擊敗0050]
         row = [
             summary_data['date'],
             summary_data['total'],
@@ -60,10 +70,11 @@ def sync_to_google_sheets(summary_data):
             f"{summary_data['avg_win']:.2f}%",
             f"{summary_data['avg_loss']:.2f}%",
             summary_data['risk_reward_ratio'],
-            f"{summary_data['benchmark_0050']:+.2f}%"
+            f"{summary_data['benchmark_0050']:+.2f}%",
+            is_beat  # 👈 新增此對照欄位
         ]
         sh.append_row(row)
-        print("📊 [Google Sheets] 已成功將週結算與0050對照數據同步至雲端！", flush=True)
+        print(f"📊 [Google Sheets] 已同步戰報至雲端！結果：{is_beat} (模擬倉週報酬: {sim_weekly_return_pct:+.2f}% vs 0050: {summary_data['benchmark_0050']:+.2f}%)", flush=True)
     except Exception as e:
         print(f"❌ [Google Sheets API 錯誤] {e}", flush=True)
 
@@ -95,7 +106,7 @@ def init_sim_db():
 
 def process_simulation():
     now = datetime.datetime.now()
-    weekday = now.weekday() # 0: Mon, 4: Fri
+    weekday = now.weekday()
     today_str = now.strftime('%Y-%m-%d')
     conn = get_db_connection()
     if not conn: return
@@ -105,7 +116,7 @@ def process_simulation():
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1})", flush=True)
 
         # -------------------------------------------------------------------------
-        # A. 賣出與平倉邏輯
+        # A. 賣出邏輯
         # -------------------------------------------------------------------------
         cursor.execute("SELECT id, stock_code, stock_name, buy_price, buy_date FROM sim_trades WHERE status = 'HOLD';")
         holding_stocks = cursor.fetchall()
@@ -126,7 +137,6 @@ def process_simulation():
             
             if res.get("data") and len(res["data"]) >= 2:
                 df = pd.DataFrame(res["data"])
-                # 修正：直接抓最後一筆（當天最新收盤價）
                 curr_price = float(df.iloc[-1]['close'])
                 
                 exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
@@ -156,7 +166,7 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # 週五結算邏輯：分別計算「當週損益」與「累計總損益」
+        # 週五結算邏輯
         # -------------------------------------------------------------------------
         if weekday == 4:
             cursor.execute("SELECT buy_price, sell_price, return_rate, sell_date FROM sim_trades WHERE status = 'CLOSED';")
@@ -176,16 +186,11 @@ def process_simulation():
                 
                 rrr = round(avg_win / avg_loss, 2) if avg_loss > 0 else (round(avg_win, 2) if avg_win > 0 else 0.0)
                 
-                # 計算歷史總損益
                 total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
                 
-                # 修正：精準計算「本週（近 7 天內）」平倉的損益
                 week_start_dt = (now - datetime.timedelta(days=6)).strftime('%Y-%m-%d')
-                weekly_pnl = sum(
-                    ((float(t[1]) - float(t[0])) / float(t[0])) * 100000 
-                    for t in closed_trades 
-                    if t[3] and t[3] >= week_start_dt
-                )
+                weekly_trades = [t for t in closed_trades if t[3] and t[3] >= week_start_dt]
+                weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in weekly_trades)
 
                 benchmark_0050 = get_0050_weekly_return()
 
@@ -200,7 +205,8 @@ def process_simulation():
                     "avg_win": avg_win,
                     "avg_loss": avg_loss,
                     "risk_reward_ratio": rrr,
-                    "benchmark_0050": benchmark_0050
+                    "benchmark_0050": benchmark_0050,
+                    "weekly_trades_count": len(weekly_trades) # 用於計算當週投入資本與報酬%
                 }
                 sync_to_google_sheets(summary)
 
@@ -208,7 +214,6 @@ def process_simulation():
         # B. 買進邏輯
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2, 3]:
-            # 修正日期抓取：優先使用 LATEST 報表
             cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
             row = cursor.fetchone()
 
@@ -222,7 +227,6 @@ def process_simulation():
                 st1_idx = st1_pos.start() if st1_pos else -1
                 st2_idx = st2_pos.start() if st2_pos else -1
 
-                # 優化正則表達式，嚴格限縮單行或區塊避免價格抓錯
                 lines = content.split('\n')
                 for line in lines:
                     match = re.search(r'(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)', line)
@@ -236,7 +240,7 @@ def process_simulation():
                         line_pos = content.find(line)
                         strategy = "策略二" if (st2_idx != -1 and line_pos >= st2_idx) else "策略一"
 
-                        score_match = re.search(r'(\d+)\s*(?:分|pts|pts)', line, re.IGNORECASE)
+                        score_match = re.search(r'(\d+)\s*(?:分|pts)', line, re.IGNORECASE)
                         score = int(score_match.group(1)) if score_match else 0
                         
                         raw_targets.append((code, name, price, strategy, score))
