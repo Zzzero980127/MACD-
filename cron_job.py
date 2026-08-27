@@ -100,6 +100,32 @@ def send_line_push(report_text):
     except Exception as e:
         print(f"❌ [LINE Log] LINE 推播發送失敗: {e}", flush=True)
 
+# 全市場主力數據拉取工具 (一次 Request 解決全場)
+def fetch_market_major_holders():
+    api_url = "https://api.finmindtrade.com/api/v4/data"
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    params = {
+        "dataset": "TaiwanStockMarketShareholding",
+        "start_date": today_str,
+        "token": FINMIND_TOKEN
+    }
+    major_dict = {}
+    try:
+        res = http.get(api_url, params=params, timeout=8.0)
+        if res.status_code == 200 and res.json().get("data"):
+            for item in res.json()["data"]:
+                stock_id = item.get("stock_id")
+                # 買賣超張數計算
+                buy_vol = float(item.get("buy", 0)) / 1000
+                sell_vol = float(item.get("sell", 0)) / 1000
+                net_vol = buy_vol - sell_vol
+                if stock_id:
+                    major_dict[stock_id] = net_vol
+            print(f"✅ [Market Log] 成功批次讀取全市場 {len(major_dict)} 檔主力籌碼資料！", flush=True)
+    except Exception as e:
+        print(f"⚠️ [Market Log] 批次讀取主力籌碼失敗，將降級為標準模式: {e}", flush=True)
+    return major_dict
+
 # -----------------------------------------------------------------------------
 # 3. 兩階段核心個股分析
 # -----------------------------------------------------------------------------
@@ -172,7 +198,7 @@ def check_technical_pass(stock_info, current_idx, total_count):
         print(f"  🔍 {prefix} [{stock_id} {stock_name}] 漲跌幅過大 ({pct_change:+.2f}%)，淘汰", flush=True)
         return None  
 
-    # 🛑 新增：上影線過長檢測（第一階段直接淘汰極端上影線）
+    # 🛑 上影線過長檢測（第一階段直接淘汰極端上影線）
     high_p = float(latest['High'])
     low_p = float(latest['Low'])
     open_p = float(latest['Open'])
@@ -180,7 +206,6 @@ def check_technical_pass(stock_info, current_idx, total_count):
     total_range = high_p - low_p
     upper_shadow = high_p - max(open_p, close_price)
     
-    # 若當日上影線佔總波幅超過 60%，代表衝高大回吐，直接淘汰
     if total_range > 0 and (upper_shadow / total_range) > 0.60:
         print(f"  🔍 {prefix} [{stock_id} {stock_name}] 衝高大砸盤(上影線過長: {(upper_shadow/total_range)*100:.1f}%)，淘汰", flush=True)
         return None
@@ -199,8 +224,8 @@ def check_technical_pass(stock_info, current_idx, total_count):
         "close_price": close_price
     }
 
-# 🔍 第二階段：籌碼與綜合評分
-def fetch_chip_and_score(tech_data):
+# 🔍 第二階段：籌碼與綜合評分 (結合外資與主力雙重濾網)
+def fetch_chip_and_score(tech_data, market_major_map):
     stock_id = tech_data["code"]
     stock_name = tech_data["name"]
     latest = tech_data["latest"]
@@ -242,6 +267,9 @@ def fetch_chip_and_score(tech_data):
     except Exception as e:
         print(f"  ⚠️ [{stock_id} {stock_name}] 籌碼抓取失敗，以 0 計算: {e}", flush=True)
 
+    # 取得當日主力籌碼 (若批次查無則為 0)
+    today_major = market_major_map.get(stock_id, 0.0)
+
     # 策略計算與計分
     dif_today = float(latest['DIF'])
     osc_today = float(latest['OSC'])
@@ -259,12 +287,14 @@ def fetch_chip_and_score(tech_data):
     else:
         foreign_surge_valid = (today_foreign > abs(prev_foreign))
 
+    # 洗盤突破需兼顧主力不可大賣
     is_wash_breakout = (
         is_above_zero_axis and 
         osc_3day_declining and 
         (osc_today > osc_p1) and 
         foreign_surge_valid and 
-        (1.0 <= pct_change <= 5.5)
+        (1.0 <= pct_change <= 5.5) and
+        (today_major >= 0)  # 確保主力沒有大倒貨
     )
 
     score = 50
@@ -308,11 +338,19 @@ def fetch_chip_and_score(tech_data):
         score += 10
         tags.append("🤝土洋同買")
 
+    # 🛑 新增：主力買賣超檢測機制 (解決對倒與倒貨問題)
+    if today_major < 0:
+        score -= 30
+        tags.append("⚠️主力倒貨(-30分)")
+    elif today_major > 0 and today_foreign > 0:
+        score += 15
+        tags.append(f"👑主力外資同買({round(today_major)}張)")
+
     if is_wash_breakout:
         score += 20
         tags.append("⚡洗盤結束起漲")
 
-    # 🛑 新增：中度上影線扣分機制（大幅扣分 -30 分，避免高檔套牢股高居第一名）
+    # 🛑 中度上影線扣分機制
     high_p = float(latest['High'])
     low_p = float(latest['Low'])
     open_p = float(latest['Open'])
@@ -342,6 +380,9 @@ def fetch_chip_and_score(tech_data):
 def run_precalculation():
     print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
+
+    # ⚡ 開頭先批次獲取全市場主力籌碼
+    market_major_map = fetch_market_major_holders()
 
     twse_url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     candidates = []
@@ -380,17 +421,16 @@ def run_precalculation():
         pass_data = check_technical_pass(stock_info, idx, total_candidates)
         if pass_data:
             tech_passed_list.append(pass_data)
-        # 1 秒 1 檔黃金節奏
         time.sleep(1.0)
 
     print(f"✅ [Phase 1 完成] 200 檔個股初篩完畢，共有 {len(tech_passed_list)} 檔符合型態標的！", flush=True)
 
     print("--------------------------------------------------", flush=True)
-    print("🔍 [Phase 2] 開始對入圍個股進行法人籌碼深度分析與扣分評估...", flush=True)
+    print("🔍 [Phase 2] 開始對入圍個股進行籌碼深度分析 (外資+主力同向評估)...", flush=True)
     all_passed_stocks = []
 
     for idx, tech_data in enumerate(tech_passed_list, 1):
-        scored_stock = fetch_chip_and_score(tech_data)
+        scored_stock = fetch_chip_and_score(tech_data, market_major_map)
         all_passed_stocks.append(scored_stock)
         print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
         time.sleep(1.0)
