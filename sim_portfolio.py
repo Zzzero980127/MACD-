@@ -75,7 +75,6 @@ def process_simulation():
 
             start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
             
-            # 🎯 核心修復：正確將 Token 帶入 URL params，避免觸發 402 免費版速率限制
             params = {
                 "dataset": "TaiwanStockPrice",
                 "data_id": code,
@@ -123,8 +122,8 @@ def process_simulation():
 
         # -------------------------------------------------------------------------
         # B. 買進邏輯：
-        # 週一至週四（weekday 0~3）皆買進前一日選股
-        # 週四（weekday 3，對應週三選股）採用「精選短線標的」機制
+        # 週一至週三（weekday 0~2）：策略一與策略二各買入前五名 (最多 10 檔)
+        # 週四（weekday 3，對應週三選股）：優先策略二前2名，若無則策略一第1名
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2, 3]:
             yesterday_dt = datetime.datetime.now() - datetime.timedelta(days=3 if weekday == 0 else 1)
@@ -142,7 +141,7 @@ def process_simulation():
                 content = row[0]
                 lines = content.split('\n')
                 current_strategy = "策略一"
-                buy_targets = []
+                raw_targets = []
 
                 for line in lines:
                     if "策略二" in line or "策略2" in line:
@@ -153,18 +152,28 @@ def process_simulation():
                     match = re.search(r'[•🔹]\s*(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)\s*\|\s*(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)', line)
                     if match:
                         code, name, price = match.group(1), match.group(2), float(match.group(3))
-                        buy_targets.append((code, name, price, current_strategy))
+                        raw_targets.append((code, name, price, current_strategy))
 
-                # 週四買進（週三選股）精選邏輯：
-                if weekday == 3:
-                    st2_targets = [t for t in buy_targets if t[3] == "策略二"]
+                buy_targets = []
+
+                # 週一至週三買進：兩個策略各前 5 名全買 (最多 10 檔)
+                if weekday in [0, 1, 2]:
+                    st1_targets = [t for t in raw_targets if t[3] == "策略一"][:5]
+                    st2_targets = [t for t in raw_targets if t[3] == "策略二"][:5]
+                    buy_targets = st1_targets + st2_targets
+                    print(f"🔥 [週一~週三正常建倉] 鎖定策略一 ({len(st1_targets)}檔) + 策略二 ({len(st2_targets)}檔) 準備進場！", flush=True)
+
+                # 週四買進（週三選股）：優先策略二前2名，若無則策略一第1名
+                elif weekday == 3:
+                    st2_targets = [t for t in raw_targets if t[3] == "策略二"]
                     if st2_targets:
                         buy_targets = st2_targets[:2]
                     else:
-                        buy_targets = buy_targets[:1]
+                        st1_targets = [t for t in raw_targets if t[3] == "策略一"]
+                        buy_targets = st1_targets[:1]
                     print(f"🔥 [週四短線精選] 鎖定週三最佳標的 {len(buy_targets)} 檔進場！", flush=True)
 
-                # 寫入模擬倉資料庫 (加入當週防護)
+                # 寫入模擬倉資料庫 (加入當週防護 + 採用前日收盤價當做掛單買入成本)
                 for code, name, price, st_type in buy_targets:
                     # 🛡️ 當週防護：若本週已買過或賣過該檔股票，則直接跳過
                     cursor.execute('''
@@ -184,7 +193,7 @@ def process_simulation():
                         INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
                         VALUES (%s, %s, %s, %s, %s, 'HOLD');
                     ''', (code, name, st_type, today_str, price))
-                    print(f"🛒 [模擬買入] [{st_type}] {code} {name} | 成本價: ${price}", flush=True)
+                    print(f"🛒 [模擬買入成功] [{st_type}] {code} {name} | 掛單成交價: ${price}", flush=True)
 
         conn.commit()
         cursor.close()
