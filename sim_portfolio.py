@@ -29,7 +29,7 @@ def get_0050_weekly_return():
         params = {"dataset": "TaiwanStockPrice", "data_id": "0050", "start_date": start_date}
         if FINMIND_TOKEN: params["token"] = FINMIND_TOKEN
         
-        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params).json()
+        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
         if res.get("data") and len(res["data"]) >= 2:
             df = pd.DataFrame(res["data"])
             p_start = float(df.iloc[-5]['close']) if len(df) >= 5 else float(df.iloc[0]['close'])
@@ -40,7 +40,7 @@ def get_0050_weekly_return():
     return 0.0
 
 def sync_to_google_sheets(summary_data):
-    """將每週五結算戰報（含風報比與 0050 對照）寫入 Google Sheets"""
+    """將每週五結算戰報寫入 Google Sheets"""
     if not GOOGLE_CREDS_JSON:
         print("⚠️ 未設定 GOOGLE_CREDS_JSON 環境變數，跳過雲端同步", flush=True)
         return
@@ -49,7 +49,6 @@ def sync_to_google_sheets(summary_data):
         gc = gspread.service_account_from_dict(creds_dict)
         sh = gc.open("AI模擬倉週績效紀錄表").sheet1
         
-        # 寫入欄位：[日期, 總筆數, 勝, 敗, 勝率, 週損益, 累計損益, 均賺%, 均賠%, 風報比, 0050漲跌%]
         row = [
             summary_data['date'],
             summary_data['total'],
@@ -95,8 +94,9 @@ def init_sim_db():
         print(f"⚠️ [Sim DB] 初始化失敗: {e}", flush=True)
 
 def process_simulation():
-    weekday = datetime.datetime.now().weekday()
-    today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+    now = datetime.datetime.now()
+    weekday = now.weekday() # 0: Mon, 4: Fri
+    today_str = now.strftime('%Y-%m-%d')
     conn = get_db_connection()
     if not conn: return
     
@@ -105,7 +105,7 @@ def process_simulation():
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1})", flush=True)
 
         # -------------------------------------------------------------------------
-        # A. 賣出邏輯
+        # A. 賣出與平倉邏輯
         # -------------------------------------------------------------------------
         cursor.execute("SELECT id, stock_code, stock_name, buy_price, buy_date FROM sim_trades WHERE status = 'HOLD';")
         holding_stocks = cursor.fetchall()
@@ -117,22 +117,23 @@ def process_simulation():
             buy_dt = datetime.datetime.strptime(buy_date_str, '%Y-%m-%d')
             buy_weekday = buy_dt.weekday()
 
-            start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+            start_date = (now - datetime.timedelta(days=40)).strftime("%Y-%m-%d")
             
             params = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}
             if FINMIND_TOKEN: params["token"] = FINMIND_TOKEN
 
-            res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params).json()
+            res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
             
-            if res.get("data"):
+            if res.get("data") and len(res["data"]) >= 2:
                 df = pd.DataFrame(res["data"])
-                curr_price = float(df.iloc[-2]['close']) if len(df) >= 2 else float(df.iloc[-1]['close'])
+                # 修正：直接抓最後一筆（當天最新收盤價）
+                curr_price = float(df.iloc[-1]['close'])
                 
                 exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
                 exp2 = pd.to_numeric(df['close']).ewm(span=26, adjust=False).mean()
                 osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
                 
-                osc_today, osc_p1 = float(osc.iloc[-2]), float(osc.iloc[-3]) if len(osc) >= 3 else (float(osc.iloc[-1]), float(osc.iloc[-2]))
+                osc_today, osc_p1 = float(osc.iloc[-1]), float(osc.iloc[-2])
 
                 ret = ((curr_price - buy_price) / buy_price) * 100
                 should_sell, exit_reason = False, ""
@@ -142,7 +143,7 @@ def process_simulation():
                 elif osc_today < osc_p1:
                     should_sell, exit_reason = True, "📉 MACD多頭減弱出場"
                 elif weekday == 3 and buy_weekday in [0, 1, 2]:
-                    should_sell, exit_reason = True, "📅 週四結算週一至週三持股（T+2週五入帳）"
+                    should_sell, exit_reason = True, "📅 週四結算週一至週三持股"
                 elif weekday == 4 and buy_weekday == 3:
                     should_sell, exit_reason = True, "📅 週五週末結算週四短線持股"
 
@@ -155,10 +156,10 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # 週五結算邏輯：計算勝率、風報比與 0050 對照
+        # 週五結算邏輯：分別計算「當週損益」與「累計總損益」
         # -------------------------------------------------------------------------
         if weekday == 4:
-            cursor.execute("SELECT buy_price, sell_price, return_rate FROM sim_trades WHERE status = 'CLOSED';")
+            cursor.execute("SELECT buy_price, sell_price, return_rate, sell_date FROM sim_trades WHERE status = 'CLOSED';")
             closed_trades = cursor.fetchall()
             
             total_trades = len(closed_trades)
@@ -173,10 +174,19 @@ def process_simulation():
                 avg_win = (sum(win_returns) / wins) if wins > 0 else 0.0
                 avg_loss = (sum(loss_returns) / losses) if losses > 0 else 0.0
                 
-                # 風報比 = 平均獲利% / 平均虧損%
                 rrr = round(avg_win / avg_loss, 2) if avg_loss > 0 else (round(avg_win, 2) if avg_win > 0 else 0.0)
                 
+                # 計算歷史總損益
                 total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
+                
+                # 修正：精準計算「本週（近 7 天內）」平倉的損益
+                week_start_dt = (now - datetime.timedelta(days=6)).strftime('%Y-%m-%d')
+                weekly_pnl = sum(
+                    ((float(t[1]) - float(t[0])) / float(t[0])) * 100000 
+                    for t in closed_trades 
+                    if t[3] and t[3] >= week_start_dt
+                )
+
                 benchmark_0050 = get_0050_weekly_return()
 
                 summary = {
@@ -185,7 +195,7 @@ def process_simulation():
                     "win": wins,
                     "loss": losses,
                     "win_rate": win_rate,
-                    "weekly_pnl": int(total_pnl),
+                    "weekly_pnl": int(weekly_pnl),
                     "total_pnl": int(total_pnl),
                     "avg_win": avg_win,
                     "avg_loss": avg_loss,
@@ -198,16 +208,9 @@ def process_simulation():
         # B. 買進邏輯
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2, 3]:
-            yesterday_dt = datetime.datetime.now() - datetime.timedelta(days=3 if weekday == 0 else 1)
-            yesterday_str = yesterday_dt.strftime('%Y%m%d')
-
-            print(f"🛒 [模擬買進] 撈取前一交易日 ({yesterday_str}) 報表獲取買入標的...", flush=True)
-            cursor.execute("SELECT content FROM history WHERE date = %s;", (yesterday_str,))
+            # 修正日期抓取：優先使用 LATEST 報表
+            cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
             row = cursor.fetchone()
-            
-            if not row or not row[0]:
-                cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
-                row = cursor.fetchone()
 
             if row and row[0]:
                 content = row[0]
@@ -219,26 +222,24 @@ def process_simulation():
                 st1_idx = st1_pos.start() if st1_pos else -1
                 st2_idx = st2_pos.start() if st2_pos else -1
 
-                pattern = r'(?:[•🔹]\s*)?(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)[\s\S]*?(?:現價:\s*\$?|收:\s*)(\d+\.?\d*)'
-                
-                for match in re.finditer(pattern, content):
-                    start_pos = match.start()
-                    code = match.group(1)
-                    name = match.group(2)
-                    price = float(match.group(3))
-
-                    if st2_idx != -1 and start_pos >= st2_idx:
-                        strategy = "策略二"
-                    else:
-                        strategy = "策略一"
-
-                    snippet = content[start_pos:start_pos + 200]
-                    score_match = re.search(r'(?:得分|分數|pts|分)\s*[:：\s]*(\d+)', snippet, re.IGNORECASE)
-                    if not score_match:
-                        score_match = re.search(r'(\d+)\s*(?:分|pts)', snippet, re.IGNORECASE)
+                # 優化正則表達式，嚴格限縮單行或區塊避免價格抓錯
+                lines = content.split('\n')
+                for line in lines:
+                    match = re.search(r'(\d{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)', line)
+                    price_match = re.search(r'(?:現價|收盤|收|價格)[:：\s]*\$?(\d+\.?\d*)', line)
                     
-                    score = int(score_match.group(1)) if score_match else 0
-                    raw_targets.append((code, name, price, strategy, score))
+                    if match and price_match:
+                        code = match.group(1)
+                        name = match.group(2)
+                        price = float(price_match.group(3) if len(price_match.groups()) >= 3 else price_match.group(1))
+                        
+                        line_pos = content.find(line)
+                        strategy = "策略二" if (st2_idx != -1 and line_pos >= st2_idx) else "策略一"
+
+                        score_match = re.search(r'(\d+)\s*(?:分|pts|pts)', line, re.IGNORECASE)
+                        score = int(score_match.group(1)) if score_match else 0
+                        
+                        raw_targets.append((code, name, price, strategy, score))
 
                 buy_targets = []
 
@@ -246,7 +247,7 @@ def process_simulation():
                     st1_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略一"][:5]
                     st2_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略二"][:5]
                     buy_targets = st1_targets + st2_targets
-                    print(f"🔥 [週一~週三正常建倉] 鎖定策略一 ({len(st1_targets)}檔) + 策略二 ({len(st2_targets)}檔) 準備進場！", flush=True)
+                    print(f"🔥 [週一~週三建倉] 策略一 ({len(st1_targets)}檔) + 策略二 ({len(st2_targets)}檔)", flush=True)
 
                 elif weekday == 3:
                     st2_qualified = [t for t in raw_targets if t[3] == "策略二" and t[4] >= 100]
@@ -254,11 +255,11 @@ def process_simulation():
                     if st2_qualified:
                         max_score = max(t[4] for t in st2_qualified)
                         buy_targets = [(t[0], t[1], t[2], t[3]) for t in st2_qualified if t[4] == max_score]
-                        print(f"🔥 [週四短線精選] 策略二有 {len(buy_targets)} 檔達 100 分以上 (最高分: {max_score})，同分全數進場！", flush=True)
+                        print(f"🔥 [週四短線精選] 策略二高分股 ({len(buy_targets)}檔) 進場！", flush=True)
                     else:
                         st1_targets = [(t[0], t[1], t[2], t[3]) for t in raw_targets if t[3] == "策略一"]
                         buy_targets = st1_targets[:3]
-                        print(f"⚠️ [週四短線精選] 策略二無標的達 100 分，啟動備案：買入策略一前 {len(buy_targets)} 名！", flush=True)
+                        print(f"⚠️ [週四短線精選] 備案：買入策略一前 {len(buy_targets)} 名！", flush=True)
 
                 for code, name, price, st_type in buy_targets:
                     cursor.execute('''
@@ -271,7 +272,7 @@ def process_simulation():
                     ''', (code, today_str, today_str))
                     
                     if cursor.fetchone():
-                        print(f"🚫 [當週防護跳過] {code} {name} 本週已有買賣紀錄，不再重複建倉！", flush=True)
+                        print(f"🚫 [當週防護跳過] {code} {name} 本週已有交易紀錄！", flush=True)
                         continue
 
                     cursor.execute('''
