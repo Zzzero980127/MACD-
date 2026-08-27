@@ -12,18 +12,25 @@ def test_sync():
         return msg
 
     try:
-        # 1. 金鑰處理
+        # 1. 解析憑證
         creds_raw = GOOGLE_CREDS_JSON.replace('\\n', '\n')
         creds_dict = json.loads(creds_raw, strict=False)
 
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
 
-        # 2. 開啟指定試算表的第一個工作表 (工作表1)
+        # 2. 登入 Google API
         gc = gspread.service_account_from_dict(creds_dict)
-        sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").get_worksheet(0)
+        
+        # 3. 嘗試開啟試算表 (改用名稱或 key)
+        try:
+            sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").get_worksheet(0)
+        except Exception as sheet_err:
+            # 若 open_by_key 失敗，嘗試用表單名稱開啟
+            print(f"Key 開啟失敗，嘗試用名稱開啟: {sheet_err}")
+            sh = gc.open("AI模擬倉週績效紀錄表").get_worksheet(0)
 
-        # 3. 寫入測試資料
+        # 4. 寫入假資料
         test_row = [
             datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), # 結算日期
             10,       # 交易總筆數
