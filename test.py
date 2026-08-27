@@ -10,9 +10,13 @@ def test_sync():
         print("❌ [測試失敗] 未設定 GOOGLE_CREDS_JSON 環境變數！")
         return
     try:
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds_raw = GOOGLE_CREDS_JSON.replace('\\n', '\n')
+        creds_dict = json.loads(creds_raw)
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+
         gc = gspread.service_account_from_dict(creds_dict)
-        sh = gc.open("AI模擬倉週績效紀錄表").sheet1
+        sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").sheet1
         
         # 測試寫入一筆假資料
         test_row = [
