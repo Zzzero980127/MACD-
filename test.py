@@ -7,18 +7,24 @@ GOOGLE_CREDS_JSON = os.environ.get('GOOGLE_CREDS_JSON', '').strip()
 
 def test_sync():
     if not GOOGLE_CREDS_JSON:
-        print("❌ [測試失敗] 未設定 GOOGLE_CREDS_JSON 環境變數！")
-        return
+        msg = "❌ [測試失敗] 未設定 GOOGLE_CREDS_JSON 環境變數！"
+        print(msg)
+        return msg
+
     try:
+        # 1. 處理字串轉義與控制字元問題
         creds_raw = GOOGLE_CREDS_JSON.replace('\\n', '\n')
-        creds_dict = json.loads(creds_raw)
+        # 加入 strict=False 解決 Invalid control character 錯誤
+        creds_dict = json.loads(creds_raw, strict=False)
+
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
 
+        # 2. 連線 Google Sheets API
         gc = gspread.service_account_from_dict(creds_dict)
         sh = gc.open_by_key("1CrADfLGVOhfrhNB_Er-0XJCazb6onD7vjWf7QpDpO0").sheet1
-        
-        # 測試寫入一筆假資料
+
+        # 3. 測試寫入假資料
         test_row = [
             datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), # 結算日期
             10,       # 交易總筆數
@@ -33,9 +39,15 @@ def test_sync():
             "+1.20%"  # 0050 同期漲跌
         ]
         sh.append_row(test_row)
-        print("🎉 [測試成功] 已成功寫入一筆測試資料至 Google 試算表！請至雲端確認。")
+        
+        success_msg = "🎉 [測試成功] 已成功寫入一筆測試資料至 Google 試算表！"
+        print(success_msg)
+        return success_msg
+
     except Exception as e:
-        print(f"❌ [測試失敗] 錯誤原因: {e}")
+        error_msg = f"❌ [測試失敗] 錯誤原因: {e}"
+        print(error_msg)
+        return error_msg
 
 if __name__ == "__main__":
     test_sync()
