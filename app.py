@@ -336,14 +336,14 @@ def handle_message(event):
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=hint))
 
-if __name__ == "__main__":
-    
 from test import test_sync
 
 @app.route('/test')
 def trigger_test():
     test_sync()
     return "✅ 測試指令已發送！請去 Google 試算表確認是否有新資料。", 200
+
+if __name__ == "__main__":
     update_stock_map()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
