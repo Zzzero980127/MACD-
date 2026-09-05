@@ -1,14 +1,17 @@
 import os
 import re
+import json
 import datetime
 import requests
 import pandas as pd
 import psycopg2
+import gspread
+from google.oauth2.service_account import Credentials
 
 FINMIND_TOKEN = (os.environ.get('FINMIND_API_TOKEN') or os.environ.get('FINMIND_TOKEN', '')).strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
-TOTAL_CAPITAL = 5000000.0  # 💰 調整為 500 萬總資金池
+TOTAL_CAPITAL = 5000000.0  # 💰 500 萬總資金池
 
 def get_db_connection():
     if not DATABASE_URL: return None
@@ -53,7 +56,59 @@ def get_0050_weekly_return():
     return 0.0
 
 def sync_to_google_sheets(summary):
-    pass
+    """
+    實作寫入 Google Sheets 的邏輯
+    需在環境變數中設定:
+    1. GOOGLE_SHEETS_JSON: Google Service Account 密鑰 JSON 字串
+    2. SPREADSHEET_KEY 或 SPREADSHEET_NAME: Google 試算表 ID 或名稱
+    """
+    sheets_json = os.environ.get('GOOGLE_SHEETS_JSON', '').strip()
+    sheet_key = os.environ.get('SPREADSHEET_KEY', '').strip()
+    sheet_name = os.environ.get('SPREADSHEET_NAME', '模擬倉週結算').strip()
+
+    if not sheets_json:
+        print("⚠️ [Google Sheets] 未偵測到 GOOGLE_SHEETS_JSON 環境變數，跳過試算表同步。", flush=True)
+        return
+
+    try:
+        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        info = json.loads(sheets_json)
+        creds = Credentials.from_service_account_info(info, scopes=scope)
+        client = gspread.authorize(creds)
+
+        if sheet_key:
+            spreadsheet = client.open_by_key(sheet_key)
+        else:
+            spreadsheet = client.open(sheet_name)
+
+        sheet = spreadsheet.sheet1
+
+        # 檢查標頭，若空表則寫入標頭
+        existing_rows = sheet.get_all_values()
+        if not existing_rows:
+            header = ["結算日期", "總交易數", "獲利筆數", "虧損筆數", "勝率(%)", "當週損益(元)", "累計總損益(元)", "平均獲利(%)", "平均虧損(%)", "盈虧比", "0050週報酬(%)", "當週交易數"]
+            sheet.append_row(header)
+
+        # 整理要追加寫入的數據資料列
+        row = [
+            summary.get("date", ""),
+            summary.get("total", 0),
+            summary.get("win", 0),
+            summary.get("loss", 0),
+            summary.get("win_rate", 0.0),
+            summary.get("weekly_pnl", 0),
+            summary.get("total_pnl", 0),
+            summary.get("avg_win", 0.0),
+            summary.get("avg_loss", 0.0),
+            summary.get("risk_reward_ratio", 0.0),
+            summary.get("benchmark_0050", 0.0),
+            summary.get("weekly_trades_count", 0)
+        ]
+
+        sheet.append_row(row)
+        print(f"✅ [Google Sheets] 成功同步週結算報告至試算表！", flush=True)
+    except Exception as e:
+        print(f"❌ [Google Sheets Sync Error] {e}", flush=True)
 
 def process_simulation():
     conn = get_db_connection()
@@ -61,7 +116,7 @@ def process_simulation():
     
     now = datetime.datetime.now()
     today_str = now.strftime('%Y-%m-%d')
-    weekday = now.weekday()  # 0:週一, 1:週二, 2:週三, 3:週四, 4:週五
+    weekday = now.weekday()  # 0:週一, 1:週二, 2:週三, 3:週四, 4:週五, 5:週六, 6:週日
 
     try:
         cursor = conn.cursor()
@@ -118,9 +173,9 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # 週五結算邏輯 (保持原本正確邏輯不變)
+        # 週五與週末結算邏輯 (修改：包含週六 5 與週日 6，避免錯過結算)
         # -------------------------------------------------------------------------
-        if weekday == 4:
+        if weekday in [4, 5, 6]:
             cursor.execute("SELECT buy_price, sell_price, return_rate, sell_date FROM sim_trades WHERE status = 'CLOSED';")
             closed_trades = cursor.fetchall()
             
@@ -131,7 +186,7 @@ def process_simulation():
                 
                 wins = len(win_returns)
                 losses = len(loss_returns)
-                win_rate = (wins / total_trades) * 100
+                win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0.0
                 
                 avg_win = (sum(win_returns) / wins) if wins > 0 else 0.0
                 avg_loss = (sum(loss_returns) / losses) if losses > 0 else 0.0
@@ -140,7 +195,8 @@ def process_simulation():
                 
                 total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
                 
-                week_start_dt = (now - datetime.timedelta(days=6)).strftime('%Y-%m-%d')
+                # 動態算回當週週一的日期
+                week_start_dt = (now - datetime.timedelta(days=now.weekday())).strftime('%Y-%m-%d')
                 weekly_trades = [t for t in closed_trades if t[3] and t[3] >= week_start_dt]
                 weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in weekly_trades)
 
@@ -151,15 +207,17 @@ def process_simulation():
                     "total": total_trades,
                     "win": wins,
                     "loss": losses,
-                    "win_rate": win_rate,
+                    "win_rate": round(win_rate, 2),
                     "weekly_pnl": int(weekly_pnl),
                     "total_pnl": int(total_pnl),
-                    "avg_win": avg_win,
-                    "avg_loss": avg_loss,
+                    "avg_win": round(avg_win, 2),
+                    "avg_loss": round(avg_loss, 2),
                     "risk_reward_ratio": rrr,
                     "benchmark_0050": benchmark_0050,
                     "weekly_trades_count": len(weekly_trades)
                 }
+                
+                print(f"📊 [週結算 Summary 產出成功]: {summary}", flush=True)
                 sync_to_google_sheets(summary)
 
         # -------------------------------------------------------------------------
@@ -175,7 +233,6 @@ def process_simulation():
                 st1_targets = []
                 st2_targets = []
                 
-                # 強效分區拆解策略一與策略二，避免格式錯亂
                 current_strategy = None
                 lines = content.split('\n')
                 
@@ -188,7 +245,6 @@ def process_simulation():
                         current_strategy = "策略二"
                         continue
                     
-                    # 強效正則匹配：抓取 [4位代碼] [名稱] 與 [價格] (相容 | 收: 25.85 或 價格: 25.85)
                     code_match = re.search(r'([0-9]{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)', line_str)
                     price_match = re.search(r'(?:現價|收盤|收|價格)[:：\s]*\$?\s*([0-9]+\.?[0-9]*)', line_str)
                     
@@ -209,15 +265,13 @@ def process_simulation():
 
                 buy_targets = []
 
-                # 週一 ~ 週三：策略一前 5 檔 + 策略二有出現的檔數 (最多 5 檔)
                 if weekday in [0, 1, 2]:
                     selected_st1 = st1_targets[:5]
-                    selected_st2 = st2_targets[:5]  # 有幾檔買幾檔，最多 5 檔 (例如僅 1 檔就買 1 檔)
+                    selected_st2 = st2_targets[:5]
                     
                     buy_targets = selected_st1 + selected_st2
                     print(f"🔥 [週一~週三建倉] 策略一 ({len(selected_st1)}檔) + 策略二 ({len(selected_st2)}檔) | 總預計買入: {len(buy_targets)} 檔", flush=True)
 
-                # 週四：保持原本短線精選邏輯不變
                 elif weekday == 3:
                     st2_qualified = [t for t in st2_targets if t[4] >= 100]
 
@@ -230,11 +284,9 @@ def process_simulation():
                         buy_targets = selected_st1
                         print(f"⚠️ [週四短線精選] 備案：買入策略一前 {len(buy_targets)} 名！", flush=True)
 
-                # 執行模擬買入下單
                 for item in buy_targets:
                     code, name, price, st_type = item[0], item[1], item[2], item[3]
                     
-                    # 週重複交易防護
                     cursor.execute('''
                         SELECT id FROM sim_trades 
                         WHERE stock_code = %s 
