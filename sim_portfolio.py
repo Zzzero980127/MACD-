@@ -163,13 +163,13 @@ def sync_to_google_sheets(summary):
             f"{avg_win:.2f}%",                                     # H: 平均獲利 (%)
             f"{avg_loss:.2f}%",                                    # I: 平均虧損 (%)
             summary.get("risk_reward_ratio", 0.0),                 # J: 風報比
-            f"{strategy_avg_return_pct:+.2f}%",                    # K: 策略期望報酬 (%) 🌟 [新增欄位]
-            f"{benchmark_0050:+.2f}%",                             # L: 0050 同期漲跌 (%) 🛠️ [防錯無條件寫入]
+            f"{strategy_avg_return_pct:+.2f}%",                    # K: 策略期望報酬 (%)
+            f"{benchmark_0050:+.2f}%",                             # L: 0050 同期漲跌 (%)
             beat_0050_str                                          # M: 是否擊敗 0050
         ]
 
         sheet.append_row(row)
-        print(f"🎉 [Google Sheets] 成功將 {target_date} 週結算資料寫入試算表！策略期望報酬: {strategy_avg_return_pct:+.2f}% vs 0050: {benchmark_0050:+.2f}%", flush=True)
+        print(f"🎉 [Google Sheets] 成功寫入！策略期望報酬: {strategy_avg_return_pct:+.2f}% vs 0050: {benchmark_0050:+.2f}%", flush=True)
     except Exception as e:
         print(f"❌ [Google Sheets Sync Error] {e}", flush=True)
 
@@ -238,32 +238,34 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # B. 週結算與同步 (週四平倉後至週末皆可執行)
+        # B. 週結算與同步 (🎯 修正區塊：SQL 去重並限定本週平倉，確保當週精準 15 筆)
         # -------------------------------------------------------------------------
         if weekday in [3, 4, 5, 6]:
-            cursor.execute("SELECT buy_price, sell_price, return_rate, sell_date FROM sim_trades WHERE status = 'CLOSED';")
-            closed_trades = cursor.fetchall()
+            monday_dt = now - datetime.timedelta(days=now.weekday())
+            friday_dt = monday_dt + datetime.timedelta(days=4)
+            start_str = monday_dt.strftime('%Y-%m-%d')
+            end_str = friday_dt.strftime('%Y-%m-%d')
+
+            # 使用 DISTINCT ON + 精準日期過濾，防止歷史/重複紀錄污染
+            cursor.execute("""
+                SELECT DISTINCT ON (stock_code) buy_price, sell_price, return_rate, sell_date
+                FROM sim_trades 
+                WHERE status = 'CLOSED' 
+                  AND sell_date >= %s 
+                  AND sell_date <= %s
+                ORDER BY stock_code, id DESC;
+            """, (start_str, end_str))
             
-            if len(closed_trades) > 0:
-                monday_dt = now - datetime.timedelta(days=now.weekday())
-                friday_dt = monday_dt + datetime.timedelta(days=4)
-                
-                start_str = monday_dt.strftime('%Y-%m-%d')
-                end_str = friday_dt.strftime('%Y-%m-%d')
-                
-                # 只採計 sell_date 落在【本週一 ~ 本週五】之間的當週交易
-                weekly_trades = [
-                    t for t in closed_trades 
-                    if t[3] and (start_str <= str(t[3])[:10] <= end_str)
-                ]
-                
-                # 當週勝敗筆數與勝率
+            weekly_trades = cursor.fetchall()
+            
+            if len(weekly_trades) > 0:
+                # 當週勝敗筆數與勝率 (大於 0 為勝，小於等於 0 為敗)
                 weekly_win_returns = [float(t[2]) for t in weekly_trades if float(t[2]) > 0]
-                weekly_loss_returns = [abs(float(t[2])) for t in weekly_trades if float(t[2]) < 0]
+                weekly_loss_returns = [abs(float(t[2])) for t in weekly_trades if float(t[2]) <= 0]
                 
-                weekly_count = len(weekly_trades)
                 weekly_wins = len(weekly_win_returns)
                 weekly_losses = len(weekly_loss_returns)
+                weekly_count = weekly_wins + weekly_losses  # 🎯 筆數精準對齊真實當週交易檔數 (15 筆)
                 weekly_win_rate = (weekly_wins / weekly_count * 100) if weekly_count > 0 else 0.0
                 
                 # 平均獲利/虧損與風報比
@@ -271,15 +273,18 @@ def process_simulation():
                 avg_loss = (sum(weekly_loss_returns) / weekly_losses) if weekly_losses > 0 else 0.0
                 rrr = round(avg_win / avg_loss, 2) if avg_loss > 0 else (round(avg_win, 2) if avg_win > 0 else 0.0)
                 
-                # 當週淨損益與歷史累積總損益 (歷史資料完全保護)
+                # 當週淨損益與歷史累積總損益
                 weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in weekly_trades)
-                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
+                
+                cursor.execute("SELECT buy_price, sell_price FROM sim_trades WHERE status = 'CLOSED';")
+                all_closed = cursor.fetchall()
+                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in all_closed)
 
                 benchmark_0050 = get_0050_weekly_return()
 
                 summary = {
                     "date": end_str,                        # 結算日 (當週五)
-                    "total": weekly_count,                  # 當週交易筆數
+                    "total": weekly_count,                  # 當週真實交易筆數
                     "win": weekly_wins,                    # 當週勝場
                     "loss": weekly_losses,                  # 當週敗場
                     "win_rate": round(weekly_win_rate, 2), # 當週勝率 (%)
@@ -377,4 +382,3 @@ def process_simulation():
 if __name__ == "__main__":
     init_sim_db()
     process_simulation()
-                
