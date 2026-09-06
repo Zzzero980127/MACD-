@@ -108,11 +108,13 @@ def sync_to_google_sheets(summary):
         sheet = spreadsheet.sheet1
 
         existing_rows = sheet.get_all_values()
+        
+        # 🎯 2. 表頭加入「策略期望報酬 (%)」，擴充至 13 欄
         if not existing_rows:
             header = [
                 "結算日期", "交易總筆數", "勝場", "敗場", "勝率 (%)", 
                 "週淨損益 ($)", "累積總損益 ($)", "平均獲利 (%)", "平均虧損 (%)", 
-                "風報比", "0050 同期漲跌 (%)", "是否擊敗 0050"
+                "風報比", "策略期望報酬 (%)", "0050 同期漲跌 (%)", "是否擊敗 0050"
             ]
             sheet.append_row(header)
 
@@ -122,7 +124,7 @@ def sync_to_google_sheets(summary):
                 print(f"ℹ️ [Google Sheets] 日期 {target_date} 已存在於試算表中，跳過重複寫入。", flush=True)
                 return
 
-        # 🎯 2. 修正 0050 對比邏輯：改用「(勝率 × 平均獲利) - (敗率 × 平均虧損)」的策略淨平均報酬率
+        # 🎯 3. 計算「策略期望報酬 (%)」 = (勝率 * 平均獲利) - (敗率 * 平均虧損)
         avg_win = summary.get("avg_win", 0.0)
         avg_loss = summary.get("avg_loss", 0.0)
         win_rate = summary.get("win_rate", 0.0) / 100.0
@@ -136,24 +138,25 @@ def sync_to_google_sheets(summary):
         else:
             beat_0050_str = "❌ 落後0050"
 
-        # 對齊 A ~ L 欄位陣列
+        # 🎯 4. 對齊 A ~ M 欄位陣列 (共 13 欄)
         row = [
-            summary.get("date", ""),                                      # A: 結算日期
-            summary.get("total", 0),                                     # B: 交易總筆數 (當週)
-            summary.get("win", 0),                                       # C: 勝場 (當週)
-            summary.get("loss", 0),                                      # D: 敗場 (當週)
-            f"{summary.get('win_rate', 0.0):.2f}%",                      # E: 勝率 (%)
-            summary.get("weekly_pnl", 0),                                # F: 週淨損益 ($)
-            summary.get("total_pnl", 0),                                 # G: 累積總損益 ($)
-            f"{summary.get('avg_win', 0.0):.2f}%",                       # H: 平均獲利 (%)
-            f"{summary.get('avg_loss', 0.0):.2f}%",                      # I: 平均虧損 (%)
-            summary.get("risk_reward_ratio", 0.0),                       # J: 風報比
-            f"{benchmark_0050:+.2f}%" if benchmark_0050 != 0 else "0.00%", # K: 0050 同期漲跌 (%)
-            beat_0050_str                                                # L: 是否擊敗 0050
+            summary.get("date", ""),                                # A: 結算日期
+            summary.get("total", 0),                               # B: 交易總筆數 (當週)
+            summary.get("win", 0),                                 # C: 勝場 (當週)
+            summary.get("loss", 0),                                # D: 敗場 (當週)
+            f"{summary.get('win_rate', 0.0):.2f}%",                # E: 勝率 (%)
+            summary.get("weekly_pnl", 0),                          # F: 週淨損益 ($)
+            summary.get("total_pnl", 0),                           # G: 累積總損益 ($)
+            f"{summary.get('avg_win', 0.0):.2f}%",                 # H: 平均獲利 (%)
+            f"{summary.get('avg_loss', 0.0):.2f}%",                # I: 平均虧損 (%)
+            summary.get("risk_reward_ratio", 0.0),                 # J: 風報比
+            f"{strategy_avg_return_pct:+.2f}%",                    # K: 策略期望報酬 (%) 🌟 [新增欄位]
+            f"{benchmark_0050:+.2f}%",                             # L: 0050 同期漲跌 (%) 🛠️ [修復顯示問題]
+            beat_0050_str                                          # M: 是否擊敗 0050
         ]
 
         sheet.append_row(row)
-        print(f"🎉 [Google Sheets] 成功將 {target_date} 週結算資料寫入試算表！策略淨平均報酬: {strategy_avg_return_pct:+.2f}% vs 0050: {benchmark_0050:+.2f}%", flush=True)
+        print(f"🎉 [Google Sheets] 成功將 {target_date} 週結算資料寫入試算表！策略期望報酬: {strategy_avg_return_pct:+.2f}% vs 0050: {benchmark_0050:+.2f}%", flush=True)
     except Exception as e:
         print(f"❌ [Google Sheets Sync Error] {e}", flush=True)
 
