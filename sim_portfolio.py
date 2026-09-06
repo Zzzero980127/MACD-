@@ -52,6 +52,33 @@ def init_sim_db():
         print(f"⚠️ [DB Log] 初始化資料庫失敗: {e}", flush=True)
 
 def get_0050_weekly_return():
+    """抓取 0050 當週開盤價與最新收盤價，計算當週漲跌幅 (%)"""
+    try:
+        now = datetime.datetime.now()
+        monday_dt = now - datetime.timedelta(days=now.weekday())
+        start_date = monday_dt.strftime("%Y-%m-%d")
+        
+        params = {
+            "dataset": "TaiwanStockPrice", 
+            "data_id": "0050", 
+            "start_date": start_date
+        }
+        if FINMIND_TOKEN: 
+            params["token"] = FINMIND_TOKEN
+
+        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
+        
+        if res.get("data") and len(res["data"]) >= 1:
+            df = pd.DataFrame(res["data"])
+            week_open = float(df.iloc[0]['open'])
+            week_close = float(df.iloc[-1]['close'])
+            weekly_return = ((week_close - week_open) / week_open) * 100
+            print(f"📈 [0050 當週績效] 週一開盤: {week_open} | 最新收盤: {week_close} | 漲跌幅: {weekly_return:+.2f}%", flush=True)
+            return round(weekly_return, 2)
+            
+    except Exception as e:
+        print(f"⚠️ [0050 API Error] 抓取 0050 績效失敗: {e}", flush=True)
+        
     return 0.0
 
 def sync_to_google_sheets(summary):
@@ -64,6 +91,9 @@ def sync_to_google_sheets(summary):
 
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        if '\\n' in sheets_json:
+            sheets_json = sheets_json.replace('\\n', '\n')
+
         info = json.loads(sheets_json)
         creds = Credentials.from_service_account_info(info, scopes=scope)
         client = gspread.authorize(creds)
@@ -73,7 +103,11 @@ def sync_to_google_sheets(summary):
 
         existing_rows = sheet.get_all_values()
         if not existing_rows:
-            header = ["結算日期", "總交易筆數", "勝場", "敗場", "勝率(%)", "當週損益(元)", "累計總損益(元)", "平均獲利(%)", "平均虧損(%)", "盈虧比", "0050週報酬(%)", "當週交易數"]
+            header = [
+                "結算日期", "交易總筆數", "勝場", "敗場", "勝率 (%)", 
+                "週淨損益 ($)", "累積總損益 ($)", "平均獲利 (%)", "平均虧損 (%)", 
+                "風報比", "0050 同期漲跌 (%)", "是否擊敗 0050"
+            ]
             sheet.append_row(header)
 
         target_date = summary.get("date", "")
@@ -82,19 +116,29 @@ def sync_to_google_sheets(summary):
                 print(f"ℹ️ [Google Sheets] 日期 {target_date} 已存在於試算表中，跳過重複寫入。", flush=True)
                 return
 
+        # 計算當週報酬率 (%) 與是否擊敗 0050
+        weekly_return_pct = (summary.get("weekly_pnl", 0) / TOTAL_CAPITAL) * 100
+        benchmark_0050 = summary.get("benchmark_0050", 0.0)
+
+        if weekly_return_pct >= benchmark_0050:
+            beat_0050_str = "🟢 擊敗0050"
+        else:
+            beat_0050_str = "❌ 落後0050"
+
+        # 🎯 精准對齊 A ~ L 欄位陣列
         row = [
-            summary.get("date", ""),
-            summary.get("total", 0),
-            summary.get("win", 0),
-            summary.get("loss", 0),
-            summary.get("win_rate", 0.0),
-            summary.get("weekly_pnl", 0),
-            summary.get("total_pnl", 0),
-            summary.get("avg_win", 0.0),
-            summary.get("avg_loss", 0.0),
-            summary.get("risk_reward_ratio", 0.0),
-            summary.get("benchmark_0050", 0.0),
-            summary.get("weekly_trades_count", 0)
+            summary.get("date", ""),                                      # A: 結算日期
+            summary.get("total", 0),                                     # B: 交易總筆數 (當週)
+            summary.get("win", 0),                                       # C: 勝場 (當週)
+            summary.get("loss", 0),                                      # D: 敗場 (當週)
+            f"{summary.get('win_rate', 0.0):.2f}%",                      # E: 勝率 (%)
+            summary.get("weekly_pnl", 0),                                # F: 週淨損益 ($)
+            summary.get("total_pnl", 0),                                 # G: 累積總損益 ($)
+            f"{summary.get('avg_win', 0.0):.2f}%",                       # H: 平均獲利 (%)
+            f"{summary.get('avg_loss', 0.0):.2f}%",                      # I: 平均虧損 (%)
+            summary.get("risk_reward_ratio", 0.0),                       # J: 風報比
+            f"{benchmark_0050:+.2f}%" if benchmark_0050 != 0 else "0.00%", # K: 0050 同期漲跌 (%)
+            beat_0050_str                                                # L: 是否擊敗 0050
         ]
 
         sheet.append_row(row)
@@ -167,48 +211,58 @@ def process_simulation():
                     print(f"💰 [模擬賣出] {code} {name} | 買價: {buy_price} -> 賣價: {curr_price} | 報酬: {ret:+.2f}% | 原因: {exit_reason}", flush=True)
 
         # -------------------------------------------------------------------------
-        # B. 週結算與同步 (週五與週末自動結算並寫入 Google Sheets)
+        # B. 週結算與同步 (週四平倉後至週末皆可執行)
         # -------------------------------------------------------------------------
-        if weekday in [4, 5, 6]:
+        if weekday in [3, 4, 5, 6]:
             cursor.execute("SELECT buy_price, sell_price, return_rate, sell_date FROM sim_trades WHERE status = 'CLOSED';")
             closed_trades = cursor.fetchall()
             
             if len(closed_trades) > 0:
-                win_returns = [float(t[2]) for t in closed_trades if float(t[2]) > 0]
-                loss_returns = [abs(float(t[2])) for t in closed_trades if float(t[2]) < 0]
+                # 🎯 計算「本週一」與「本週五」日期字串，精準區隔當週交易
+                monday_dt = now - datetime.timedelta(days=now.weekday())
+                friday_dt = monday_dt + datetime.timedelta(days=4)
                 
-                wins = len(win_returns)
-                losses = len(loss_returns)
-                win_rate = (wins / len(closed_trades)) * 100
+                start_str = monday_dt.strftime('%Y-%m-%d')
+                end_str = friday_dt.strftime('%Y-%m-%d')
                 
-                avg_win = (sum(win_returns) / wins) if wins > 0 else 0.0
-                avg_loss = (sum(loss_returns) / losses) if losses > 0 else 0.0
+                # 只採計 sell_date 落在【本週一 ~ 本週五】之間的當週交易
+                weekly_trades = [
+                    t for t in closed_trades 
+                    if t[3] and (start_str <= str(t[3])[:10] <= end_str)
+                ]
+                
+                # 當週勝敗筆數與勝率
+                weekly_win_returns = [float(t[2]) for t in weekly_trades if float(t[2]) > 0]
+                weekly_loss_returns = [abs(float(t[2])) for t in weekly_trades if float(t[2]) < 0]
+                
+                weekly_count = len(weekly_trades)
+                weekly_wins = len(weekly_win_returns)
+                weekly_losses = len(weekly_loss_returns)
+                weekly_win_rate = (weekly_wins / weekly_count * 100) if weekly_count > 0 else 0.0
+                
+                # 平均獲利/虧損與風報比
+                avg_win = (sum(weekly_win_returns) / weekly_wins) if weekly_wins > 0 else 0.0
+                avg_loss = (sum(weekly_loss_returns) / weekly_losses) if weekly_losses > 0 else 0.0
                 rrr = round(avg_win / avg_loss, 2) if avg_loss > 0 else (round(avg_win, 2) if avg_win > 0 else 0.0)
                 
-                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
-                
-                week_start_dt = (now - datetime.timedelta(days=now.weekday())).strftime('%Y-%m-%d')
-                weekly_trades = [t for t in closed_trades if t[3] and t[3] >= week_start_dt]
+                # 當週淨損益與歷史累積總損益 (歷史資料完全保護)
                 weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in weekly_trades)
+                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in closed_trades)
 
                 benchmark_0050 = get_0050_weekly_return()
 
-                # 自動計算當週五的日期作為紀錄標準
-                friday_dt = (now - datetime.timedelta(days=(weekday - 4))).strftime('%Y-%m-%d')
-
                 summary = {
-                    "date": friday_dt,
-                    "total": len(closed_trades),
-                    "win": wins,
-                    "loss": losses,
-                    "win_rate": round(win_rate, 2),
-                    "weekly_pnl": int(weekly_pnl),
-                    "total_pnl": int(total_pnl),
+                    "date": end_str,                        # 結算日 (當週五)
+                    "total": weekly_count,                  # 當週交易筆數 (例如: 15)
+                    "win": weekly_wins,                    # 當週勝場 (例如: 9)
+                    "loss": weekly_losses,                  # 當週敗場 (例如: 6)
+                    "win_rate": round(weekly_win_rate, 2), # 當週勝率 (%)
+                    "weekly_pnl": int(weekly_pnl),          # 當週淨損益 ($)
+                    "total_pnl": int(total_pnl),            # 歷史累積總損益 ($)
                     "avg_win": round(avg_win, 2),
                     "avg_loss": round(avg_loss, 2),
                     "risk_reward_ratio": rrr,
-                    "benchmark_0050": benchmark_0050,
-                    "weekly_trades_count": len(weekly_trades)
+                    "benchmark_0050": benchmark_0050
                 }
                 
                 print(f"📊 [週結算 Summary]: {summary}", flush=True)
@@ -255,7 +309,7 @@ def process_simulation():
                 if weekday in [0, 1, 2]:
                     buy_targets = st1_targets[:5] + st2_targets[:5]
 
-                # 週四建倉：買入週三推薦股 (優先選擇策略二 $\ge 100$ 分第 1 名，否則買策略一第 1 名)
+                # 週四建倉：買入週三推薦股 (優先選擇策略二 >= 100 分第 1 名，否則買策略一第 1 名)
                 elif weekday == 3:
                     st2_qualified = [t for t in st2_targets if t[4] >= 100]
                     if st2_qualified:
@@ -297,3 +351,4 @@ def process_simulation():
 if __name__ == "__main__":
     init_sim_db()
     process_simulation()
+
