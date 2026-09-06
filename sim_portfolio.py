@@ -52,11 +52,13 @@ def init_sim_db():
         print(f"⚠️ [DB Log] 初始化資料庫失敗: {e}", flush=True)
 
 def get_0050_weekly_return():
-    """抓取 0050 當週開盤價與最新收盤價，計算當週漲跌幅 (%)"""
+    """抓取 0050 當週開盤價與最新收盤價，計算當週漲跌幅 (%) [加入週末/假期回溯強化]"""
     try:
         now = datetime.datetime.now()
         monday_dt = now - datetime.timedelta(days=now.weekday())
-        start_date = monday_dt.strftime("%Y-%m-%d")
+        
+        # 往前多抓 3 天，避免週末或連假時 API 查無當週資料
+        start_date = (monday_dt - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
         
         params = {
             "dataset": "TaiwanStockPrice", 
@@ -66,15 +68,26 @@ def get_0050_weekly_return():
         if FINMIND_TOKEN: 
             params["token"] = FINMIND_TOKEN
 
-        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
+        res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=10).json()
+        data = res.get("data", [])
         
-        if res.get("data") and len(res["data"]) >= 1:
-            df = pd.DataFrame(res["data"])
-            week_open = float(df.iloc[0]['open'])
-            week_close = float(df.iloc[-1]['close'])
+        if data:
+            df = pd.DataFrame(data)
+            monday_str = monday_dt.strftime("%Y-%m-%d")
+            week_df = df[df['date'] >= monday_str]
+            
+            # 若當週資料受假日影響未出，則使用回溯區間最後資料
+            if week_df.empty:
+                week_df = df
+
+            week_open = float(week_df.iloc[0]['open'])
+            week_close = float(week_df.iloc[-1]['close'])
             weekly_return = ((week_close - week_open) / week_open) * 100
-            print(f"📈 [0050 當週績效] 週一開盤: {week_open} | 最新收盤: {week_close} | 漲跌幅: {weekly_return:+.2f}%", flush=True)
+            
+            print(f"📈 [0050 當週績效] 週一開盤({week_df.iloc[0]['date']}): {week_open} | 最新收盤({week_df.iloc[-1]['date']}): {week_close} | 漲跌幅: {weekly_return:+.2f}%", flush=True)
             return round(weekly_return, 2)
+        else:
+            print(f"⚠️ [0050 API Warning] FinMind 未回傳 0050 資料: {res}", flush=True)
             
     except Exception as e:
         print(f"⚠️ [0050 API Error] 抓取 0050 績效失敗: {e}", flush=True)
@@ -124,14 +137,14 @@ def sync_to_google_sheets(summary):
                 print(f"ℹ️ [Google Sheets] 日期 {target_date} 已存在於試算表中，跳過重複寫入。", flush=True)
                 return
 
-        # 🎯 3. 計算「策略期望報酬 (%)」 = (勝率 * 平均獲利) - (敗率 * 平均虧損)
-        avg_win = summary.get("avg_win", 0.0)
-        avg_loss = summary.get("avg_loss", 0.0)
-        win_rate = summary.get("win_rate", 0.0) / 100.0
+        # 🎯 3. 安全強制轉型，精準計算「策略期望報酬 (%)」
+        avg_win = float(summary.get("avg_win", 0.0))
+        avg_loss = float(summary.get("avg_loss", 0.0))
+        win_rate = float(summary.get("win_rate", 0.0)) / 100.0
         loss_rate = 1.0 - win_rate
         
         strategy_avg_return_pct = (win_rate * avg_win) - (loss_rate * avg_loss)
-        benchmark_0050 = summary.get("benchmark_0050", 0.0)
+        benchmark_0050 = float(summary.get("benchmark_0050", 0.0))
 
         if strategy_avg_return_pct >= benchmark_0050:
             beat_0050_str = "🟢 擊敗0050"
@@ -144,14 +157,14 @@ def sync_to_google_sheets(summary):
             summary.get("total", 0),                               # B: 交易總筆數 (當週)
             summary.get("win", 0),                                 # C: 勝場 (當週)
             summary.get("loss", 0),                                # D: 敗場 (當週)
-            f"{summary.get('win_rate', 0.0):.2f}%",                # E: 勝率 (%)
+            f"{float(summary.get('win_rate', 0.0)):.2f}%",         # E: 勝率 (%)
             summary.get("weekly_pnl", 0),                          # F: 週淨損益 ($)
             summary.get("total_pnl", 0),                           # G: 累積總損益 ($)
-            f"{summary.get('avg_win', 0.0):.2f}%",                 # H: 平均獲利 (%)
-            f"{summary.get('avg_loss', 0.0):.2f}%",                # I: 平均虧損 (%)
+            f"{avg_win:.2f}%",                                     # H: 平均獲利 (%)
+            f"{avg_loss:.2f}%",                                    # I: 平均虧損 (%)
             summary.get("risk_reward_ratio", 0.0),                 # J: 風報比
             f"{strategy_avg_return_pct:+.2f}%",                    # K: 策略期望報酬 (%) 🌟 [新增欄位]
-            f"{benchmark_0050:+.2f}%",                             # L: 0050 同期漲跌 (%) 🛠️ [修復顯示問題]
+            f"{benchmark_0050:+.2f}%",                             # L: 0050 同期漲跌 (%) 🛠️ [防錯無條件寫入]
             beat_0050_str                                          # M: 是否擊敗 0050
         ]
 
@@ -364,3 +377,4 @@ def process_simulation():
 if __name__ == "__main__":
     init_sim_db()
     process_simulation()
+                
