@@ -152,9 +152,11 @@ class TestIndicatorStatus(unittest.TestCase):
 
 
 class TestBuyFilter(unittest.TestCase):
+    """RSI/KD 過熱過濾 (進場品質過濾另外測)"""
     def check(self, status):
-        with mock.patch.object(sp, "fetch_price_df", return_value="df"), \
-             mock.patch.object(sp, "get_indicator_status", return_value=status):
+        with mock.patch.object(sp, "fetch_price_df", return_value=make_df([10.0] * 40)), \
+             mock.patch.object(sp, "get_indicator_status", return_value=status), \
+             mock.patch.object(sp, "entry_quality_reasons", return_value=[]):
             return sp.is_overheated_for_buy("2330", "台積電", {})
 
     def st(self, rsi=60, k=60, bias5=2.0):
@@ -183,7 +185,7 @@ class TestBuyFilter(unittest.TestCase):
 
     def test_cache_avoids_refetch(self):
         cache = {}
-        with mock.patch.object(sp, "fetch_price_df", return_value="df") as f, \
+        with mock.patch.object(sp, "fetch_price_df", return_value=make_df([10.0] * 40)) as f, \
              mock.patch.object(sp, "get_indicator_status", return_value=self.st()):
             sp.is_overheated_for_buy("2330", "台積電", cache)
             sp.is_overheated_for_buy("2330", "台積電", cache)
@@ -192,6 +194,47 @@ class TestBuyFilter(unittest.TestCase):
     def test_filter_disabled(self):
         with mock.patch.object(sp, "USE_BUY_FILTER", False):
             self.assertFalse(self.check(self.st(rsi=99, k=99, bias5=20)))
+
+
+class TestEntryQuality(unittest.TestCase):
+    def patched(self, **kw):
+        cfg = dict(MAX_DAY_PCT=None, MIN_ADX=None, MAX_RET20=None)
+        cfg.update(kw)
+        return mock.patch.multiple(sp, **cfg)
+
+    def test_adx_trend_vs_flat(self):
+        trend = make_df([10.0 + i * 0.5 for i in range(60)])
+        chop = make_df([10.0 + (i % 2) for i in range(60)], spread=0.6)
+        self.assertGreater(sp.calc_adx(trend), 50)
+        self.assertLess(sp.calc_adx(chop), 20)
+        self.assertIsNone(sp.calc_adx(make_df([10.0] * 10)))
+
+    def test_day_pct(self):
+        df = make_df([10.0] * 30 + [10.4])  # 當天 +4%
+        with self.patched(MAX_DAY_PCT=3.0):
+            self.assertTrue(any("當天漲幅" in r for r in sp.entry_quality_reasons(df)))
+        with self.patched(MAX_DAY_PCT=5.0):
+            self.assertEqual(sp.entry_quality_reasons(df), [])
+
+    def test_ret20(self):
+        df = make_df([10.0] * 10 + [10.0 + i * 0.1 for i in range(1, 21)])  # 20 日漲 20%
+        with self.patched(MAX_RET20=10.0):
+            self.assertTrue(any("20日漲幅" in r for r in sp.entry_quality_reasons(df)))
+
+    def test_min_adx(self):
+        chop = make_df([10.0 + (i % 2) * 0.2 for i in range(60)], spread=0.3)
+        with self.patched(MIN_ADX=20.0):
+            self.assertTrue(any("ADX" in r for r in sp.entry_quality_reasons(chop)))
+
+    def test_disabled(self):
+        with self.patched():
+            self.assertEqual(sp.entry_quality_reasons(make_df([10.0] * 30 + [13.0])), [])
+
+    def test_wednesday_skip(self):
+        st1, st2 = sp.parse_recommendations(SAMPLE_REPORT)
+        with mock.patch.object(sp, "MON_WED_BUY_DAYS", (0, 1)):
+            self.assertEqual(sp.pick_buy_targets(st1, st2, 2, verbose=False), [])
+            self.assertTrue(sp.pick_buy_targets(st1, st2, 1, verbose=False))
 
 
 class TestTradingRules(unittest.TestCase):

@@ -48,8 +48,16 @@ TAKE_PROFIT_PCT = 5.0         # 停利 (%)；舊設定 None
 MACD_EXIT_ONLY_PROFIT = True  # MACD 減弱只在有獲利時才出場 (MACD 1 天就賣的單勝率僅 6%)；舊設定 False
 MARKET_MA = None              # 大盤濾網：0050 站上 N 日均線才買 (回測無效，維持關閉)
 MIN_BUY_SCORE = None          # 週一~三買進的最低分數 (回測無差異，維持關閉)
-TOP_N_PER_STRATEGY = 3        # 週一~三每個策略最多買幾檔；舊設定 5
-STRATEGY2_TOP_N = 2           # 週一~三策略二另外限制檔數 (策略二整體勝率偏低)；舊設定 None
+TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔 (有進場品質過濾後恢復 5)
+STRATEGY2_TOP_N = None        # 週一~三策略二另外限制檔數；None = 同 TOP_N_PER_STRATEGY
+
+# --- 進場品質過濾 (網路常見指標，None = 不使用) ---
+# 2026-10 回測：三項同時使用，隔日開盤價進場勝率 46.7% → 75.8%、每筆 +0.32% → +1.88%；
+# 周邊參數 (當天漲 2~3%、20日漲 7~10%) 勝率皆在 67~83%，ADX 拉到 25 會變差
+MAX_DAY_PCT = 3.0             # 推薦當天漲幅上限 (%)：當天已大漲的隔天容易拉回
+MIN_ADX = 20.0                # ADX(14) 下限：趨勢夠強才買 (網路常用門檻 20)
+MAX_RET20 = 10.0              # 近 20 日漲幅上限 (%)：已經漲多的不追
+MON_WED_BUY_DAYS = (0, 1, 2)  # 週一~三中哪幾天建倉 (例如 (0, 1) = 週三不買；回測差異不大，維持)
 
 PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
 
@@ -132,6 +140,42 @@ def get_indicator_status(df):
     return {"rsi": float(rsi_now), "k": float(k_now), "d": float(d_now),
             "kd_dead_cross": dead_cross, "bias5": bias5}
 
+def calc_adx(df, n=14):
+    """Wilder's ADX，回傳最新一天的 ADX 值；資料不足回傳 None"""
+    if df is None or len(df) < n * 2:
+        return None
+    high, low, close = df['max'], df['min'], df['close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    up, down = high.diff(), -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).where((plus_di + minus_di) != 0)
+    adx = dx.ewm(alpha=1 / n, adjust=False).mean().iloc[-1]
+    return None if pd.isna(adx) else float(adx)
+
+def entry_quality_reasons(df):
+    """進場品質過濾 (當天漲幅 / ADX / 20 日漲幅)，回傳不買的原因清單；資料不足的項目略過"""
+    reasons = []
+    if df is None or len(df) < 2:
+        return reasons
+    close = df['close']
+    if MAX_DAY_PCT is not None:
+        day_pct = (close.iloc[-1] / close.iloc[-2] - 1) * 100
+        if day_pct >= MAX_DAY_PCT:
+            reasons.append(f"當天漲幅 {day_pct:.1f}% ≥ {MAX_DAY_PCT:g}%")
+    if MIN_ADX is not None:
+        adx = calc_adx(df)
+        if adx is not None and adx < MIN_ADX:
+            reasons.append(f"ADX {adx:.1f} < {MIN_ADX:g} (趨勢不足)")
+    if MAX_RET20 is not None and len(df) >= 21:
+        ret20 = (close.iloc[-1] / close.iloc[-21] - 1) * 100
+        if ret20 >= MAX_RET20:
+            reasons.append(f"20日漲幅 {ret20:.1f}% ≥ {MAX_RET20:g}%")
+    return reasons
+
 def buy_overheat_reasons(st):
     """依指標狀態回傳過熱原因清單；空清單 = 可以買 (實盤與回測共用)"""
     reasons = []
@@ -143,29 +187,37 @@ def buy_overheat_reasons(st):
         reasons.append(f"5日乖離 {st['bias5']:.1f}% ≥ {BIAS5_BUY_MAX:.0f}%")
     return reasons
 
+def buy_block_reasons(df):
+    """買進前檢查 (實盤與回測共用)：RSI/KD 過熱 (USE_BUY_FILTER) + 進場品質過濾。
+    回傳 (不買原因清單, 指標說明)；資料不足的檢查項目一律放行"""
+    reasons, info = [], ""
+    st = get_indicator_status(df) if USE_BUY_FILTER else None
+    if st:
+        reasons += buy_overheat_reasons(st)
+        info = f"RSI {st['rsi']:.1f} | K {st['k']:.1f} | D {st['d']:.1f} | 5日乖離 {st['bias5']:.1f}%"
+    reasons += entry_quality_reasons(df)
+    return reasons, info
+
 def is_overheated_for_buy(code, name, cache):
-    """買進前過熱檢查。回傳 True = 過熱 (不買)。資料取得失敗時不阻擋 (沿用原本行為)"""
-    if not USE_BUY_FILTER:
-        return False
+    """買進前檢查。回傳 True = 不買。資料取得失敗時不阻擋 (沿用原本行為)"""
     if code in cache:
         return cache[code]
-    overheated = False
+    blocked = False
     try:
-        st = get_indicator_status(fetch_price_df(code))
-        if st is None:
-            print(f"⚠️ [過熱檢查] {code} {name} 指標資料不足，略過過濾直接放行", flush=True)
+        df = fetch_price_df(code)
+        if df is None or len(df) < 2:
+            print(f"⚠️ [買進檢查] {code} {name} 價格資料不足，略過過濾直接放行", flush=True)
         else:
-            reasons = buy_overheat_reasons(st)
-            info = f"RSI {st['rsi']:.1f} | K {st['k']:.1f} | D {st['d']:.1f} | 5日乖離 {st['bias5']:.1f}%"
+            reasons, info = buy_block_reasons(df)
             if reasons:
-                overheated = True
-                print(f"🧊 [過熱略過] {code} {name} | {' / '.join(reasons)} | {info}", flush=True)
+                blocked = True
+                print(f"🧊 [買進略過] {code} {name} | {' / '.join(reasons)} | {info}", flush=True)
             else:
-                print(f"✅ [過熱檢查通過] {code} {name} | {info}", flush=True)
+                print(f"✅ [買進檢查通過] {code} {name} | {info}", flush=True)
     except Exception as e:
-        print(f"⚠️ [過熱檢查] {code} {name} 失敗，略過過濾直接放行: {e}", flush=True)
-    cache[code] = overheated
-    return overheated
+        print(f"⚠️ [買進檢查] {code} {name} 失敗，略過過濾直接放行: {e}", flush=True)
+    cache[code] = blocked
+    return blocked
 
 def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
     """
@@ -222,6 +274,8 @@ def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
     """依星期決定買進標的 (輸入為已過濾過熱後的清單，實盤與回測共用)"""
     # 週一 ~ 週三建倉：兩策略各取前 N 名 (可設最低分數)
     if weekday in [0, 1, 2]:
+        if weekday not in MON_WED_BUY_DAYS:
+            return []
         if MIN_BUY_SCORE is not None:
             st1_targets = [t for t in st1_targets if t[4] >= MIN_BUY_SCORE]
             st2_targets = [t for t in st2_targets if t[4] >= MIN_BUY_SCORE]

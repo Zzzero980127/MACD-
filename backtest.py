@@ -33,7 +33,8 @@ TRADE_AMOUNT = 100000  # 與週報、戰報一致：每筆固定 10 萬
 # BASE = 2026-10 調整前的舊設定，保留當比較基準
 BASE = dict(USE_BUY_FILTER=True, USE_EXIT_FILTER=True, MACD_WEAK_DAYS=1, STOP_LOSS_PCT=-5.0,
             TAKE_PROFIT_PCT=None, MACD_EXIT_ONLY_PROFIT=False, MARKET_MA=None,
-            MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5, STRATEGY2_TOP_N=None)
+            MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5, STRATEGY2_TOP_N=None,
+            MAX_DAY_PCT=None, MIN_ADX=None, MAX_RET20=None, MON_WED_BUY_DAYS=(0, 1, 2))
 COMBO_A = dict(BASE, MACD_EXIT_ONLY_PROFIT=True, TAKE_PROFIT_PCT=5.0)
 CONFIGS = [
     ("原版 (無 RSI/KD)", dict(BASE, USE_BUY_FILTER=False, USE_EXIT_FILTER=False)),
@@ -199,10 +200,9 @@ def _simulate(reports, prices, entry, market):
                    default=last_report)
     day = min(reports)
 
-    def overheated(code, d):
+    def blocked(code, d):
         w = window(prices.get(code), d)
-        st = sp.get_indicator_status(w) if w is not None else None
-        return bool(st and sp.buy_overheat_reasons(st))  # 資料不足放行，同實盤
+        return bool(w is not None and sp.buy_block_reasons(w)[0])  # 資料不足放行，同實盤
 
     while day <= max(last_report, last_bar):
         if day > last_report and not open_pos:
@@ -233,11 +233,10 @@ def _simulate(reports, prices, entry, market):
             stats["market_skip_days"] += 1
         elif day in reports and day.weekday() <= 3:
             st1, st2 = sp.parse_recommendations(reports[day])
-            if sp.USE_BUY_FILTER:
-                before = len(st1) + len(st2)
-                st1 = [t for t in st1 if not overheated(t[0], day)]
-                st2 = [t for t in st2 if not overheated(t[0], day)]
-                stats["filtered"] += before - len(st1) - len(st2)
+            before = len(st1) + len(st2)
+            st1 = [t for t in st1 if not blocked(t[0], day)]
+            st2 = [t for t in st2 if not blocked(t[0], day)]
+            stats["filtered"] += before - len(st1) - len(st2)
 
             for code, name, price, strategy, score in sp.pick_buy_targets(st1, st2, day.weekday(), verbose=False):
                 wk = week_of(day)
