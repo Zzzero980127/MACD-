@@ -37,6 +37,16 @@ EXIT_ONLY_WHEN_PROFIT = True
 # MACD 柱狀體連續縮小幾天才出場 (原程式為 1 天，容易在飆股洗盤時被洗出去；想維持原樣就設 1)
 MACD_WEAK_DAYS = 1
 
+# =============================================================================
+# 🧪 週結算短線優化候選 (預設全部維持原行為；先用 backtest.py 驗證有效再開啟)
+# =============================================================================
+STOP_LOSS_PCT = -5.0          # 停損 (%)
+TAKE_PROFIT_PCT = None        # 停利 (%)，例如 6.0；None = 不設
+MACD_EXIT_ONLY_PROFIT = False # True = MACD 減弱只在有獲利時才出場 (虧損交給停損與日期規則)
+MARKET_MA = None              # 大盤濾網：0050 收盤站上 N 日均線才買，例如 20；None = 不設
+MIN_BUY_SCORE = None          # 週一~三買進的最低分數，例如 70；None = 不設
+TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔
+
 PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
 
 # 🕗 一律用台灣時間判斷日期與星期 (Render 等雲端主機預設 UTC，台灣早上 8 點前會被算成前一天)
@@ -156,7 +166,7 @@ def is_overheated_for_buy(code, name, cache):
 def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
     """
     指標面出場判斷 (實盤與回測共用)，回傳 (should_sell, exit_reason)。
-    判斷順序：-5% 止損 → RSI/KD 鎖利 (有獲利才啟動) → MACD 柱狀體連續縮小。日期規則不在這裡。
+    判斷順序：停損 → 停利 → RSI/KD 鎖利 (有獲利才啟動) → MACD 柱狀體連續縮小。日期規則不在這裡。
     """
     if macd_weak_days is None:
         macd_weak_days = MACD_WEAK_DAYS
@@ -174,15 +184,24 @@ def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
     ind = get_indicator_status(df) if use_exit_filter else None
     can_lock_profit = (ret > 0) or (not EXIT_ONLY_WHEN_PROFIT)
 
-    if ret <= -5.0:
-        return True, "🚨 大跌觸發止損 (-5%)"
+    if ret <= STOP_LOSS_PCT:
+        return True, f"🚨 大跌觸發止損 ({STOP_LOSS_PCT:g}%)"
+    if TAKE_PROFIT_PCT is not None and ret >= TAKE_PROFIT_PCT:
+        return True, f"🎯 達停利出場 (+{TAKE_PROFIT_PCT:g}%)"
     if ind and can_lock_profit and ind['rsi'] > RSI_EXIT:
         return True, f"🔥 RSI 過熱鎖利出場 (RSI {ind['rsi']:.1f})"
     if ind and can_lock_profit and ind['kd_dead_cross']:
         return True, f"🔥 KD 高檔死叉鎖利出場 (K {ind['k']:.1f} < D {ind['d']:.1f})"
-    if macd_weak:
+    if macd_weak and (ret > 0 or not MACD_EXIT_ONLY_PROFIT):
         return True, "📉 MACD多頭減弱出場"
     return False, ""
+
+def market_ok(df_market):
+    """大盤濾網：0050 收盤在 MARKET_MA 日均線之上才允許買進；未啟用或資料不足時放行"""
+    if not MARKET_MA or df_market is None or len(df_market) < MARKET_MA:
+        return True
+    ma = df_market['close'].rolling(MARKET_MA).mean().iloc[-1]
+    return float(df_market['close'].iloc[-1]) >= float(ma)
 
 def calendar_exit_reason(weekday, buy_weekday):
     """T+2 / 週五日期強制出場規則，回傳出場原因；不需出場回傳空字串 (實盤與回測共用)"""
@@ -197,9 +216,12 @@ def calendar_exit_reason(weekday, buy_weekday):
 
 def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
     """依星期決定買進標的 (輸入為已過濾過熱後的清單，實盤與回測共用)"""
-    # 週一 ~ 週三建倉：兩策略各取前 5 名
+    # 週一 ~ 週三建倉：兩策略各取前 N 名 (可設最低分數)
     if weekday in [0, 1, 2]:
-        return st1_targets[:5] + st2_targets[:5]
+        if MIN_BUY_SCORE is not None:
+            st1_targets = [t for t in st1_targets if t[4] >= MIN_BUY_SCORE]
+            st2_targets = [t for t in st2_targets if t[4] >= MIN_BUY_SCORE]
+        return st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:TOP_N_PER_STRATEGY]
 
     # 週四建倉：精選 1 檔 (優先選擇策略二 >= 100 分最高分，否則買策略一第 1 名)
     if weekday == 3:
@@ -542,7 +564,16 @@ def process_simulation():
             cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
             row = cursor.fetchone()
 
-            if row and row[0]:
+            market_pass = True
+            if MARKET_MA:
+                try:
+                    market_pass = market_ok(fetch_price_df("0050"))
+                except Exception as e:
+                    print(f"⚠️ [大盤濾網] 0050 資料取得失敗，略過濾網: {e}", flush=True)
+                if not market_pass:
+                    print(f"🛑 [大盤濾網] 0050 跌破 {MARKET_MA} 日均線，今日不建倉", flush=True)
+
+            if market_pass and row and row[0]:
                 st1_targets, st2_targets = parse_recommendations(row[0])
                 print(f"📋 [推薦解析] 策略一 {len(st1_targets)} 檔 | 策略二 {len(st2_targets)} 檔", flush=True)
 

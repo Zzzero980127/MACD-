@@ -27,12 +27,25 @@ FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".backtest_cache")
 TRADE_AMOUNT = 100000  # 與週報、戰報一致：每筆固定 10 萬
 
+# 每組設定 = 對 sim_portfolio 參數的覆寫。除「原版」與「全部組合」外，一次只改一個參數 (以目前設定為基準)，
+# 才看得出是哪一項真的有效，也比較不會過度擬合。
+BASE = dict(USE_BUY_FILTER=True, USE_EXIT_FILTER=True, MACD_WEAK_DAYS=1, STOP_LOSS_PCT=-5.0,
+            TAKE_PROFIT_PCT=None, MACD_EXIT_ONLY_PROFIT=False, MARKET_MA=None,
+            MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5)
 CONFIGS = [
-    ("原版 (無過濾, MACD 1天)", dict(buy_filter=False, exit_filter=False, macd_weak_days=1)),
-    ("原版 + MACD 2天", dict(buy_filter=False, exit_filter=False, macd_weak_days=2)),
-    ("RSI/KD 過濾 + MACD 1天 (目前設定)", dict(buy_filter=True, exit_filter=True, macd_weak_days=1)),
-    ("RSI/KD 過濾 + MACD 2天", dict(buy_filter=True, exit_filter=True, macd_weak_days=2)),
+    ("原版 (無 RSI/KD)", dict(BASE, USE_BUY_FILTER=False, USE_EXIT_FILTER=False)),
+    ("目前設定 (基準)", dict(BASE)),
+    ("+ MACD 連 2 天才賣", dict(BASE, MACD_WEAK_DAYS=2)),
+    ("+ MACD 只在獲利時賣", dict(BASE, MACD_EXIT_ONLY_PROFIT=True)),
+    ("+ 停利 +5%", dict(BASE, TAKE_PROFIT_PCT=5.0)),
+    ("+ 停利 +8%", dict(BASE, TAKE_PROFIT_PCT=8.0)),
+    ("+ 停損 -4%", dict(BASE, STOP_LOSS_PCT=-4.0)),
+    ("+ 大盤 0050 > MA10", dict(BASE, MARKET_MA=10)),
+    ("+ 大盤 0050 > MA20", dict(BASE, MARKET_MA=20)),
+    ("+ 最低 70 分", dict(BASE, MIN_BUY_SCORE=70)),
+    ("+ 每策略前 3 名", dict(BASE, TOP_N_PER_STRATEGY=3)),
 ]
+MARKET_CODE = "0050"
 
 
 class RateLimited(Exception):
@@ -130,15 +143,28 @@ def week_of(d):
     return d.isocalendar()[:2]
 
 
-def simulate(reports, prices, buy_filter, exit_filter, macd_weak_days, entry="report"):
+def simulate(reports, prices, entry="report", market=None, **overrides):
     """
     逐日重播：每天先跑出場、再依當天報告買進 (與 process_simulation 順序相同)。
-    entry="report"   用報告上的收盤價買 (與實盤相同)
+    overrides  暫時覆寫 sim_portfolio 參數 (例如 MACD_WEAK_DAYS=2)，結束後還原
+    market     0050 日 K，大盤濾網用
+    entry="report"    用報告上的收盤價買 (與實盤相同)
     entry="next_open" 用隔一個交易日開盤價買 (較貼近真實可成交價)
     回傳 (trades, stats)；trades 中 sell_date 為 None 代表資料結束時仍持有。
     """
+    saved = {k: getattr(sp, k) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            setattr(sp, k, v)
+        return _simulate(reports, prices, entry, market)
+    finally:
+        for k, v in saved.items():
+            setattr(sp, k, v)
+
+
+def _simulate(reports, prices, entry, market):
     trades, open_pos = [], []
-    stats = {"filtered": 0, "no_price": 0, "no_next_open": 0, "dup_week": 0}
+    stats = {"filtered": 0, "no_price": 0, "no_next_open": 0, "dup_week": 0, "market_skip_days": 0}
     if not reports:
         return trades, stats
 
@@ -168,7 +194,7 @@ def simulate(reports, prices, buy_filter, exit_filter, macd_weak_days, entry="re
             ret = (curr - pos['buy_price']) / pos['buy_price'] * 100
             should_sell, reason = False, ""
             if w['date'].iloc[-1] == day:  # 有新 K 棒才會出現新的指標訊號
-                should_sell, reason = sp.check_exit_signal(w, ret, macd_weak_days, exit_filter)
+                should_sell, reason = sp.check_exit_signal(w, ret)
             if not should_sell:
                 reason = sp.calendar_exit_reason(day.weekday(), pos['buy_date'].weekday())
                 should_sell = bool(reason)
@@ -177,9 +203,11 @@ def simulate(reports, prices, buy_filter, exit_filter, macd_weak_days, entry="re
                 open_pos.remove(pos)
 
         # B. 進場 (週一 ~ 週四)
-        if day in reports and day.weekday() <= 3:
+        if day in reports and day.weekday() <= 3 and not sp.market_ok(window(market, day)):
+            stats["market_skip_days"] += 1
+        elif day in reports and day.weekday() <= 3:
             st1, st2 = sp.parse_recommendations(reports[day])
-            if buy_filter:
+            if sp.USE_BUY_FILTER:
                 before = len(st1) + len(st2)
                 st1 = [t for t in st1 if not overheated(t[0], day)]
                 st2 = [t for t in st2 if not overheated(t[0], day)]
@@ -220,19 +248,27 @@ def simulate(reports, prices, buy_filter, exit_filter, macd_weak_days, entry="re
 # 統計
 # =============================================================================
 def exit_category(reason):
-    for key, label in [("止損", "止損"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"),
+    for key, label in [("止損", "止損"), ("停利", "停利"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"),
                        ("MACD", "MACD減弱"), ("📅", "日期出場")]:
         if key in reason:
             return label
     return "其他"
 
 
-def summarize(trades):
+def summarize(trades, split=None):
+    """split：把期間切成前後兩半各算勝率，兩半都比基準好才算穩定 (避免只是剛好吃到某段行情)"""
     closed = sorted([t for t in trades if t['sell_date']], key=lambda t: (t['sell_date'], t['buy_date']))
     rets = [t['ret'] for t in closed]
     n = len(rets)
     if n == 0:
         return {"筆數": 0}
+
+    halves = {}
+    if split:
+        for name, part in (("前半", [t['ret'] for t in closed if t['buy_date'] < split]),
+                           ("後半", [t['ret'] for t in closed if t['buy_date'] >= split])):
+            halves[f"{name}勝率%"] = round(sum(r > 0 for r in part) / len(part) * 100, 1) if part else None
+            halves[f"{name}每筆%"] = round(sum(part) / len(part), 2) if part else None
     wins = [r for r in rets if r > 0]
     losses = [-r for r in rets if r <= 0]
     avg_win = sum(wins) / len(wins) if wins else 0.0
@@ -254,6 +290,7 @@ def summarize(trades):
         "總損益$": int(cum),
         "最大回撤$": int(mdd),
         "未平倉": len(trades) - n,
+        **halves,
     }
 
 
@@ -296,12 +333,15 @@ def main():
     except RateLimited as e:
         raise SystemExit(f"⛔ FinMind 額度用完：{e}\n已下載的價格都已快取，等額度恢復後重跑即可接續。")
 
-    bench = fetch_prices("0050", price_start, price_end)
+    bench = fetch_prices(MARKET_CODE, price_start, price_end)
+    report_days = sorted(reports)
+    split = report_days[len(report_days) // 2]
     results, all_rows = [], []
     for label, cfg in CONFIGS:
-        trades, stats = simulate(reports, prices, entry=args.entry, **cfg)
-        s = summarize(trades)
+        trades, stats = simulate(reports, prices, entry=args.entry, market=bench, **cfg)
+        s = summarize(trades, split)
         s["過熱擋掉"] = stats["filtered"]
+        s["大盤停買天"] = stats["market_skip_days"]
         results.append((label, s, trades))
         for t in trades:
             all_rows.append(dict(設定=label, **t))
@@ -312,6 +352,7 @@ def main():
     print(f"📊 回測結果 (進場價: {'報告收盤價' if args.entry == 'report' else '隔日開盤價'}，每筆 {TRADE_AMOUNT:,} 元)")
     print("=" * 80)
     print(pd.DataFrame({label: s for label, s, _ in results}).T.to_string())
+    print(f"(前半/後半以 {split} 切分)")
 
     if bench is not None and not bench.empty:
         b = bench[(bench['date'] >= min(reports)) & (bench['date'] <= max(reports))]
