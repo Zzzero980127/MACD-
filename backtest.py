@@ -15,6 +15,7 @@ check_exit_signal / calendar_exit_reason / buy_overheat_reasons)，與實盤一�
 """
 import argparse
 import datetime
+import glob
 import os
 import time
 
@@ -29,12 +30,15 @@ TRADE_AMOUNT = 100000  # 與週報、戰報一致：每筆固定 10 萬
 
 # 每組設定 = 對 sim_portfolio 參數的覆寫。除「原版」與「全部組合」外，一次只改一個參數 (以目前設定為基準)，
 # 才看得出是哪一項真的有效，也比較不會過度擬合。
+# BASE = 2026-10 調整前的舊設定，保留當比較基準
 BASE = dict(USE_BUY_FILTER=True, USE_EXIT_FILTER=True, MACD_WEAK_DAYS=1, STOP_LOSS_PCT=-5.0,
             TAKE_PROFIT_PCT=None, MACD_EXIT_ONLY_PROFIT=False, MARKET_MA=None,
-            MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5)
+            MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5, STRATEGY2_TOP_N=None)
+COMBO_A = dict(BASE, MACD_EXIT_ONLY_PROFIT=True, TAKE_PROFIT_PCT=5.0)
 CONFIGS = [
     ("原版 (無 RSI/KD)", dict(BASE, USE_BUY_FILTER=False, USE_EXIT_FILTER=False)),
-    ("目前設定 (基準)", dict(BASE)),
+    ("舊設定 (基準)", dict(BASE)),
+    ("★ 現行 sim_portfolio 設定", {}),
     ("+ MACD 連 2 天才賣", dict(BASE, MACD_WEAK_DAYS=2)),
     ("+ MACD 只在獲利時賣", dict(BASE, MACD_EXIT_ONLY_PROFIT=True)),
     ("+ 停利 +5%", dict(BASE, TAKE_PROFIT_PCT=5.0)),
@@ -44,6 +48,13 @@ CONFIGS = [
     ("+ 大盤 0050 > MA20", dict(BASE, MARKET_MA=20)),
     ("+ 最低 70 分", dict(BASE, MIN_BUY_SCORE=70)),
     ("+ 每策略前 3 名", dict(BASE, TOP_N_PER_STRATEGY=3)),
+    ("+ 週一~三策略二只買 2 檔", dict(BASE, STRATEGY2_TOP_N=2)),
+    ("組合A: MACD只獲利賣 + 停利5%", COMBO_A),
+    ("組合B: A + 前3名", dict(COMBO_A, TOP_N_PER_STRATEGY=3)),
+    ("組合C: A + 策略二只買2檔", dict(COMBO_A, STRATEGY2_TOP_N=2)),
+    ("組合D: A + 前3名 + 策略二2檔", dict(COMBO_A, TOP_N_PER_STRATEGY=3, STRATEGY2_TOP_N=2)),
+    ("組合E: A + MACD連2天", dict(COMBO_A, MACD_WEAK_DAYS=2)),
+    ("組合F: 停利5% + 前3名", dict(BASE, TAKE_PROFIT_PCT=5.0, TOP_N_PER_STRATEGY=3)),
 ]
 MARKET_CODE = "0050"
 
@@ -55,18 +66,29 @@ class RateLimited(Exception):
 # =============================================================================
 # 資料載入
 # =============================================================================
-def load_reports(start=None, end=None):
-    """讀取 history 表中以 YYYYMMDD 為 key 的每日報告，回傳 {date: content}"""
-    conn = sp.get_db_connection()
-    if not conn:
-        raise SystemExit("❌ 無法連線資料庫，請先設定 DATABASE_URL")
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT date, content FROM history WHERE date ~ '^[0-9]{8}$' ORDER BY date;")
-        rows = cursor.fetchall()
-        cursor.close()
-    finally:
-        conn.close()
+REPORTS_CACHE = os.path.join(CACHE_DIR, "reports.pkl")
+
+
+def load_reports(start=None, end=None, offline=False):
+    """讀取 history 表中以 YYYYMMDD 為 key 的每日報告，回傳 {date: content}。
+    每次從資料庫讀取後會存一份到快取；offline=True 時直接讀快取，不需 DATABASE_URL"""
+    if offline:
+        if not os.path.exists(REPORTS_CACHE):
+            raise SystemExit("❌ 沒有報告快取，請先在有 DATABASE_URL 的環境跑一次")
+        rows = pd.read_pickle(REPORTS_CACHE)
+    else:
+        conn = sp.get_db_connection()
+        if not conn:
+            raise SystemExit("❌ 無法連線資料庫，請先設定 DATABASE_URL (或加 --offline 使用快取)")
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT date, content FROM history WHERE date ~ '^[0-9]{8}$' ORDER BY date;")
+            rows = cursor.fetchall()
+            cursor.close()
+        finally:
+            conn.close()
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        pd.to_pickle(rows, REPORTS_CACHE)
 
     reports = {}
     for key, content in rows:
@@ -89,12 +111,16 @@ def to_price_df(data):
     return df.sort_values('date').reset_index(drop=True)
 
 
-def fetch_prices(code, start, end):
+def fetch_prices(code, start, end, offline=False):
     """抓 [start, end] 日 K (含快取)。遇到 FinMind 額度用完丟出 RateLimited"""
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{code}_{start}_{end}.pkl")
     if os.path.exists(path):
         return pd.read_pickle(path)
+    if offline:
+        # 離線：沿用同一檔最近一次下載的快取 (結束日可能不同)
+        cached = sorted(glob.glob(os.path.join(CACHE_DIR, f"{code}_{start}_*.pkl")))
+        return pd.read_pickle(cached[-1]) if cached else None
 
     params = {"dataset": "TaiwanStockPrice", "data_id": code,
               "start_date": str(start), "end_date": str(end)}
@@ -310,9 +336,10 @@ def main():
     ap.add_argument("--entry", choices=["report", "next_open"], default="report",
                     help="report=報告收盤價買 (同實盤)；next_open=隔日開盤價買")
     ap.add_argument("--csv", default="backtest_trades.csv", help="逐筆交易輸出檔")
+    ap.add_argument("--offline", action="store_true", help="使用上次快取的報告與價格，不連資料庫")
     args = ap.parse_args()
 
-    reports = load_reports(args.start, args.end)
+    reports = load_reports(args.start, args.end, args.offline)
     if not reports:
         raise SystemExit("❌ 找不到任何 YYYYMMDD 格式的歷史報告")
     print(f"📚 報告 {len(reports)} 份：{min(reports)} ~ {max(reports)}", flush=True)
@@ -326,14 +353,14 @@ def main():
     try:
         for i, code in enumerate(codes, 1):
             cached = os.path.exists(os.path.join(CACHE_DIR, f"{code}_{price_start}_{price_end}.pkl"))
-            prices[code] = fetch_prices(code, price_start, price_end)
+            prices[code] = fetch_prices(code, price_start, price_end, args.offline)
             if not cached:
                 print(f"  [{i}/{len(codes)}] {code} 下載完成", flush=True)
                 time.sleep(0.3)
     except RateLimited as e:
         raise SystemExit(f"⛔ FinMind 額度用完：{e}\n已下載的價格都已快取，等額度恢復後重跑即可接續。")
 
-    bench = fetch_prices(MARKET_CODE, price_start, price_end)
+    bench = fetch_prices(MARKET_CODE, price_start, price_end, args.offline)
     report_days = sorted(reports)
     split = report_days[len(report_days) // 2]
     results, all_rows = [], []

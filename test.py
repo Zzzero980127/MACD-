@@ -216,12 +216,16 @@ class TestTradingRules(unittest.TestCase):
 
     def test_min_score_and_top_n(self):
         st1, st2 = sp.parse_recommendations(SAMPLE_REPORT)
-        with mock.patch.object(sp, "MIN_BUY_SCORE", 100), mock.patch.object(sp, "TOP_N_PER_STRATEGY", 1):
+        with mock.patch.object(sp, "MIN_BUY_SCORE", 100), mock.patch.object(sp, "TOP_N_PER_STRATEGY", 1), \
+             mock.patch.object(sp, "STRATEGY2_TOP_N", None):
             self.assertEqual([t[0] for t in sp.pick_buy_targets(st1, st2, 1, verbose=False)], ["2603"])
+        with mock.patch.object(sp, "TOP_N_PER_STRATEGY", 3), mock.patch.object(sp, "STRATEGY2_TOP_N", 0):
+            self.assertEqual([t[0] for t in sp.pick_buy_targets(st1, st2, 1, verbose=False)], ["2330", "6230"])
 
     def test_macd_exit_only_profit(self):
         df = make_df([10.0 + i for i in range(40)])  # MACD 柱狀體縮小中
-        self.assertTrue(sp.check_exit_signal(df, -1.0, 1, False)[0])
+        with mock.patch.object(sp, "MACD_EXIT_ONLY_PROFIT", False):
+            self.assertTrue(sp.check_exit_signal(df, -1.0, 1, False)[0])
         with mock.patch.object(sp, "MACD_EXIT_ONLY_PROFIT", True):
             self.assertFalse(sp.check_exit_signal(df, -1.0, 1, False)[0])
             self.assertTrue(sp.check_exit_signal(df, 1.0, 1, False)[0])
@@ -278,10 +282,14 @@ class TestBacktest(unittest.TestCase):
         return self.bt.simulate(reports, prices, **cfg)
 
     def test_take_profit(self):
+        original = sp.TAKE_PROFIT_PCT
         trades, _ = self.run_bt({self.monday: self.report()}, {"1111": self.prices([10.6] * 10)},
                                 TAKE_PROFIT_PCT=5.0)
         self.assertIn("停利", trades[0]["reason"])
-        self.assertEqual(sp.TAKE_PROFIT_PCT, None)  # 回測結束後參數要還原
+        trades, _ = self.run_bt({self.monday: self.report()}, {"1111": self.prices([10.6] * 10)},
+                                TAKE_PROFIT_PCT=None)
+        self.assertIn("週四", trades[0]["reason"])
+        self.assertEqual(sp.TAKE_PROFIT_PCT, original)  # 回測結束後參數要還原
 
     def test_market_filter_blocks_buys(self):
         market = self.prices([9.0] * 10)            # 0050 在報告日前一路平盤，報告日當天跌破

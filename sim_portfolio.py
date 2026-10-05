@@ -38,14 +38,18 @@ EXIT_ONLY_WHEN_PROFIT = True
 MACD_WEAK_DAYS = 1
 
 # =============================================================================
-# 🧪 週結算短線優化候選 (預設全部維持原行為；先用 backtest.py 驗證有效再開啟)
+# 🧪 週結算短線參數 (2026-10 回測 2026/08/24~10/04 共 42 份報告後選定「組合D」)
+#    舊設定：隔日開盤價進場 勝率 36.9%、每筆 -0.17%、最大回撤 56,144
+#    組合D ：隔日開盤價進場 勝率 46.7%、每筆 +0.32%、最大回撤 17,649 (前後半段皆為正)
+#    樣本僅約 6 週，請持續用 backtest.py 追蹤；想退回舊設定見每行註解
 # =============================================================================
 STOP_LOSS_PCT = -5.0          # 停損 (%)
-TAKE_PROFIT_PCT = None        # 停利 (%)，例如 6.0；None = 不設
-MACD_EXIT_ONLY_PROFIT = False # True = MACD 減弱只在有獲利時才出場 (虧損交給停損與日期規則)
-MARKET_MA = None              # 大盤濾網：0050 收盤站上 N 日均線才買，例如 20；None = 不設
-MIN_BUY_SCORE = None          # 週一~三買進的最低分數，例如 70；None = 不設
-TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔
+TAKE_PROFIT_PCT = 5.0         # 停利 (%)；舊設定 None
+MACD_EXIT_ONLY_PROFIT = True  # MACD 減弱只在有獲利時才出場 (MACD 1 天就賣的單勝率僅 6%)；舊設定 False
+MARKET_MA = None              # 大盤濾網：0050 站上 N 日均線才買 (回測無效，維持關閉)
+MIN_BUY_SCORE = None          # 週一~三買進的最低分數 (回測無差異，維持關閉)
+TOP_N_PER_STRATEGY = 3        # 週一~三每個策略最多買幾檔；舊設定 5
+STRATEGY2_TOP_N = 2           # 週一~三策略二另外限制檔數 (策略二整體勝率偏低)；舊設定 None
 
 PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
 
@@ -221,7 +225,8 @@ def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
         if MIN_BUY_SCORE is not None:
             st1_targets = [t for t in st1_targets if t[4] >= MIN_BUY_SCORE]
             st2_targets = [t for t in st2_targets if t[4] >= MIN_BUY_SCORE]
-        return st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:TOP_N_PER_STRATEGY]
+        st2_n = TOP_N_PER_STRATEGY if STRATEGY2_TOP_N is None else STRATEGY2_TOP_N
+        return st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:st2_n]
 
     # 週四建倉：精選 1 檔 (優先選擇策略二 >= 100 分最高分，否則買策略一第 1 名)
     if weekday == 3:
