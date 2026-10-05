@@ -13,6 +13,184 @@ DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 TOTAL_CAPITAL = 5000000.0  # 💰 500 萬總資金池
 
+# =============================================================================
+# 🔧 RSI / KD 過熱過濾參數 (集中在這裡，方便調整與回測比較)
+# =============================================================================
+USE_BUY_FILTER = True      # 買進前檢查：過熱就不追高
+USE_EXIT_FILTER = True     # 持股中檢查：過熱就提前出場
+
+RSI_PERIOD = 14
+KD_N = 9                   # 台股常用 KD(9,3,3)
+
+# --- 追強勢股版本：強勢股 RSI>70、K 高檔鈍化是常態，所以只擋「極端過熱」 ---
+# 買進過濾：RSI 與 K 「同時」極端才視為過熱 (AND)，單一指標偏高不擋
+RSI_BUY_MAX = 82.0
+K_BUY_MAX = 90.0
+# 短線追高保護：收盤價高於 5 日均線超過 N% (乖離過大，隔天容易拉回)；設 None 可關閉
+BIAS5_BUY_MAX = 10.0
+
+# 出場輔助 (🆕 只在「已經有獲利」時才啟動，當作鎖利，不會在虧損時提前砍)
+RSI_EXIT = 85.0            # RSI 衝過 85 且有獲利 → 鎖利
+KD_HIGH_ZONE = 85.0        # K 在 85 以上向下穿越 D (高檔死叉) 且有獲利 → 鎖利
+EXIT_ONLY_WHEN_PROFIT = True
+
+# MACD 柱狀體連續縮小幾天才出場 (原程式為 1 天，容易在飆股洗盤時被洗出去；想維持原樣就設 1)
+MACD_WEAK_DAYS = 1
+
+PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
+
+# =============================================================================
+# 📐 技術指標計算
+# =============================================================================
+def fetch_price_df(code, days=PRICE_LOOKBACK_DAYS):
+    """從 FinMind 抓日 K，並轉成數值型態。FinMind 的最高/最低價欄位為 max / min"""
+    start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    params = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}
+    if FINMIND_TOKEN:
+        params["token"] = FINMIND_TOKEN
+    res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
+    data = res.get("data")
+    if not data:
+        return None
+    df = pd.DataFrame(data)
+    for col in ['open', 'max', 'min', 'close']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # 排除停牌 / 異常 (價格為 0 或缺值)
+    df = df.dropna(subset=['close', 'max', 'min'])
+    df = df[df['close'] > 0].reset_index(drop=True)
+    return df
+
+def calc_rsi(close, period=RSI_PERIOD):
+    """Wilder's RSI"""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.where(avg_loss != 0)
+    rsi = 100 - 100 / (1 + rs)
+    # 完全沒有下跌時 avg_loss=0，RSI 視為 100
+    rsi = rsi.where(~((avg_loss == 0) & (avg_gain > 0)), 100.0)
+    return rsi
+
+def calc_kd(df, n=KD_N):
+    """台股標準 KD：RSV 算法，K = 2/3*前K + 1/3*RSV，D = 2/3*前D + 1/3*K，初值 50"""
+    low_n = df['min'].rolling(n, min_periods=n).min()
+    high_n = df['max'].rolling(n, min_periods=n).max()
+    rng = (high_n - low_n).where((high_n - low_n) != 0)
+    rsv = (df['close'] - low_n) / rng * 100
+
+    k_list, d_list = [], []
+    k_prev, d_prev = 50.0, 50.0
+    for v in rsv:
+        if pd.notna(v):
+            k_prev = k_prev * 2 / 3 + float(v) / 3
+            d_prev = d_prev * 2 / 3 + k_prev / 3
+            k_list.append(k_prev)
+            d_list.append(d_prev)
+        else:
+            k_list.append(float('nan'))
+            d_list.append(float('nan'))
+    return pd.Series(k_list, index=df.index), pd.Series(d_list, index=df.index)
+
+def get_indicator_status(df):
+    """回傳最新一天的 RSI / K / D 與是否高檔死叉；資料不足回傳 None"""
+    if df is None or len(df) < max(RSI_PERIOD, KD_N) + 5:
+        return None
+    rsi = calc_rsi(df['close'])
+    k, d = calc_kd(df)
+    rsi_now, k_now, d_now = rsi.iloc[-1], k.iloc[-1], d.iloc[-1]
+    k_prev, d_prev = k.iloc[-2], d.iloc[-2]
+    if pd.isna(rsi_now) or pd.isna(k_now) or pd.isna(d_now):
+        return None
+    dead_cross = bool(
+        pd.notna(k_prev) and pd.notna(d_prev)
+        and k_prev >= d_prev and k_now < d_now and k_prev > KD_HIGH_ZONE
+    )
+    ma5 = df['close'].rolling(5).mean().iloc[-1]
+    bias5 = float((df['close'].iloc[-1] / ma5 - 1) * 100) if pd.notna(ma5) and ma5 > 0 else 0.0
+    return {"rsi": float(rsi_now), "k": float(k_now), "d": float(d_now),
+            "kd_dead_cross": dead_cross, "bias5": bias5}
+
+def is_overheated_for_buy(code, name, cache):
+    """買進前過熱檢查。回傳 True = 過熱 (不買)。資料取得失敗時不阻擋 (沿用原本行為)"""
+    if not USE_BUY_FILTER:
+        return False
+    if code in cache:
+        return cache[code]
+    overheated = False
+    try:
+        st = get_indicator_status(fetch_price_df(code))
+        if st is None:
+            print(f"⚠️ [過熱檢查] {code} {name} 指標資料不足，略過過濾直接放行", flush=True)
+        else:
+            reasons = []
+            # RSI 與 K 同時極端才算過熱 (強勢股單一指標偏高屬正常)
+            if st['rsi'] >= RSI_BUY_MAX and st['k'] >= K_BUY_MAX:
+                reasons.append(f"RSI {st['rsi']:.1f} 且 K {st['k']:.1f} 同時極端")
+            # 短線乖離過大 (追高風險)
+            if BIAS5_BUY_MAX is not None and st['bias5'] >= BIAS5_BUY_MAX:
+                reasons.append(f"5日乖離 {st['bias5']:.1f}% ≥ {BIAS5_BUY_MAX:.0f}%")
+            info = f"RSI {st['rsi']:.1f} | K {st['k']:.1f} | D {st['d']:.1f} | 5日乖離 {st['bias5']:.1f}%"
+            if reasons:
+                overheated = True
+                print(f"🧊 [過熱略過] {code} {name} | {' / '.join(reasons)} | {info}", flush=True)
+            else:
+                print(f"✅ [過熱檢查通過] {code} {name} | {info}", flush=True)
+    except Exception as e:
+        print(f"⚠️ [過熱檢查] {code} {name} 失敗，略過過濾直接放行: {e}", flush=True)
+    cache[code] = overheated
+    return overheated
+
+# =============================================================================
+# 📝 解析 cron_job 產生的推薦報告
+# =============================================================================
+STRATEGY_HEADER_RE = re.compile(r'【\s*策略\s*(一|二|1|2)')
+CODE_RE = re.compile(r'([0-9]{4})\s+([一-龥A-Za-z0-9\*\-]+)')
+PRICE_RE = re.compile(r'(?:現價|收盤|收|價格)[:：\s]*\$?\s*([0-9]+\.?[0-9]*)')
+SCORE_RE = re.compile(r'(-?\d+)\s*(?:分|pts)', re.IGNORECASE)
+
+def parse_recommendations(content):
+    """
+    解析推薦報告，回傳 (策略一清單, 策略二清單)，每筆為 (code, name, price, strategy, score)。
+    - 只認「【策略一」「【策略二」標題切換策略 (說明行「已排除策略二標的」不可誤判)
+    - 分數在代號下一行 (👉 得分:85分)，要往下一行補上
+    """
+    st1_targets, st2_targets = [], []
+    current_strategy = None
+    last_item = None  # 最近一檔尚未取得分數的標的 (list，方便補分數)
+
+    for line in content.split('\n'):
+        line_str = line.strip()
+        header = STRATEGY_HEADER_RE.search(line_str)
+        if header:
+            current_strategy = "策略一" if header.group(1) in ("一", "1") else "策略二"
+            last_item = None
+            continue
+
+        code_match = CODE_RE.search(line_str)
+        price_match = PRICE_RE.search(line_str)
+        if code_match and price_match and current_strategy:
+            score_match = SCORE_RE.search(line_str)
+            item = [code_match.group(1), code_match.group(2), float(price_match.group(1)),
+                    current_strategy, int(score_match.group(1)) if score_match else None]
+            (st1_targets if current_strategy == "策略一" else st2_targets).append(item)
+            last_item = item if item[4] is None else None
+            continue
+
+        if last_item is not None:
+            score_match = SCORE_RE.search(line_str)
+            if score_match:
+                last_item[4] = int(score_match.group(1))
+                last_item = None
+
+    def finalize(items):
+        return [(c, n, p, s, sc if sc is not None else 0) for c, n, p, s, sc in items]
+    return finalize(st1_targets), finalize(st2_targets)
+
+# =============================================================================
+# 🗄️ 資料庫
+# =============================================================================
 def get_db_connection():
     if not DATABASE_URL: return None
     try:
@@ -186,7 +364,7 @@ def process_simulation():
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1}) | 總資金設定: ${TOTAL_CAPITAL:,.0f}", flush=True)
 
         # -------------------------------------------------------------------------
-        # A. 賣出邏輯 (精準執行 T+2 雙軌出場)
+        # A. 賣出邏輯 (精準執行 T+2 雙軌出場 + 🆕 RSI/KD 過熱出場)
         # -------------------------------------------------------------------------
         cursor.execute("SELECT id, stock_code, stock_name, buy_price, buy_date FROM sim_trades WHERE status = 'HOLD';")
         holding_stocks = cursor.fetchall()
@@ -197,28 +375,37 @@ def process_simulation():
             buy_dt = datetime.datetime.strptime(buy_date_str, '%Y-%m-%d')
             buy_weekday = buy_dt.weekday()
 
-            start_date = (now - datetime.timedelta(days=40)).strftime("%Y-%m-%d")
-            params = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}
-            if FINMIND_TOKEN: params["token"] = FINMIND_TOKEN
+            # 🆕 改用 fetch_price_df (回溯 90 天，讓 RSI/KD 有足夠暖機資料，並取得 max/min 欄位)
+            df = fetch_price_df(code)
 
-            res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
-            
-            if res.get("data") and len(res["data"]) >= 2:
-                df = pd.DataFrame(res["data"])
+            if df is not None and len(df) >= 2:
                 curr_price = float(df.iloc[-1]['close'])
                 
-                exp1 = pd.to_numeric(df['close']).ewm(span=12, adjust=False).mean()
-                exp2 = pd.to_numeric(df['close']).ewm(span=26, adjust=False).mean()
+                exp1 = df['close'].ewm(span=12, adjust=False).mean()
+                exp2 = df['close'].ewm(span=26, adjust=False).mean()
                 osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
                 
-                osc_today, osc_p1 = float(osc.iloc[-1]), float(osc.iloc[-2])
                 ret = ((curr_price - buy_price) / buy_price) * 100
                 should_sell, exit_reason = False, ""
+
+                # MACD 柱狀體連續 MACD_WEAK_DAYS 天縮小 (預設 1 天 = 原本行為)
+                osc_tail = [float(x) for x in osc.iloc[-(MACD_WEAK_DAYS + 1):]]
+                macd_weak = len(osc_tail) == MACD_WEAK_DAYS + 1 and all(
+                    osc_tail[i + 1] < osc_tail[i] for i in range(MACD_WEAK_DAYS)
+                )
+
+                # 🆕 過熱狀態 (RSI / KD)；只在有獲利時啟動鎖利，不在虧損時提前砍
+                ind = get_indicator_status(df) if USE_EXIT_FILTER else None
+                can_lock_profit = (ret > 0) or (not EXIT_ONLY_WHEN_PROFIT)
 
                 # 風控/MACD 先行判斷
                 if ret <= -5.0:
                     should_sell, exit_reason = True, "🚨 大跌觸發止損 (-5%)"
-                elif osc_today < osc_p1:
+                elif ind and can_lock_profit and ind['rsi'] > RSI_EXIT:
+                    should_sell, exit_reason = True, f"🔥 RSI 過熱鎖利出場 (RSI {ind['rsi']:.1f})"
+                elif ind and can_lock_profit and ind['kd_dead_cross']:
+                    should_sell, exit_reason = True, f"🔥 KD 高檔死叉鎖利出場 (K {ind['k']:.1f} < D {ind['d']:.1f})"
+                elif macd_weak:
                     should_sell, exit_reason = True, "📉 MACD多頭減弱出場"
                 
                 # 精準 T+2 日期強制清空規則
@@ -226,8 +413,9 @@ def process_simulation():
                     should_sell, exit_reason = True, "📅 週四清空週一至週三持股 (T+2)"
                 elif weekday >= 4 and buy_weekday == 3:
                     should_sell, exit_reason = True, "📅 週五清空週四精選短線股 (T+2)"
-                elif weekday in [5, 6]:
-                    should_sell, exit_reason = True, "📅 週末強制結算殘餘持股"
+                elif weekday >= 4:
+                    # 🆕 週五起清空所有殘餘持股 (例如週四排程沒跑到)，讓週五結算涵蓋整週
+                    should_sell, exit_reason = True, "📅 週五/週末強制結算殘餘持股"
 
                 if should_sell:
                     cursor.execute('''
@@ -240,11 +428,14 @@ def process_simulation():
         # -------------------------------------------------------------------------
         # B. 週結算與同步 (🎯 修正區塊：SQL 去重並限定本週平倉，確保當週精準 15 筆)
         # -------------------------------------------------------------------------
-        if weekday in [3, 4, 5, 6]:
+        # 🆕 週五起才結算：原本週四就以「週五日期」寫入試算表，週五平倉的週四精選股會因日期重複被跳過、永遠沒算進週報
+        if weekday in [4, 5, 6]:
             monday_dt = now - datetime.timedelta(days=now.weekday())
             friday_dt = monday_dt + datetime.timedelta(days=4)
+            sunday_dt = monday_dt + datetime.timedelta(days=6)
             start_str = monday_dt.strftime('%Y-%m-%d')
             end_str = friday_dt.strftime('%Y-%m-%d')
+            query_end_str = sunday_dt.strftime('%Y-%m-%d')  # 週末強制結算的平倉也算本週
 
             # 使用 DISTINCT ON + 精準日期過濾，防止歷史/重複紀錄污染
             cursor.execute("""
@@ -254,7 +445,7 @@ def process_simulation():
                   AND sell_date >= %s 
                   AND sell_date <= %s
                 ORDER BY stock_code, id DESC;
-            """, (start_str, end_str))
+            """, (start_str, query_end_str))
             
             weekly_trades = cursor.fetchall()
             
@@ -300,39 +491,20 @@ def process_simulation():
                 sync_to_google_sheets(summary)
 
         # -------------------------------------------------------------------------
-        # C. 買進邏輯 (包含週四買入週三精選股條件)
+        # C. 買進邏輯 (包含週四買入週三精選股條件 + 🆕 RSI/KD 過熱過濾)
         # -------------------------------------------------------------------------
         if weekday in [0, 1, 2, 3]:
             cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
             row = cursor.fetchone()
 
             if row and row[0]:
-                content = row[0]
-                st1_targets, st2_targets = [], []
-                current_strategy = None
-                
-                for line in content.split('\n'):
-                    line_str = line.strip()
-                    if '策略一' in line_str or '策略 1' in line_str:
-                        current_strategy = "策略一"
-                        continue
-                    elif '策略二' in line_str or '策略 2' in line_str:
-                        current_strategy = "策略二"
-                        continue
-                    
-                    code_match = re.search(r'([0-9]{4})\s+([\u4e00-\u9fa5A-Za-z0-9\*]+)', line_str)
-                    price_match = re.search(r'(?:現價|收盤|收|價格)[:：\s]*\$?\s*([0-9]+\.?[0-9]*)', line_str)
-                    
-                    if code_match and price_match and current_strategy:
-                        code = code_match.group(1)
-                        name = code_match.group(2)
-                        price = float(price_match.group(1))
-                        score_match = re.search(r'(\d+)\s*(?:分|pts)', line_str, re.IGNORECASE)
-                        score = int(score_match.group(1)) if score_match else 0
-                        item = (code, name, price, current_strategy, score)
-                        
-                        if current_strategy == "策略一": st1_targets.append(item)
-                        elif current_strategy == "策略二": st2_targets.append(item)
+                st1_targets, st2_targets = parse_recommendations(row[0])
+                print(f"📋 [推薦解析] 策略一 {len(st1_targets)} 檔 | 策略二 {len(st2_targets)} 檔", flush=True)
+
+                # 🆕 先過濾過熱標的，再取前幾名 (過熱的剔除後，遞補下一名合格標的)
+                overheat_cache = {}
+                st1_targets = [t for t in st1_targets if not is_overheated_for_buy(t[0], t[1], overheat_cache)]
+                st2_targets = [t for t in st2_targets if not is_overheated_for_buy(t[0], t[1], overheat_cache)]
 
                 buy_targets = []
 
