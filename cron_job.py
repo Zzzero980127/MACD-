@@ -22,6 +22,12 @@ FINMIND_TOKEN = (os.environ.get('FINMIND_API_TOKEN') or os.environ.get('FINMIND_
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
 
+# 🕗 一律用台灣時間 (Render 主機預設 UTC，台灣早上 8 點前會被算成前一天)
+TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+def now_tw():
+    return datetime.datetime.now(TW_TZ).replace(tzinfo=None)
+
 if not FINMIND_TOKEN:
     print("❌ [Fatal Error] 未偵測到 FINMIND_API_TOKEN 或 FINMIND_TOKEN！程式強制終止。", flush=True)
     exit(1)
@@ -103,7 +109,7 @@ def send_line_push(report_text):
 # 全市場主力數據拉取工具 (一次 Request 解決全場)
 def fetch_market_major_holders():
     api_url = "https://api.finmindtrade.com/api/v4/data"
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    today_str = now_tw().strftime("%Y-%m-%d")
     params = {
         "dataset": "TaiwanStockMarketShareholding",
         "start_date": today_str,
@@ -136,7 +142,7 @@ def check_technical_pass(stock_info, current_idx, total_count):
     stock_name = stock_info["name"]
     prefix = f"[{current_idx}/{total_count}]"
     
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
+    start_date = (now_tw() - datetime.timedelta(days=90)).strftime("%Y-%m-%d")
     api_url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockPrice",
@@ -236,7 +242,7 @@ def fetch_chip_and_score(tech_data, market_major_map):
     pct_change = tech_data["pct_change"]
 
     api_url = "https://api.finmindtrade.com/api/v4/data"
-    chip_start = (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+    chip_start = (now_tw() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
     chip_params = {
         "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
         "data_id": stock_id,
@@ -379,7 +385,7 @@ def fetch_chip_and_score(tech_data, market_major_map):
 # -----------------------------------------------------------------------------
 def run_precalculation():
     print("==================================================", flush=True)
-    print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M')})...", flush=True)
+    print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({now_tw().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
     # ⚡ 開頭先批次獲取全市場主力籌碼
     market_major_map = fetch_market_major_holders()
@@ -443,8 +449,8 @@ def run_precalculation():
     strategy_1_candidates.sort(key=lambda x: x['score'], reverse=True)
     top_bottom_turn = strategy_1_candidates[:5]
 
-    date_display = datetime.datetime.now().strftime('%Y/%m/%d')
-    today_str = datetime.datetime.now().strftime('%Y%m%d')
+    date_display = now_tw().strftime('%Y/%m/%d')
+    today_str = now_tw().strftime('%Y%m%d')
 
     lines = [
         f"📊 【AI 精選雙策略雙軌選股報告】({date_display})",

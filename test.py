@@ -194,5 +194,108 @@ class TestBuyFilter(unittest.TestCase):
             self.assertFalse(self.check(self.st(rsi=99, k=99, bias5=20)))
 
 
+class TestTradingRules(unittest.TestCase):
+    def test_calendar_exit(self):
+        self.assertIn("週四", sp.calendar_exit_reason(3, 0))
+        self.assertEqual(sp.calendar_exit_reason(3, 3), "")      # 週四買的週四不賣
+        self.assertIn("週四精選", sp.calendar_exit_reason(4, 3))
+        self.assertIn("強制結算", sp.calendar_exit_reason(4, 1))
+        self.assertEqual(sp.calendar_exit_reason(1, 0), "")
+
+    def test_pick_mon_to_wed_takes_both_strategies(self):
+        st1, st2 = sp.parse_recommendations(SAMPLE_REPORT)
+        picks = sp.pick_buy_targets(st1, st2, 0, verbose=False)
+        self.assertEqual([t[0] for t in picks], ["2330", "6230", "2603", "2317"])
+
+    def test_pick_thursday(self):
+        st1, st2 = sp.parse_recommendations(SAMPLE_REPORT)
+        self.assertEqual([t[0] for t in sp.pick_buy_targets(st1, st2, 3, verbose=False)], ["2603"])
+        low_st2 = [t[:4] + (90,) for t in st2]
+        self.assertEqual([t[0] for t in sp.pick_buy_targets(st1, low_st2, 3, verbose=False)], ["2330"])
+        self.assertEqual(sp.pick_buy_targets(st1, st2, 4, verbose=False), [])
+
+    def test_exit_signal_stop_loss(self):
+        df = make_df([10.0] * 40)
+        self.assertEqual(sp.check_exit_signal(df, -5.0, 1, False), (True, "🚨 大跌觸發止損 (-5%)"))
+        self.assertEqual(sp.check_exit_signal(df, 0.0, 1, False), (False, ""))
+
+    def test_exit_rsi_lock_only_with_profit(self):
+        df = make_df([10.0 + i for i in range(40)])  # RSI = 100
+        sell, reason = sp.check_exit_signal(df, 3.0, 1, True)
+        self.assertTrue(sell and "RSI" in reason)
+        # 虧損時不啟動 RSI 鎖利 (這組資料 MACD 柱狀體在縮小，所以會改由 MACD 減弱出場)
+        self.assertNotIn("RSI", sp.check_exit_signal(df, -1.0, 1, True)[1])
+
+
+class TestBacktest(unittest.TestCase):
+    """用合成價格驗證回測的進出場機制"""
+
+    @classmethod
+    def setUpClass(cls):
+        import datetime
+        import backtest
+        cls.bt = backtest
+        cls.dt = datetime
+        # 找一個週一當報告日
+        d = datetime.date(2026, 9, 7)
+        cls.monday = d - datetime.timedelta(days=d.weekday())
+
+    def prices(self, closes_after, flat=10.0):
+        """報告日前 120 個交易日平盤，報告日 (含) 之後依序為 closes_after"""
+        days = pd.bdate_range(end=self.monday, periods=120).date.tolist()
+        after = pd.bdate_range(start=self.monday + self.dt.timedelta(days=1), periods=len(closes_after)).date.tolist()
+        closes = [flat] * len(days) + list(closes_after)
+        df = pd.DataFrame({"date": days + after, "close": closes,
+                           "max": [c + 0.2 for c in closes], "min": [c - 0.2 for c in closes]})
+        df["open"] = df["close"]
+        return df
+
+    def report(self, code="1111", strategy="一", score=80):
+        return f"【策略{strategy}】\n🔹 {code} 測試 | 收: 10.00 (+0.00%)\n    👉 得分:{score}分 | x"
+
+    def run_bt(self, reports, prices, **kw):
+        cfg = dict(buy_filter=False, exit_filter=False, macd_weak_days=1)
+        cfg.update(kw)
+        return self.bt.simulate(reports, prices, **cfg)
+
+    def test_thursday_forced_exit(self):
+        trades, _ = self.run_bt({self.monday: self.report()}, {"1111": self.prices([10.0] * 10)})
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual(t["sell_date"], self.monday + self.dt.timedelta(days=3))
+        self.assertAlmostEqual(t["ret"], 0.0)
+        self.assertIn("週四", t["reason"])
+
+    def test_stop_loss(self):
+        trades, _ = self.run_bt({self.monday: self.report()}, {"1111": self.prices([9.4] + [9.4] * 9)})
+        t = trades[0]
+        self.assertEqual(t["sell_date"], self.monday + self.dt.timedelta(days=1))
+        self.assertIn("止損", t["reason"])
+
+    def test_same_week_not_bought_twice(self):
+        tue = self.monday + self.dt.timedelta(days=1)
+        reports = {self.monday: self.report(), tue: self.report()}
+        trades, stats = self.run_bt(reports, {"1111": self.prices([10.0] * 10)})
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(stats["dup_week"], 1)
+
+    def test_next_open_entry(self):
+        prices = self.prices([10.0] * 10)
+        prices.loc[prices["date"] > self.monday, "open"] = 10.5
+        trades, _ = self.run_bt({self.monday: self.report()}, {"1111": prices}, entry="next_open")
+        self.assertEqual(trades[0]["buy_price"], 10.5)
+        self.assertIn("週四", trades[0]["reason"])
+
+    def test_summarize_drawdown(self):
+        d = self.monday
+        trades = [dict(sell_date=d, buy_date=d, ret=r) for r in (5.0, -3.0, -4.0, 2.0)]
+        s = self.bt.summarize(trades + [dict(sell_date=None, buy_date=d, ret=None)])
+        self.assertEqual(s["筆數"], 4)
+        self.assertEqual(s["勝率%"], 50.0)
+        self.assertEqual(s["總損益$"], 0)
+        self.assertEqual(s["最大回撤$"], 7000)   # 5000 → -2000
+        self.assertEqual(s["未平倉"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

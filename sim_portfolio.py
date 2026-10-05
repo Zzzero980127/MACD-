@@ -39,12 +39,18 @@ MACD_WEAK_DAYS = 1
 
 PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
 
+# 🕗 一律用台灣時間判斷日期與星期 (Render 等雲端主機預設 UTC，台灣早上 8 點前會被算成前一天)
+TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+def now_tw():
+    return datetime.datetime.now(TW_TZ).replace(tzinfo=None)
+
 # =============================================================================
 # 📐 技術指標計算
 # =============================================================================
 def fetch_price_df(code, days=PRICE_LOOKBACK_DAYS):
     """從 FinMind 抓日 K，並轉成數值型態。FinMind 的最高/最低價欄位為 max / min"""
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    start_date = (now_tw() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
     params = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start_date}
     if FINMIND_TOKEN:
         params["token"] = FINMIND_TOKEN
@@ -112,6 +118,17 @@ def get_indicator_status(df):
     return {"rsi": float(rsi_now), "k": float(k_now), "d": float(d_now),
             "kd_dead_cross": dead_cross, "bias5": bias5}
 
+def buy_overheat_reasons(st):
+    """依指標狀態回傳過熱原因清單；空清單 = 可以買 (實盤與回測共用)"""
+    reasons = []
+    # RSI 與 K 同時極端才算過熱 (強勢股單一指標偏高屬正常)
+    if st['rsi'] >= RSI_BUY_MAX and st['k'] >= K_BUY_MAX:
+        reasons.append(f"RSI {st['rsi']:.1f} 且 K {st['k']:.1f} 同時極端")
+    # 短線乖離過大 (追高風險)
+    if BIAS5_BUY_MAX is not None and st['bias5'] >= BIAS5_BUY_MAX:
+        reasons.append(f"5日乖離 {st['bias5']:.1f}% ≥ {BIAS5_BUY_MAX:.0f}%")
+    return reasons
+
 def is_overheated_for_buy(code, name, cache):
     """買進前過熱檢查。回傳 True = 過熱 (不買)。資料取得失敗時不阻擋 (沿用原本行為)"""
     if not USE_BUY_FILTER:
@@ -124,13 +141,7 @@ def is_overheated_for_buy(code, name, cache):
         if st is None:
             print(f"⚠️ [過熱檢查] {code} {name} 指標資料不足，略過過濾直接放行", flush=True)
         else:
-            reasons = []
-            # RSI 與 K 同時極端才算過熱 (強勢股單一指標偏高屬正常)
-            if st['rsi'] >= RSI_BUY_MAX and st['k'] >= K_BUY_MAX:
-                reasons.append(f"RSI {st['rsi']:.1f} 且 K {st['k']:.1f} 同時極端")
-            # 短線乖離過大 (追高風險)
-            if BIAS5_BUY_MAX is not None and st['bias5'] >= BIAS5_BUY_MAX:
-                reasons.append(f"5日乖離 {st['bias5']:.1f}% ≥ {BIAS5_BUY_MAX:.0f}%")
+            reasons = buy_overheat_reasons(st)
             info = f"RSI {st['rsi']:.1f} | K {st['k']:.1f} | D {st['d']:.1f} | 5日乖離 {st['bias5']:.1f}%"
             if reasons:
                 overheated = True
@@ -141,6 +152,69 @@ def is_overheated_for_buy(code, name, cache):
         print(f"⚠️ [過熱檢查] {code} {name} 失敗，略過過濾直接放行: {e}", flush=True)
     cache[code] = overheated
     return overheated
+
+def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
+    """
+    指標面出場判斷 (實盤與回測共用)，回傳 (should_sell, exit_reason)。
+    判斷順序：-5% 止損 → RSI/KD 鎖利 (有獲利才啟動) → MACD 柱狀體連續縮小。日期規則不在這裡。
+    """
+    if macd_weak_days is None:
+        macd_weak_days = MACD_WEAK_DAYS
+    if use_exit_filter is None:
+        use_exit_filter = USE_EXIT_FILTER
+
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
+    osc_tail = [float(x) for x in osc.iloc[-(macd_weak_days + 1):]]
+    macd_weak = len(osc_tail) == macd_weak_days + 1 and all(
+        osc_tail[i + 1] < osc_tail[i] for i in range(macd_weak_days)
+    )
+
+    ind = get_indicator_status(df) if use_exit_filter else None
+    can_lock_profit = (ret > 0) or (not EXIT_ONLY_WHEN_PROFIT)
+
+    if ret <= -5.0:
+        return True, "🚨 大跌觸發止損 (-5%)"
+    if ind and can_lock_profit and ind['rsi'] > RSI_EXIT:
+        return True, f"🔥 RSI 過熱鎖利出場 (RSI {ind['rsi']:.1f})"
+    if ind and can_lock_profit and ind['kd_dead_cross']:
+        return True, f"🔥 KD 高檔死叉鎖利出場 (K {ind['k']:.1f} < D {ind['d']:.1f})"
+    if macd_weak:
+        return True, "📉 MACD多頭減弱出場"
+    return False, ""
+
+def calendar_exit_reason(weekday, buy_weekday):
+    """T+2 / 週五日期強制出場規則，回傳出場原因；不需出場回傳空字串 (實盤與回測共用)"""
+    if weekday == 3 and buy_weekday in [0, 1, 2]:
+        return "📅 週四清空週一至週三持股 (T+2)"
+    if weekday >= 4 and buy_weekday == 3:
+        return "📅 週五清空週四精選短線股 (T+2)"
+    if weekday >= 4:
+        # 週五起清空所有殘餘持股 (例如週四排程沒跑到)，讓週五結算涵蓋整週
+        return "📅 週五/週末強制結算殘餘持股"
+    return ""
+
+def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
+    """依星期決定買進標的 (輸入為已過濾過熱後的清單，實盤與回測共用)"""
+    # 週一 ~ 週三建倉：兩策略各取前 5 名
+    if weekday in [0, 1, 2]:
+        return st1_targets[:5] + st2_targets[:5]
+
+    # 週四建倉：精選 1 檔 (優先選擇策略二 >= 100 分最高分，否則買策略一第 1 名)
+    if weekday == 3:
+        st2_qualified = [t for t in st2_targets if t[4] >= 100]
+        if st2_qualified:
+            max_score = max(t[4] for t in st2_qualified)
+            picked = [t for t in st2_qualified if t[4] == max_score][:1]
+            if verbose:
+                print(f"🔥 [週四精選買入] 選用策略二最高分 ({picked[0][4]}分) 標的: {picked[0][1]}", flush=True)
+            return picked
+        if st1_targets:
+            if verbose:
+                print(f"🔥 [週四精選買入] 策略二未達 100 分，改選策略一第 1 名: {st1_targets[0][1]}", flush=True)
+            return st1_targets[:1]
+    return []
 
 # =============================================================================
 # 📝 解析 cron_job 產生的推薦報告
@@ -232,9 +306,9 @@ def init_sim_db():
 def get_0050_weekly_return():
     """抓取 0050 當週開盤價與最新收盤價，計算當週漲跌幅 (%) [加入週末/假期回溯強化]"""
     try:
-        now = datetime.datetime.now()
+        now = now_tw()
         monday_dt = now - datetime.timedelta(days=now.weekday())
-        
+
         # 往前多抓 3 天，避免週末或連假時 API 查無當週資料
         start_date = (monday_dt - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
         
@@ -355,7 +429,7 @@ def process_simulation():
     conn = get_db_connection()
     if not conn: return
     
-    now = datetime.datetime.now()
+    now = now_tw()
     today_str = now.strftime('%Y-%m-%d')
     weekday = now.weekday()  # 0:週一, 1:週二, 2:週三, 3:週四, 4:週五, 5:週六, 6:週日
 
@@ -380,42 +454,13 @@ def process_simulation():
 
             if df is not None and len(df) >= 2:
                 curr_price = float(df.iloc[-1]['close'])
-                
-                exp1 = df['close'].ewm(span=12, adjust=False).mean()
-                exp2 = df['close'].ewm(span=26, adjust=False).mean()
-                osc = (exp1 - exp2) - (exp1 - exp2).ewm(span=9, adjust=False).mean()
-                
                 ret = ((curr_price - buy_price) / buy_price) * 100
-                should_sell, exit_reason = False, ""
 
-                # MACD 柱狀體連續 MACD_WEAK_DAYS 天縮小 (預設 1 天 = 原本行為)
-                osc_tail = [float(x) for x in osc.iloc[-(MACD_WEAK_DAYS + 1):]]
-                macd_weak = len(osc_tail) == MACD_WEAK_DAYS + 1 and all(
-                    osc_tail[i + 1] < osc_tail[i] for i in range(MACD_WEAK_DAYS)
-                )
-
-                # 🆕 過熱狀態 (RSI / KD)；只在有獲利時啟動鎖利，不在虧損時提前砍
-                ind = get_indicator_status(df) if USE_EXIT_FILTER else None
-                can_lock_profit = (ret > 0) or (not EXIT_ONLY_WHEN_PROFIT)
-
-                # 風控/MACD 先行判斷
-                if ret <= -5.0:
-                    should_sell, exit_reason = True, "🚨 大跌觸發止損 (-5%)"
-                elif ind and can_lock_profit and ind['rsi'] > RSI_EXIT:
-                    should_sell, exit_reason = True, f"🔥 RSI 過熱鎖利出場 (RSI {ind['rsi']:.1f})"
-                elif ind and can_lock_profit and ind['kd_dead_cross']:
-                    should_sell, exit_reason = True, f"🔥 KD 高檔死叉鎖利出場 (K {ind['k']:.1f} < D {ind['d']:.1f})"
-                elif macd_weak:
-                    should_sell, exit_reason = True, "📉 MACD多頭減弱出場"
-                
-                # 精準 T+2 日期強制清空規則
-                elif weekday == 3 and buy_weekday in [0, 1, 2]:
-                    should_sell, exit_reason = True, "📅 週四清空週一至週三持股 (T+2)"
-                elif weekday >= 4 and buy_weekday == 3:
-                    should_sell, exit_reason = True, "📅 週五清空週四精選短線股 (T+2)"
-                elif weekday >= 4:
-                    # 🆕 週五起清空所有殘餘持股 (例如週四排程沒跑到)，讓週五結算涵蓋整週
-                    should_sell, exit_reason = True, "📅 週五/週末強制結算殘餘持股"
+                # 風控 / RSI·KD 鎖利 / MACD 減弱 先行判斷，再套用 T+2 日期強制清空規則
+                should_sell, exit_reason = check_exit_signal(df, ret)
+                if not should_sell:
+                    exit_reason = calendar_exit_reason(weekday, buy_weekday)
+                    should_sell = bool(exit_reason)
 
                 if should_sell:
                     cursor.execute('''
@@ -506,22 +551,7 @@ def process_simulation():
                 st1_targets = [t for t in st1_targets if not is_overheated_for_buy(t[0], t[1], overheat_cache)]
                 st2_targets = [t for t in st2_targets if not is_overheated_for_buy(t[0], t[1], overheat_cache)]
 
-                buy_targets = []
-
-                # 週一 ~ 週三建倉
-                if weekday in [0, 1, 2]:
-                    buy_targets = st1_targets[:5] + st2_targets[:5]
-
-                # 週四建倉：買入週三推薦股 (優先選擇策略二 >= 100 分第 1 名，否則買策略一第 1 名)
-                elif weekday == 3:
-                    st2_qualified = [t for t in st2_targets if t[4] >= 100]
-                    if st2_qualified:
-                        max_score = max(t[4] for t in st2_qualified)
-                        buy_targets = [t for t in st2_qualified if t[4] == max_score][:1]
-                        print(f"🔥 [週四精選買入] 選用策略二最高分 ({buy_targets[0][4]}分) 標的: {buy_targets[0][1]}", flush=True)
-                    elif st1_targets:
-                        buy_targets = st1_targets[:1]
-                        print(f"🔥 [週四精選買入] 策略二未達 100 分，改選策略一第 1 名: {buy_targets[0][1]}", flush=True)
+                buy_targets = pick_buy_targets(st1_targets, st2_targets, weekday)
 
                 for item in buy_targets:
                     code, name, price, st_type = item[0], item[1], item[2], item[3]
