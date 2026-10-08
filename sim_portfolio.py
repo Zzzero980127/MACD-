@@ -46,6 +46,9 @@ MACD_WEAK_DAYS = 1
 STOP_LOSS_PCT = -5.0          # 停損 (%)
 TAKE_PROFIT_PCT = 5.0         # 停利 (%)；舊設定 None
 MACD_EXIT_ONLY_PROFIT = True  # MACD 減弱只在有獲利時才出場 (MACD 1 天就賣的單勝率僅 6%)；舊設定 False
+# 虧損時的雙重確認出場：綠柱擴大 (空方力道加大) 且 收盤跌破 N 日均線 才賣，單一訊號視為洗盤不賣；None = 關閉
+# (例：晶豪科 10/6 綠柱 -1.55→-2.04、收盤 273.5 跌破 10 日線 280.6 → -3.0% 出場，不必等到 -5% 停損)
+LOSS_EXIT_MA = 10
 MARKET_MA = None              # 大盤濾網：0050 站上 N 日均線才買 (回測無效，維持關閉)
 MIN_BUY_SCORE = None          # 週一~三買進的最低分數 (回測無差異，維持關閉)
 TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔 (有進場品質過濾後恢復 5)
@@ -228,7 +231,7 @@ def is_overheated_for_buy(code, name, cache):
 def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
     """
     指標面出場判斷 (實盤與回測共用)，回傳 (should_sell, exit_reason)。
-    判斷順序：停損 → 停利 → RSI/KD 鎖利 (有獲利才啟動) → MACD 柱狀體連續縮小。日期規則不在這裡。
+    判斷順序：停損 → 停利 → RSI/KD 鎖利 (有獲利才啟動) → MACD 柱狀體連續縮小 → 虧損時綠柱擴大且跌破均線。日期規則不在這裡。
     """
     if macd_weak_days is None:
         macd_weak_days = MACD_WEAK_DAYS
@@ -256,6 +259,11 @@ def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
         return True, f"🔥 KD 高檔死叉鎖利出場 (K {ind['k']:.1f} < D {ind['d']:.1f})"
     if macd_weak and (ret > 0 or not MACD_EXIT_ONLY_PROFIT):
         return True, "📉 MACD多頭減弱出場"
+    if LOSS_EXIT_MA and ret <= 0 and len(df) >= LOSS_EXIT_MA:
+        green_expanding = len(osc) >= 2 and osc.iloc[-1] < 0 and osc.iloc[-1] < osc.iloc[-2]
+        ma = df['close'].rolling(LOSS_EXIT_MA).mean().iloc[-1]
+        if green_expanding and float(df['close'].iloc[-1]) < float(ma):
+            return True, f"📉 綠柱擴大且跌破{LOSS_EXIT_MA}日線停損"
     return False, ""
 
 def market_ok(df_market):

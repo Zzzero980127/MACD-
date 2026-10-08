@@ -34,7 +34,8 @@ TRADE_AMOUNT = 100000  # 與週報、戰報一致：每筆固定 10 萬
 BASE = dict(USE_BUY_FILTER=True, USE_EXIT_FILTER=True, MACD_WEAK_DAYS=1, STOP_LOSS_PCT=-5.0,
             TAKE_PROFIT_PCT=None, MACD_EXIT_ONLY_PROFIT=False, MARKET_MA=None,
             MIN_BUY_SCORE=None, TOP_N_PER_STRATEGY=5, STRATEGY2_TOP_N=None,
-            MAX_DAY_PCT=None, MIN_ADX=None, MAX_RET20=None, MON_WED_BUY_DAYS=(0, 1, 2))
+            MAX_DAY_PCT=None, MIN_ADX=None, MAX_RET20=None, MON_WED_BUY_DAYS=(0, 1, 2),
+            LOSS_EXIT_MA=None)
 COMBO_A = dict(BASE, MACD_EXIT_ONLY_PROFIT=True, TAKE_PROFIT_PCT=5.0)
 CONFIGS = [
     ("原版 (無 RSI/KD)", dict(BASE, USE_BUY_FILTER=False, USE_EXIT_FILTER=False)),
@@ -56,6 +57,11 @@ CONFIGS = [
     ("組合D: A + 前3名 + 策略二2檔", dict(COMBO_A, TOP_N_PER_STRATEGY=3, STRATEGY2_TOP_N=2)),
     ("組合E: A + MACD連2天", dict(COMBO_A, MACD_WEAK_DAYS=2)),
     ("組合F: 停利5% + 前3名", dict(BASE, TAKE_PROFIT_PCT=5.0, TOP_N_PER_STRATEGY=3)),
+    # 現行設定上只改虧損時的出場方式 (LOSS_EXIT_MA 為現行預設值 10)
+    ("現行 - 關閉綠柱+破線停損", dict(LOSS_EXIT_MA=None)),
+    ("現行: 綠柱擴大+破5日線", dict(LOSS_EXIT_MA=5)),
+    ("現行: 綠柱擴大+破20日線", dict(LOSS_EXIT_MA=20)),
+    ("現行: 綠柱+破10日線 + 停損-4%", dict(STOP_LOSS_PCT=-4.0)),
 ]
 MARKET_CODE = "0050"
 
@@ -274,7 +280,7 @@ def _simulate(reports, prices, entry, market):
 # =============================================================================
 def exit_category(reason):
     for key, label in [("止損", "止損"), ("停利", "停利"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"),
-                       ("MACD", "MACD減弱"), ("📅", "日期出場")]:
+                       ("綠柱擴大", "綠柱破線停損"), ("MACD", "MACD減弱"), ("📅", "日期出場")]:
         if key in reason:
             return label
     return "其他"
