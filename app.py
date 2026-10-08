@@ -159,6 +159,15 @@ def get_sim_portfolio_report():
             lines.append("🛒 【當前持股明細】")
             lines.append("\n┈┈┈┈┈┈┈┈┈┈\n".join(hold_lines_temp))
 
+        # A-2. 尚未成交的掛單 (下一個交易日以開盤價成交)
+        cursor.execute("SELECT stock_code, stock_name, strategy_type, buy_date FROM sim_trades WHERE status = 'PENDING' ORDER BY id;")
+        pendings = cursor.fetchall()
+        if pendings:
+            lines.append("--------------------")
+            lines.append("📝 【待成交掛單】(推薦隔日以開盤價買進)")
+            for code, name, st_type, buy_date in pendings:
+                lines.append(f"🔸 {code} {name} ({st_type[:3]}) | 推薦日: {buy_date}")
+
         lines.append("\n====================\n")
 
         # B. 抓取【歷史平倉】戰績統計

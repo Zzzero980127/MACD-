@@ -63,6 +63,13 @@ def main():
             print(f"  {code} {name} [{st_type}] 買 {buy_date} @{float(buy_price):.2f} → {curr:.2f} "
                   f"({ret:+.2f}%) | 下次執行: {reason or '續抱'}")
 
+        cur.execute("SELECT stock_code, stock_name, strategy_type, buy_date FROM sim_trades "
+                    "WHERE status = 'PENDING' ORDER BY id;")
+        pendings = cur.fetchall()
+        print(f"\n📝 待成交掛單 {len(pendings)} 檔 (下次執行以推薦隔日開盤價成交)")
+        for code, name, st_type, buy_date in pendings:
+            print(f"  {code} {name} [{st_type}] 推薦日 {buy_date}")
+
         # 3. 本週平倉
         cur.execute("SELECT stock_code, stock_name, buy_date, sell_date, return_rate, exit_reason FROM sim_trades "
                     "WHERE status = 'CLOSED' AND sell_date >= %s ORDER BY sell_date, id;", (monday,))

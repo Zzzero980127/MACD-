@@ -9,7 +9,7 @@ check_exit_signal / calendar_exit_reason / buy_overheat_reasons)，與實盤一�
 執行前需要環境變數：DATABASE_URL、FINMIND_API_TOKEN
     pip install -r requirements.txt
     python backtest.py
-    python backtest.py --start 2026-07-01 --end 2026-09-30 --entry next_open
+    python backtest.py --start 2026-07-01 --end 2026-09-30 --entry report
 
 價格資料會快取在 .backtest_cache/，重跑不會重複消耗 FinMind 額度。
 """
@@ -170,13 +170,13 @@ def week_of(d):
     return d.isocalendar()[:2]
 
 
-def simulate(reports, prices, entry="report", market=None, **overrides):
+def simulate(reports, prices, entry="next_open", market=None, **overrides):
     """
     逐日重播：每天先跑出場、再依當天報告買進 (與 process_simulation 順序相同)。
     overrides  暫時覆寫 sim_portfolio 參數 (例如 MACD_WEAK_DAYS=2)，結束後還原
     market     0050 日 K，大盤濾網用
-    entry="report"    用報告上的收盤價買 (與實盤相同)
-    entry="next_open" 用隔一個交易日開盤價買 (較貼近真實可成交價)
+    entry="next_open" 用隔一個交易日開盤價買 (與實盤 ENTRY_AT_NEXT_OPEN=True 相同)
+    entry="report"    用報告上的收盤價買 (舊實盤做法)
     回傳 (trades, stats)；trades 中 sell_date 為 None 代表資料結束時仍持有。
     """
     saved = {k: getattr(sp, k) for k in overrides}
@@ -332,8 +332,8 @@ def main():
     ap = argparse.ArgumentParser(description="模擬倉回測")
     ap.add_argument("--start", type=lambda s: datetime.date.fromisoformat(s), help="起始報告日 YYYY-MM-DD")
     ap.add_argument("--end", type=lambda s: datetime.date.fromisoformat(s), help="結束報告日 YYYY-MM-DD")
-    ap.add_argument("--entry", choices=["report", "next_open"], default="report",
-                    help="report=報告收盤價買 (同實盤)；next_open=隔日開盤價買")
+    ap.add_argument("--entry", choices=["report", "next_open"], default="next_open",
+                    help="next_open=隔日開盤價買 (同實盤)；report=報告收盤價買 (舊做法)")
     ap.add_argument("--csv", default="backtest_trades.csv", help="逐筆交易輸出檔")
     ap.add_argument("--offline", action="store_true", help="使用上次快取的報告與價格，不連資料庫")
     args = ap.parse_args()

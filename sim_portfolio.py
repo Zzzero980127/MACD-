@@ -59,6 +59,12 @@ MIN_ADX = 20.0                # ADX(14) 下限：趨勢夠強才買 (網路常�
 MAX_RET20 = 10.0              # 近 20 日漲幅上限 (%)：已經漲多的不追
 MON_WED_BUY_DAYS = (0, 1, 2)  # 週一~三中哪幾天建倉 (例如 (0, 1) = 週三不買；回測差異不大，維持)
 
+# --- 進場價 ---
+# True ：推薦當天先掛單 (PENDING)，下一次執行時以「推薦隔一個交易日的開盤價」成交 (同 backtest.py --entry next_open)
+# False：舊做法，直接以推薦報告上的收盤價買進 (實際上收盤後已買不到這個價)
+ENTRY_AT_NEXT_OPEN = True
+PENDING_EXPIRE_DAYS = 7       # 掛單超過幾天仍抓不到隔日開盤價 (停牌等) 就取消
+
 PRICE_LOOKBACK_DAYS = 90   # 指標暖機用，約 60 個交易日
 
 # 🕗 一律用台灣時間判斷日期與星期 (Render 等雲端主機預設 UTC，台灣早上 8 點前會被算成前一天)
@@ -506,6 +512,29 @@ def sync_to_google_sheets(summary):
     except Exception as e:
         print(f"❌ [Google Sheets Sync Error] {e}", flush=True)
 
+def fill_pending_orders(cursor, now):
+    """掛單成交：以推薦日之後第一個交易日的開盤價買進 (PENDING → HOLD)；逾期抓不到價格則取消"""
+    cursor.execute("SELECT id, stock_code, stock_name, buy_date FROM sim_trades WHERE status = 'PENDING' ORDER BY id;")
+    for trade_id, code, name, buy_date_str in cursor.fetchall():
+        try:
+            df = fetch_price_df(code)
+        except Exception as e:
+            print(f"⚠️ [掛單成交] {code} {name} 價格抓取失敗，下次再試: {e}", flush=True)
+            continue
+
+        nxt = df[(df['date'] > buy_date_str) & (df['open'] > 0)] if df is not None else None
+        if nxt is not None and not nxt.empty:
+            open_price = float(nxt['open'].iloc[0])
+            cursor.execute("UPDATE sim_trades SET buy_price = %s, status = 'HOLD' WHERE id = %s;",
+                           (open_price, trade_id))
+            print(f"🛒 [模擬買入成交] {code} {name} | 推薦日 {buy_date_str} → {nxt['date'].iloc[0]} 開盤價 ${open_price:.2f}", flush=True)
+        elif (now - datetime.datetime.strptime(buy_date_str, '%Y-%m-%d')).days > PENDING_EXPIRE_DAYS:
+            cursor.execute("UPDATE sim_trades SET status = 'CANCELLED', exit_reason = %s WHERE id = %s;",
+                           (f"⌛ 超過 {PENDING_EXPIRE_DAYS} 天抓不到隔日開盤價，取消掛單", trade_id))
+            print(f"⌛ [掛單取消] {code} {name} | 推薦日 {buy_date_str} 之後查無開盤價", flush=True)
+        else:
+            print(f"⏳ [掛單等待] {code} {name} | 推薦日 {buy_date_str} 之後尚無 K 棒，下次執行再成交", flush=True)
+
 def process_simulation():
     conn = get_db_connection()
     if not conn: return
@@ -517,6 +546,11 @@ def process_simulation():
     try:
         cursor = conn.cursor()
         print(f"🎯 [Sim Engine] 執行日期: {today_str} (週{weekday + 1}) | 總資金設定: ${TOTAL_CAPITAL:,.0f}", flush=True)
+
+        # -------------------------------------------------------------------------
+        # 0. 先讓上一次推薦的掛單以隔日開盤價成交，成交當天收盤即納入下方出場判斷 (同回測)
+        # -------------------------------------------------------------------------
+        fill_pending_orders(cursor, now)
 
         # -------------------------------------------------------------------------
         # A. 賣出邏輯 (精準執行 T+2 雙軌出場 + 🆕 RSI/KD 過熱出場)
@@ -658,11 +692,17 @@ def process_simulation():
                     if cursor.fetchone():
                         continue
 
+                    # buy_date 一律記推薦日 (週四/週五日期出場規則依此判斷)；
+                    # 掛單時 buy_price 先暫填報告收盤價，成交時改為隔日開盤價
+                    status = 'PENDING' if ENTRY_AT_NEXT_OPEN else 'HOLD'
                     cursor.execute('''
                         INSERT INTO sim_trades (stock_code, stock_name, strategy_type, buy_date, buy_price, status)
-                        VALUES (%s, %s, %s, %s, %s, 'HOLD');
-                    ''', (code, name, st_type, today_str, price))
-                    print(f"🛒 [模擬買入成功] [{st_type}] {code} {name} | 掛單成交價: ${price:.2f}", flush=True)
+                        VALUES (%s, %s, %s, %s, %s, %s);
+                    ''', (code, name, st_type, today_str, price, status))
+                    if ENTRY_AT_NEXT_OPEN:
+                        print(f"📝 [模擬掛單] [{st_type}] {code} {name} | 報告收盤 ${price:.2f}，隔日以開盤價成交", flush=True)
+                    else:
+                        print(f"🛒 [模擬買入成功] [{st_type}] {code} {name} | 掛單成交價: ${price:.2f}", flush=True)
 
         conn.commit()
         cursor.close()
