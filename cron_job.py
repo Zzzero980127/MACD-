@@ -248,6 +248,17 @@ def check_technical_pass(stock_info, current_idx, total_count):
         "close_price": close_price
     }
 
+def entry_block_reasons(df):
+    """套用模擬倉的進場過濾 (RSI/KD 過熱、5日乖離、當天漲幅、ADX、20日漲幅)，回傳不買原因；無法判斷時放行"""
+    if not sim_portfolio:
+        return []
+    try:
+        df_sp = df.rename(columns={'Close': 'close', 'High': 'max', 'Low': 'min', 'Open': 'open'})
+        return sim_portfolio.buy_block_reasons(df_sp)[0]
+    except Exception as e:
+        print(f"  ⚠️ 進場過濾計算失敗，直接放行: {e}", flush=True)
+        return []
+
 # 🔍 第二階段：籌碼與綜合評分 (結合外資與主力雙重濾網)
 def fetch_chip_and_score(tech_data, market_major_map):
     stock_id = tech_data["code"]
@@ -467,15 +478,21 @@ def run_precalculation():
 
     for idx, tech_data in enumerate(tech_passed_list, 1):
         scored_stock = fetch_chip_and_score(tech_data, market_major_map)
+        scored_stock['block_reasons'] = entry_block_reasons(tech_data['df'])
         all_passed_stocks.append(scored_stock)
-        print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分", flush=True)
+        block_note = f" | 🧊 不符進場條件: {' / '.join(scored_stock['block_reasons'])}" if scored_stock['block_reasons'] else ""
+        print(f"  ✅ [{idx}/{len(tech_passed_list)}] {scored_stock['code']} {scored_stock['name']} 評分完成: {scored_stock['score']}分{block_note}", flush=True)
         time.sleep(1.0)
 
-    wash_breakout_stocks = [s for s in all_passed_stocks if s['is_wash_breakout']]
+    # 🧊 先剔除不符模擬倉進場條件的標的再排名，讓推薦名單 = 模擬倉實際會買的名單 (被剔除的由下一名遞補)
+    buyable_stocks = [s for s in all_passed_stocks if not s['block_reasons']]
+    blocked_stocks = sorted([s for s in all_passed_stocks if s['block_reasons']], key=lambda x: x['score'], reverse=True)
+
+    wash_breakout_stocks = [s for s in buyable_stocks if s['is_wash_breakout']]
     wash_breakout_stocks.sort(key=lambda x: x['score'], reverse=True)
     top_wash_breakout = wash_breakout_stocks[:5]
 
-    strategy_1_candidates = [s for s in all_passed_stocks if not s['is_wash_breakout']]
+    strategy_1_candidates = [s for s in buyable_stocks if not s['is_wash_breakout']]
     strategy_1_candidates.sort(key=lambda x: x['score'], reverse=True)
     top_bottom_turn = strategy_1_candidates[:5]
 
@@ -516,6 +533,13 @@ def run_precalculation():
             )
             if idx < len(top_wash_breakout) - 1:
                 lines.append("┈┈┈┈┈┈┈┈┈┈")
+
+    # 被進場過濾擋下的高分股只列代號與原因 (不寫收盤價，模擬倉解析報告時不會當成買進標的)
+    if blocked_stocks:
+        lines.append("\n====================\n")
+        lines.append("🧊 【高分但不符進場條件 (僅供參考，不建議追)】")
+        for item in blocked_stocks[:5]:
+            lines.append(f"▫️ {item['code']} {item['name']} {item['score']}分 | {' / '.join(item['block_reasons'])}")
 
     report = "\n".join(lines)
 
