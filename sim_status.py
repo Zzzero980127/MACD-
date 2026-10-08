@@ -59,7 +59,9 @@ def main():
             ret = (curr - float(buy_price)) / float(buy_price) * 100
             sell, reason = sp.check_exit_signal(df, ret)
             if not sell:
-                reason = sp.calendar_exit_reason(now.weekday(), datetime.datetime.strptime(buy_date, '%Y-%m-%d').weekday())
+                bd = datetime.datetime.strptime(buy_date, '%Y-%m-%d')
+                reason = sp.calendar_exit_reason(now.weekday(), bd.weekday(),
+                                                 bd.isocalendar()[:2] != now.isocalendar()[:2])
             print(f"  {code} {name} [{st_type}] 買 {buy_date} @{float(buy_price):.2f} → {curr:.2f} "
                   f"({ret:+.2f}%) | 下次執行: {reason or '續抱'}")
 

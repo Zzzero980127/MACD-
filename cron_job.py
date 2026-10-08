@@ -95,6 +95,20 @@ def save_to_db(report_text, date_str="LATEST"):
     except Exception as e:
         print(f"⚠️ [DB Log] 資料庫寫入失敗: {e}", flush=True)
 
+def load_from_db(date_str):
+    conn = get_db_connection()
+    if not conn: return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM history WHERE date = %s;", (date_str,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"⚠️ [DB Log] 讀取今日報告失敗: {e}", flush=True)
+        return None
+
 def send_line_push(report_text):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("⚠️ [LINE Log] 未設定 LINE Token，略過推播", flush=True)
@@ -170,6 +184,10 @@ def check_technical_pass(stock_info, current_idx, total_count):
         df[col] = pd.to_numeric(df[col], errors='coerce')
         
     df = df.dropna(subset=['Close', 'Volume', 'High', 'Low', 'Open'])
+    if df['date'].iloc[-1] != now_tw().strftime("%Y-%m-%d"):
+        print(f"  ⚪ {prefix} [{stock_id} {stock_name}] 今日 K 棒尚未更新 (最新 {df['date'].iloc[-1]})，跳過", flush=True)
+        return None
+
     if len(df) < 35:
         print(f"  ⚪ {prefix} [{stock_id} {stock_name}] K線天數不足 35 天，跳過", flush=True)
         return None
@@ -265,7 +283,9 @@ def fetch_chip_and_score(tech_data, market_major_map):
                 
                 daily_chip = daily_total.merge(foreign_df, on='date', how='left').merge(trust_df, on='date', how='left').fillna(0).sort_values('date')
                 
-                if len(daily_chip) >= 2:
+                if daily_chip.iloc[-1]['date'] != now_tw().strftime("%Y-%m-%d"):
+                    print(f"  ⚠️ [{stock_id} {stock_name}] 今日法人資料尚未更新，籌碼以 0 計算", flush=True)
+                elif len(daily_chip) >= 2:
                     today_total = float(daily_chip.iloc[-1]['total_net'])
                     today_foreign = float(daily_chip.iloc[-1]['foreign_net'])
                     prev_foreign = float(daily_chip.iloc[-2]['foreign_net'])
@@ -387,6 +407,16 @@ def run_precalculation():
     print("==================================================", flush=True)
     print(f"🚀 [Cron Job] 開始執行 AI 排程選股 ({now_tw().strftime('%Y-%m-%d %H:%M')})...", flush=True)
 
+    # 🗓️ 休市日 (國定假日/補假) 沒有新行情，不重發前一天的報告
+    if sim_portfolio and not sim_portfolio.is_trading_day(now_tw().date()):
+        print("🗓️ [Cron Job] 今天休市，不產生選股報告、不推播", flush=True)
+        return
+
+    # ⏳ FinMind 日K 約 17:30、三大法人約 20:00 才更新；資料不完整時算出來的分數會混到前一天的籌碼，乾脆不跑
+    if sim_portfolio and not sim_portfolio.market_data_ready(now_tw().date(), need_chip=True):
+        print("⏳ [Cron Job] FinMind 今日股價 / 三大法人尚未更新完成，不產生報告 (請排在 20:00 之後或稍後重跑)", flush=True)
+        return
+
     # ⚡ 開頭先批次獲取全市場主力籌碼
     market_major_map = fetch_market_major_holders()
 
@@ -489,9 +519,15 @@ def run_precalculation():
 
     report = "\n".join(lines)
 
+    prev_report = load_from_db(today_str)
     save_to_db(report, "LATEST")
     save_to_db(report, today_str)
-    send_line_push(report)
+    if prev_report == report:
+        print("📭 [LINE Log] 報告與今天稍早推播的內容相同，不重複推播", flush=True)
+    elif prev_report:
+        send_line_push("🔄 今日選股報告已更新 (以此版為準，模擬倉也改用此版掛單)\n" + report)
+    else:
+        send_line_push(report)
 
     print("\n🎉 [Cron Job Log] 排程選股與 LINE 推播全數完畢！", flush=True)
 

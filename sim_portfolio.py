@@ -76,6 +76,45 @@ TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 def now_tw():
     return datetime.datetime.now(TW_TZ).replace(tzinfo=None)
 
+_TRADING_DAYS = {}
+
+def is_trading_day(d):
+    """依 FinMind 台股交易日曆 (含未來的國定假日/補假) 判斷是否開盤；查詢失敗時以週一~五視為交易日"""
+    if d.year not in _TRADING_DAYS:
+        params = {"dataset": "TaiwanStockTradingDate",
+                  "start_date": f"{d.year}-01-01", "end_date": f"{d.year}-12-31"}
+        if FINMIND_TOKEN:
+            params["token"] = FINMIND_TOKEN
+        try:
+            res = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json()
+            _TRADING_DAYS[d.year] = {x['date'] for x in res.get('data') or []} or None
+        except Exception as e:
+            print(f"⚠️ [交易日曆] 查詢失敗，改以週一~五判斷: {e}", flush=True)
+            _TRADING_DAYS[d.year] = None
+    days = _TRADING_DAYS[d.year]
+    return d.weekday() < 5 if not days else d.strftime('%Y-%m-%d') in days
+
+def market_data_ready(d, need_chip=False):
+    """FinMind 是否已有 d 當天資料：日 K 官方約 17:30 更新 (以 0050 檢查)；
+    need_chip=True 時再檢查三大法人 (官方約 20:00 更新，以 2330 檢查)。查詢失敗視為未就緒"""
+    ds = d.strftime('%Y-%m-%d')
+    checks = [("TaiwanStockPrice", "0050", "日K")]
+    if need_chip:
+        checks.append(("TaiwanStockInstitutionalInvestorsBuySell", "2330", "三大法人"))
+    for dataset, code, label in checks:
+        params = {"dataset": dataset, "data_id": code, "start_date": ds}
+        if FINMIND_TOKEN:
+            params["token"] = FINMIND_TOKEN
+        try:
+            data = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=8).json().get("data") or []
+        except Exception as e:
+            print(f"⚠️ [資料檢查] {label} 查詢失敗，視為尚未更新: {e}", flush=True)
+            return False
+        if not any(x.get("date") == ds for x in data):
+            print(f"⏳ [資料檢查] FinMind {label} 尚無 {ds} 資料", flush=True)
+            return False
+    return True
+
 # =============================================================================
 # 📐 技術指標計算
 # =============================================================================
@@ -273,8 +312,12 @@ def market_ok(df_market):
     ma = df_market['close'].rolling(MARKET_MA).mean().iloc[-1]
     return float(df_market['close'].iloc[-1]) >= float(ma)
 
-def calendar_exit_reason(weekday, buy_weekday):
-    """T+2 / 週五日期強制出場規則，回傳出場原因；不需出場回傳空字串 (實盤與回測共用)"""
+def calendar_exit_reason(weekday, buy_weekday, new_week=False):
+    """T+2 / 週五日期強制出場規則，回傳出場原因；不需出場回傳空字串 (實盤與回測共用)
+    new_week：今天與推薦日不同週 (例如週五補假，週四精選股到下週一才以開盤價成交)"""
+    if new_week:
+        # 跨週的持股在成交後第一個交易日收盤出場，維持原本只抱 1 天的設計，不會一路抱到下週五
+        return "📅 跨週持股 (遇休市) 於下一交易日出場"
     if weekday == 3 and buy_weekday in [0, 1, 2]:
         return "📅 週四清空週一至週三持股 (T+2)"
     if weekday >= 4 and buy_weekday == 3:
@@ -558,13 +601,23 @@ def process_simulation():
         # -------------------------------------------------------------------------
         # 0. 先讓上一次推薦的掛單以隔日開盤價成交，成交當天收盤即納入下方出場判斷 (同回測)
         # -------------------------------------------------------------------------
-        fill_pending_orders(cursor, now)
+        # 🗓️ 休市日 (國定假日/補假)：沒有新 K 棒，不成交、不賣出、不建倉，只保留週結算
+        trading = is_trading_day(now.date())
+        data_pending = False  # 交易日但 FinMind 今日 K 棒還沒出來
+        if not trading:
+            print(f"🗓️ [休市] {today_str} 非交易日，略過成交 / 出場 / 建倉", flush=True)
+        elif not market_data_ready(now.date()):
+            # 沒有今日 K 棒時若照跑，會用「前一天收盤價」賣出 / 成交，所以整個跳過，等資料更新後再跑
+            trading, data_pending = False, True
+            print(f"⏳ [資料未更新] {today_str} 今日股價尚未公布，略過成交 / 出場 / 建倉 / 週結算", flush=True)
+        else:
+            fill_pending_orders(cursor, now)
 
         # -------------------------------------------------------------------------
         # A. 賣出邏輯 (精準執行 T+2 雙軌出場 + 🆕 RSI/KD 過熱出場)
         # -------------------------------------------------------------------------
         cursor.execute("SELECT id, stock_code, stock_name, buy_price, buy_date FROM sim_trades WHERE status = 'HOLD';")
-        holding_stocks = cursor.fetchall()
+        holding_stocks = cursor.fetchall() if trading else []
 
         for item in holding_stocks:
             trade_id, code, name, buy_price, buy_date_str = item
@@ -582,7 +635,8 @@ def process_simulation():
                 # 風控 / RSI·KD 鎖利 / MACD 減弱 先行判斷，再套用 T+2 日期強制清空規則
                 should_sell, exit_reason = check_exit_signal(df, ret)
                 if not should_sell:
-                    exit_reason = calendar_exit_reason(weekday, buy_weekday)
+                    new_week = buy_dt.isocalendar()[:2] != now.isocalendar()[:2]
+                    exit_reason = calendar_exit_reason(weekday, buy_weekday, new_week)
                     should_sell = bool(exit_reason)
 
                 if should_sell:
@@ -597,7 +651,7 @@ def process_simulation():
         # B. 週結算與同步 (🎯 修正區塊：SQL 去重並限定本週平倉，確保當週精準 15 筆)
         # -------------------------------------------------------------------------
         # 🆕 週五起才結算：原本週四就以「週五日期」寫入試算表，週五平倉的週四精選股會因日期重複被跳過、永遠沒算進週報
-        if weekday in [4, 5, 6]:
+        if weekday in [4, 5, 6] and not data_pending:
             monday_dt = now - datetime.timedelta(days=now.weekday())
             friday_dt = monday_dt + datetime.timedelta(days=4)
             sunday_dt = monday_dt + datetime.timedelta(days=6)
@@ -661,9 +715,19 @@ def process_simulation():
         # -------------------------------------------------------------------------
         # C. 買進邏輯 (包含週四買入週三精選股條件 + 🆕 RSI/KD 過熱過濾)
         # -------------------------------------------------------------------------
-        if weekday in [0, 1, 2, 3]:
-            cursor.execute("SELECT content FROM history WHERE date = 'LATEST';")
+        if trading and weekday in [0, 1, 2, 3]:
+            # 只用「今天」的報告建倉 (LATEST 可能還是昨天的：今天選股因資料未更新而沒跑時，不可拿舊報告再買一次)
+            cursor.execute("SELECT content FROM history WHERE date = %s;", (now.strftime('%Y%m%d'),))
             row = cursor.fetchone()
+            if not row:
+                print(f"⏳ [建倉] 找不到今天 ({today_str}) 的選股報告，今日不建倉", flush=True)
+
+            # 同一天重跑 (例如手動在 cron-job.org 按 Run 測試)：今天的掛單還沒成交，先刪掉、改用最新報告重新掛單，
+            # 避免測試版與正式版推薦都被買進
+            if row and ENTRY_AT_NEXT_OPEN:
+                cursor.execute("DELETE FROM sim_trades WHERE status = 'PENDING' AND buy_date = %s;", (today_str,))
+                if cursor.rowcount:
+                    print(f"♻️ [重跑] 已撤銷今天稍早的 {cursor.rowcount} 筆掛單，依最新報告重新掛單", flush=True)
 
             market_pass = True
             if MARKET_MA:

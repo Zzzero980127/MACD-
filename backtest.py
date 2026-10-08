@@ -205,6 +205,8 @@ def _simulate(reports, prices, entry, market):
     last_bar = max((df['date'].iloc[-1] for df in prices.values() if df is not None and not df.empty),
                    default=last_report)
     day = min(reports)
+    # 以 0050 有 K 棒的日子當交易日，休市日不成交、不出場、不建倉 (同實盤 is_trading_day)
+    trading_days = set(market['date']) if market is not None and not market.empty else None
 
     def blocked(code, d):
         w = window(prices.get(code), d)
@@ -213,6 +215,9 @@ def _simulate(reports, prices, entry, market):
     while day <= max(last_report, last_bar):
         if day > last_report and not open_pos:
             break
+        if trading_days is not None and day <= max(trading_days) and day not in trading_days:
+            day += datetime.timedelta(days=1)
+            continue
 
         # A. 出場
         for pos in list(open_pos):
@@ -228,7 +233,8 @@ def _simulate(reports, prices, entry, market):
             if w['date'].iloc[-1] == day:  # 有新 K 棒才會出現新的指標訊號
                 should_sell, reason = sp.check_exit_signal(w, ret)
             if not should_sell:
-                reason = sp.calendar_exit_reason(day.weekday(), pos['buy_date'].weekday())
+                reason = sp.calendar_exit_reason(day.weekday(), pos['buy_date'].weekday(),
+                                                 week_of(day) != week_of(pos['buy_date']))
                 should_sell = bool(reason)
             if should_sell:
                 pos.update(sell_date=day, sell_price=curr, ret=ret, reason=reason)
@@ -280,7 +286,7 @@ def _simulate(reports, prices, entry, market):
 # =============================================================================
 def exit_category(reason):
     for key, label in [("止損", "止損"), ("停利", "停利"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"),
-                       ("綠柱擴大", "綠柱破線停損"), ("MACD", "MACD減弱"), ("📅", "日期出場")]:
+                       ("綠柱擴大", "綠柱破線停損"), ("MACD", "MACD減弱"), ("跨週", "跨週出場"), ("📅", "日期出場")]:
         if key in reason:
             return label
     return "其他"
