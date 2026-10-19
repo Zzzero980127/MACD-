@@ -63,7 +63,10 @@ MAX_RET20 = 10.0              # 近 20 日漲幅上限 (%)：已經漲多的不�
 MON_WED_BUY_DAYS = (0, 1, 2)  # 週一~三中哪幾天建倉 (例如 (0, 1) = 週三不買；回測差異不大，維持)
 # 週五收盤後的推薦也掛單：週一開盤價成交，成交當天 (週一) 收盤依「跨週持股」規則出場，吃下週一的波動
 # (不開啟的話，週五晚上的推薦永遠不會被模擬倉買進)；設 False 退回舊行為
-FRI_BUY = True
+# 2026-10 改為「週五清倉、不做當沖」：週三推薦 (週四買) 改抱到週五收盤，週四、週五推薦會變成當天買賣，所以關閉
+FRI_BUY = False
+THU_BUY = False               # 週四收盤後推薦 (週五開盤買、週五收盤賣 = 當沖)；舊設定 True
+THU_CLEAR_MON_WED = False     # 週四收盤清空週一至週三持股 (T+2)；False = 全部抱到週五收盤清倉；舊設定 True
 
 # --- 進場價 ---
 # True ：推薦當天先掛單 (PENDING)，下一次執行時以「推薦隔一個交易日的開盤價」成交 (同 backtest.py --entry next_open)
@@ -321,7 +324,7 @@ def calendar_exit_reason(weekday, buy_weekday, new_week=False):
     if new_week:
         # 跨週的持股在成交後第一個交易日收盤出場，維持原本只抱 1 天的設計，不會一路抱到下週五
         return "📅 跨週持股 (遇休市) 於下一交易日出場"
-    if weekday == 3 and buy_weekday in [0, 1, 2]:
+    if THU_CLEAR_MON_WED and weekday == 3 and buy_weekday in [0, 1, 2]:
         return "📅 週四清空週一至週三持股 (T+2)"
     if weekday >= 4 and buy_weekday == 3:
         return "📅 週五清空週四精選短線股 (T+2)"
@@ -343,7 +346,7 @@ def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
         return st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:st2_n]
 
     # 週四建倉：精選 1 檔 (優先選擇策略二 >= 100 分最高分，否則買策略一第 1 名)
-    if weekday == 3:
+    if weekday == 3 and THU_BUY:
         st2_qualified = [t for t in st2_targets if t[4] >= 100]
         if st2_qualified:
             max_score = max(t[4] for t in st2_qualified)
