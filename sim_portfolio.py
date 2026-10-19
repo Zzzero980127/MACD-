@@ -12,6 +12,7 @@ FINMIND_TOKEN = (os.environ.get('FINMIND_API_TOKEN') or os.environ.get('FINMIND_
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 TOTAL_CAPITAL = 5000000.0  # 💰 500 萬總資金池
+PER_TRADE_AMOUNT = 5000.0  # 每檔固定投入金額 (元)，只影響損益金額的換算，不影響報酬率；實際資金不到 5 萬，以零股小額模擬
 
 # =============================================================================
 # 🔧 RSI / KD 過熱過濾參數 (集中在這裡，方便調整與回測比較)
@@ -693,11 +694,11 @@ def process_simulation():
                 rrr = round(avg_win / avg_loss, 2) if avg_loss > 0 else (round(avg_win, 2) if avg_win > 0 else 0.0)
                 
                 # 當週淨損益與歷史累積總損益
-                weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in weekly_trades)
+                weekly_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * PER_TRADE_AMOUNT for t in weekly_trades)
                 
                 cursor.execute("SELECT buy_price, sell_price FROM sim_trades WHERE status = 'CLOSED';")
                 all_closed = cursor.fetchall()
-                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * 100000 for t in all_closed)
+                total_pnl = sum(((float(t[1]) - float(t[0])) / float(t[0])) * PER_TRADE_AMOUNT for t in all_closed)
 
                 benchmark_0050 = get_0050_weekly_return()
 

@@ -26,7 +26,7 @@ import sim_portfolio as sp
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".backtest_cache")
-TRADE_AMOUNT = 100000  # 與週報、戰報一致：每筆固定 10 萬
+TRADE_AMOUNT = sp.PER_TRADE_AMOUNT  # 與週報、戰報一致：每筆固定金額
 
 # 每組設定 = 對 sim_portfolio 參數的覆寫。除「原版」與「全部組合」外，一次只改一個參數 (以目前設定為基準)，
 # 才看得出是哪一項真的有效，也比較不會過度擬合。

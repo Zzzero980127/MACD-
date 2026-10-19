@@ -11,7 +11,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 # 匯入模擬倉模組
-from sim_portfolio import init_sim_db, process_simulation
+from sim_portfolio import init_sim_db, process_simulation, PER_TRADE_AMOUNT
 
 app = Flask(__name__)
 
@@ -72,7 +72,7 @@ def get_report_by_date(date_key="LATEST"):
         return f"❌ 讀取報告失敗: {e}"
 
 # -----------------------------------------------------------------------------
-# 2. 模擬倉戰報生成邏輯 (固定投入 10 萬元測試，升級加入當前持倉總損益與勝率)
+# 2. 模擬倉戰報生成邏輯 (固定投入小額金額測試，升級加入當前持倉總損益與勝率)
 # -----------------------------------------------------------------------------
 def get_sim_portfolio_report():
     """計算並組合模擬倉當前持股明細與歷史勝率戰報"""
@@ -89,7 +89,7 @@ def get_sim_portfolio_report():
 
         lines = [
             "📊 【AI 模擬倉即時戰報】",
-            "💰 測試設定：每檔固定投入 10 萬元",
+            f"💰 測試設定：每檔固定投入 {PER_TRADE_AMOUNT:,.0f} 元",
             "===================="
         ]
 
@@ -120,8 +120,8 @@ def get_sim_portfolio_report():
                 except Exception:
                     pass
 
-                # 計算 10 萬元買入的股數與即時損益
-                shares = int(100000 / buy_price)
+                # 計算每檔固定金額買入的股數與即時損益
+                shares = int(PER_TRADE_AMOUNT / buy_price)
                 cost_actual = shares * buy_price
                 curr_val = shares * curr_price
                 pnl_dollars = curr_val - cost_actual
@@ -184,7 +184,7 @@ def get_sim_portfolio_report():
 
             for buy_p, sell_p, ret_rate in closed:
                 buy_p, sell_p = float(buy_p), float(sell_p)
-                shares = int(100000 / buy_p)
+                shares = int(PER_TRADE_AMOUNT / buy_p)
                 pnl = (shares * sell_p) - (shares * buy_p)
                 total_pnl += pnl
                 if pnl > 0: wins += 1
