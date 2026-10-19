@@ -208,6 +208,9 @@ def _simulate(reports, prices, entry, market):
     # 以 0050 有 K 棒的日子當交易日，休市日不成交、不出場、不建倉 (同實盤 is_trading_day)
     trading_days = set(market['date']) if market is not None and not market.empty else None
 
+    def buy_day(d):
+        return d.weekday() <= 3 or (d.weekday() == 4 and sp.FRI_BUY)
+
     def blocked(code, d):
         w = window(prices.get(code), d)
         return bool(w is not None and sp.buy_block_reasons(w)[0])  # 資料不足放行，同實盤
@@ -240,10 +243,10 @@ def _simulate(reports, prices, entry, market):
                 pos.update(sell_date=day, sell_price=curr, ret=ret, reason=reason)
                 open_pos.remove(pos)
 
-        # B. 進場 (週一 ~ 週四)
-        if day in reports and day.weekday() <= 3 and not sp.market_ok(window(market, day)):
+        # B. 進場 (週一 ~ 週四，FRI_BUY 開啟時含週五)
+        if day in reports and buy_day(day) and not sp.market_ok(window(market, day)):
             stats["market_skip_days"] += 1
-        elif day in reports and day.weekday() <= 3:
+        elif day in reports and buy_day(day):
             st1, st2 = sp.parse_recommendations(reports[day])
             before = len(st1) + len(st2)
             st1 = [t for t in st1 if not blocked(t[0], day)]

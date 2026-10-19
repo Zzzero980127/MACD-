@@ -42,7 +42,7 @@ def main():
                     print(f"  {mark} [{t[3]}] {t[0]} {t[1]} {t[4]}分 | K棒日 {last} | ADX "
                           f"{adx if adx is None else round(adx, 1)} | {info} {('| ' + ' / '.join(reasons)) if reasons else ''}")
             wd = now.weekday()
-            picks = sp.pick_buy_targets(passed1, passed2, wd, verbose=False) if wd <= 3 else []
+            picks = sp.pick_buy_targets(passed1, passed2, wd, verbose=False) if wd <= 3 or (wd == 4 and sp.FRI_BUY) else []
             print(f"👉 今天 (週{wd + 1}) 依規則會買: {[f'{t[0]} {t[1]}' for t in picks] or '無'}\n")
 
         # 2. 持股

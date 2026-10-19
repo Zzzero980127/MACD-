@@ -61,6 +61,9 @@ MAX_DAY_PCT = 3.0             # 推薦當天漲幅上限 (%)：當天已大漲�
 MIN_ADX = 20.0                # ADX(14) 下限：趨勢夠強才買 (網路常用門檻 20)
 MAX_RET20 = 10.0              # 近 20 日漲幅上限 (%)：已經漲多的不追
 MON_WED_BUY_DAYS = (0, 1, 2)  # 週一~三中哪幾天建倉 (例如 (0, 1) = 週三不買；回測差異不大，維持)
+# 週五收盤後的推薦也掛單：週一開盤價成交，成交當天 (週一) 收盤依「跨週持股」規則出場，吃下週一的波動
+# (不開啟的話，週五晚上的推薦永遠不會被模擬倉買進)；設 False 退回舊行為
+FRI_BUY = True
 
 # --- 進場價 ---
 # True ：推薦當天先掛單 (PENDING)，下一次執行時以「推薦隔一個交易日的開盤價」成交 (同 backtest.py --entry next_open)
@@ -329,9 +332,9 @@ def calendar_exit_reason(weekday, buy_weekday, new_week=False):
 
 def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
     """依星期決定買進標的 (輸入為已過濾過熱後的清單，實盤與回測共用)"""
-    # 週一 ~ 週三建倉：兩策略各取前 N 名 (可設最低分數)
-    if weekday in [0, 1, 2]:
-        if weekday not in MON_WED_BUY_DAYS:
+    # 週一 ~ 週三 (及開啟 FRI_BUY 時的週五) 建倉：兩策略各取前 N 名 (可設最低分數)
+    if weekday in [0, 1, 2] or (weekday == 4 and FRI_BUY):
+        if weekday in [0, 1, 2] and weekday not in MON_WED_BUY_DAYS:
             return []
         if MIN_BUY_SCORE is not None:
             st1_targets = [t for t in st1_targets if t[4] >= MIN_BUY_SCORE]
@@ -715,7 +718,7 @@ def process_simulation():
         # -------------------------------------------------------------------------
         # C. 買進邏輯 (包含週四買入週三精選股條件 + 🆕 RSI/KD 過熱過濾)
         # -------------------------------------------------------------------------
-        if trading and weekday in [0, 1, 2, 3]:
+        if trading and (weekday in [0, 1, 2, 3] or (weekday == 4 and FRI_BUY)):
             # 只用「今天」的報告建倉 (LATEST 可能還是昨天的：今天選股因資料未更新而沒跑時，不可拿舊報告再買一次)
             cursor.execute("SELECT content FROM history WHERE date = %s;", (now.strftime('%Y%m%d'),))
             row = cursor.fetchone()
