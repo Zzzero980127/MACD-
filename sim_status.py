@@ -78,7 +78,7 @@ def main():
         closed = cur.fetchall()
         print(f"\n📈 本週已平倉 {len(closed)} 筆")
         for code, name, bd, sd, ret, reason in closed:
-            print(f"  {code} {name} {bd} → {sd} {float(ret):+.2f}% | {reason}")
+            print(f"  {sp.exit_label(reason)} {code} {name} {bd} → {sd} {float(ret):+.2f}% | {reason}")
         if closed:
             rets = [float(c[4]) for c in closed]
             print(f"  勝率 {sum(r > 0 for r in rets) / len(rets) * 100:.0f}% | 平均 {sum(rets) / len(rets):+.2f}%")

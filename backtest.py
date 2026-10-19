@@ -63,6 +63,19 @@ CONFIGS = [
     ("現行: 綠柱擴大+破20日線", dict(LOSS_EXIT_MA=20)),
     ("現行: 綠柱+破10日線 + 停損-4%", dict(STOP_LOSS_PCT=-4.0)),
 ]
+# --exits：只買策略一 (小額資金實際設定)，比較停損 / 鎖利方式。{} = 目前 sim_portfolio 設定 (固定 -3% + 停利 5%)
+EXIT_CONFIGS = [
+    ("★ 現行: 固定 -3% + 停利 5%", {}),
+    ("固定 -5% + 停利 5%", dict(STOP_LOSS_PCT=-5.0)),
+    ("ATR 1.5 倍 + 停利 5%", dict(STOP_ATR_MULT=1.5)),
+    ("ATR 2 倍 + 停利 5%", dict(STOP_ATR_MULT=2.0)),
+    ("ATR 2 倍(最寬 -4%) + 停利 5%", dict(STOP_ATR_MULT=2.0, STOP_ATR_MAX_PCT=4.0)),
+    ("固定 -3% + 破5日線鎖利 (取代停利)", dict(TAKE_PROFIT_PCT=None, PROFIT_TRAIL_MA=5)),
+    ("固定 -3% + 停利 5% + 破5日線鎖利", dict(PROFIT_TRAIL_MA=5)),
+    ("ATR 1.5 倍 + 破5日線鎖利 (取代停利)", dict(STOP_ATR_MULT=1.5, TAKE_PROFIT_PCT=None, PROFIT_TRAIL_MA=5)),
+    ("ATR 2 倍 + 破5日線鎖利 (取代停利)", dict(STOP_ATR_MULT=2.0, TAKE_PROFIT_PCT=None, PROFIT_TRAIL_MA=5)),
+    ("固定 -3% 無停利無鎖利 (對照)", dict(TAKE_PROFIT_PCT=None)),
+]
 MARKET_CODE = "0050"
 
 
@@ -288,7 +301,7 @@ def _simulate(reports, prices, entry, market):
 # 統計
 # =============================================================================
 def exit_category(reason):
-    for key, label in [("止損", "止損"), ("停利", "停利"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"),
+    for key, label in [("止損", "止損"), ("停利", "停利"), ("RSI", "RSI鎖利"), ("KD", "KD鎖利"), ("日線鎖利", "破均線鎖利"),
                        ("綠柱擴大", "綠柱破線停損"), ("MACD", "MACD減弱"), ("跨週", "跨週出場"), ("📅", "日期出場")]:
         if key in reason:
             return label
@@ -327,6 +340,7 @@ def summarize(trades, split=None):
         "平均虧損%": round(avg_loss, 2),
         "風報比": round(avg_win / avg_loss, 2) if avg_loss > 0 else None,
         "每筆期望%": round(sum(rets) / n, 2),
+        "最差單筆%": round(min(rets), 2),
         "總損益$": int(cum),
         "最大回撤$": int(mdd),
         "未平倉": len(trades) - n,
@@ -351,6 +365,7 @@ def main():
                     help="next_open=隔日開盤價買 (同實盤)；report=報告收盤價買 (舊做法)")
     ap.add_argument("--csv", default="backtest_trades.csv", help="逐筆交易輸出檔")
     ap.add_argument("--offline", action="store_true", help="使用上次快取的報告與價格，不連資料庫")
+    ap.add_argument("--exits", action="store_true", help="改跑停損 / 鎖利比較組 (EXIT_CONFIGS，只買策略一)")
     args = ap.parse_args()
 
     reports = load_reports(args.start, args.end, args.offline)
@@ -378,7 +393,8 @@ def main():
     report_days = sorted(reports)
     split = report_days[len(report_days) // 2]
     results, all_rows = [], []
-    for label, cfg in CONFIGS:
+    configs = [(label, dict(cfg, STRATEGY2_TOP_N=0)) for label, cfg in EXIT_CONFIGS] if args.exits else CONFIGS
+    for label, cfg in configs:
         trades, stats = simulate(reports, prices, entry=args.entry, market=bench, **cfg)
         s = summarize(trades, split)
         s["過熱擋掉"] = stats["filtered"]

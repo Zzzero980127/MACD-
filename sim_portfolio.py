@@ -44,12 +44,17 @@ MACD_WEAK_DAYS = 1
 #    組合D ：隔日開盤價進場 勝率 46.7%、每筆 +0.32%、最大回撤 17,649 (前後半段皆為正)
 #    樣本僅約 6 週，請持續用 backtest.py 追蹤；想退回舊設定見每行註解
 # =============================================================================
-STOP_LOSS_PCT = -5.0          # 停損 (%)
-TAKE_PROFIT_PCT = 5.0         # 停利 (%)；舊設定 None
+STOP_LOSS_PCT = -3.0          # 停損 (%)；2026-10 回測 -3% 最差單筆 -3.83%、最大回撤最低；舊設定 -5.0
+TAKE_PROFIT_PCT = None        # 停利 (%)；2026-10 回測改用「獲利後跌破 5 日線鎖利」取代固定 +5% 停利；舊設定 5.0
 MACD_EXIT_ONLY_PROFIT = True  # MACD 減弱只在有獲利時才出場 (MACD 1 天就賣的單勝率僅 6%)；舊設定 False
 # 虧損時的雙重確認出場：綠柱擴大 (空方力道加大) 且 收盤跌破 N 日均線 才賣，單一訊號視為洗盤不賣；None = 關閉
 # (例：晶豪科 10/6 綠柱 -1.55→-2.04、收盤 273.5 跌破 10 日線 280.6 → -3.0% 出場，不必等到 -5% 停損)
-LOSS_EXIT_MA = 10
+LOSS_EXIT_MA = None           # 回測關閉後勝率/損益較好 (固定 -3% 停損已足夠)；舊設定 10
+# ATR 停損：停損距離 = N 倍 ATR(14) (以進場價換算成 %，用最新一天的 ATR)，依個股波動自動調整；None = 用固定 STOP_LOSS_PCT
+STOP_ATR_MULT = None
+STOP_ATR_MAX_PCT = None       # ATR 停損最寬不超過幾 % (控管小額資金單筆最大虧損)；None = 不限
+# 獲利後鎖利：已有獲利且收盤跌破 N 日線就賣 (虧損中不觸發，虧損只靠停損)；None = 關閉
+PROFIT_TRAIL_MA = 5            # 2026-10 回測：固定 -3% 停損 + 破 5 日線鎖利，總損益 $4,250 > 舊 $3,729
 MARKET_MA = None              # 大盤濾網：0050 站上 N 日均線才買 (回測無效，維持關閉)
 MIN_BUY_SCORE = None          # 週一~三買進的最低分數 (回測無差異，維持關閉)
 TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔 (有進場品質過濾後恢復 5)
@@ -212,6 +217,35 @@ def calc_adx(df, n=14):
     adx = dx.ewm(alpha=1 / n, adjust=False).mean().iloc[-1]
     return None if pd.isna(adx) else float(adx)
 
+def calc_atr(df, n=14):
+    """Wilder's ATR(n)，回傳最新一天的值；資料不足回傳 None"""
+    if df is None or len(df) < n + 1:
+        return None
+    high, low, close = df['max'], df['min'], df['close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, min_periods=n, adjust=False).mean().iloc[-1]
+    return None if pd.isna(atr) else float(atr)
+
+def effective_stop_pct(df, ret):
+    """目前適用的停損 % (負值)：開啟 STOP_ATR_MULT 時依 ATR 換算，否則為固定 STOP_LOSS_PCT"""
+    if STOP_ATR_MULT:
+        atr = calc_atr(df)
+        curr = float(df['close'].iloc[-1])
+        buy_price = curr / (1 + ret / 100) if ret > -100 else 0
+        if atr and buy_price > 0:
+            stop = -STOP_ATR_MULT * atr / buy_price * 100
+            return max(stop, -STOP_ATR_MAX_PCT) if STOP_ATR_MAX_PCT is not None else stop
+    return STOP_LOSS_PCT
+
+def exit_label(reason):
+    """把出場原因歸類成停損 / 停利 / 鎖利 / MACD / 到期清倉，顯示本週平倉用"""
+    r = reason or ""
+    for key, label in (("止損", "🚨 停損"), ("停損", "🚨 停損"), ("停利", "🎯 停利"), ("鎖利", "🔒 鎖利"),
+                       ("MACD", "📉 MACD 減弱"), ("週五", "📅 週五清倉"), ("跨週", "📅 到期清倉"), ("📅", "📅 到期清倉")):
+        if key in r:
+            return label
+    return "其他"
+
 def entry_quality_reasons(df):
     """進場品質過濾 (當天漲幅 / ADX / 20 日漲幅)，回傳不買的原因清單；資料不足的項目略過"""
     reasons = []
@@ -296,10 +330,15 @@ def check_exit_signal(df, ret, macd_weak_days=None, use_exit_filter=None):
     ind = get_indicator_status(df) if use_exit_filter else None
     can_lock_profit = (ret > 0) or (not EXIT_ONLY_WHEN_PROFIT)
 
-    if ret <= STOP_LOSS_PCT:
-        return True, f"🚨 大跌觸發止損 ({STOP_LOSS_PCT:g}%)"
+    stop_pct = effective_stop_pct(df, ret)
+    if ret <= stop_pct:
+        return True, f"🚨 大跌觸發止損 ({stop_pct:.1f}%)"
     if TAKE_PROFIT_PCT is not None and ret >= TAKE_PROFIT_PCT:
         return True, f"🎯 達停利出場 (+{TAKE_PROFIT_PCT:g}%)"
+    if PROFIT_TRAIL_MA and ret > 0 and len(df) >= PROFIT_TRAIL_MA:
+        ma = float(df['close'].rolling(PROFIT_TRAIL_MA).mean().iloc[-1])
+        if float(df['close'].iloc[-1]) < ma:
+            return True, f"🔒 獲利後跌破{PROFIT_TRAIL_MA}日線鎖利"
     if ind and can_lock_profit and ind['rsi'] > RSI_EXIT:
         return True, f"🔥 RSI 過熱鎖利出場 (RSI {ind['rsi']:.1f})"
     if ind and can_lock_profit and ind['kd_dead_cross']:

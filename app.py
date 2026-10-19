@@ -11,7 +11,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 # 匯入模擬倉模組
-from sim_portfolio import init_sim_db, process_simulation, PER_TRADE_AMOUNT
+from sim_portfolio import init_sim_db, process_simulation, PER_TRADE_AMOUNT, exit_label
 
 app = Flask(__name__)
 
@@ -167,6 +167,32 @@ def get_sim_portfolio_report():
             lines.append("📝 【待成交掛單】(推薦隔日以開盤價買進)")
             for code, name, st_type, buy_date in pendings:
                 lines.append(f"🔸 {code} {name} ({st_type[:3]}) | 推薦日: {buy_date}")
+
+        # A-3. 本週已平倉 (依停利 / 鎖利 / 停損 / 到期清倉分組，一眼看出哪檔為什麼不見)
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
+        monday = (now - datetime.timedelta(days=now.weekday())).strftime('%Y-%m-%d')
+        cursor.execute("SELECT stock_code, stock_name, strategy_type, buy_date, sell_date, buy_price, sell_price, "
+                       "return_rate, exit_reason FROM sim_trades "
+                       "WHERE status = 'CLOSED' AND sell_date >= %s ORDER BY sell_date, id;", (monday,))
+        week_closed = cursor.fetchall()
+        lines.append("--------------------")
+        lines.append(f"✅ 【本週已平倉】共 {len(week_closed)} 檔")
+        if not week_closed:
+            lines.append("本週尚無平倉")
+        else:
+            groups = {}
+            for code, name, st_type, bd, sd, bp, sp_, ret, reason in week_closed:
+                groups.setdefault(exit_label(reason), []).append((code, name, st_type, bd, sd, float(bp), float(sp_), float(ret)))
+            order = ["🎯 停利", "🔒 鎖利", "📉 MACD 減弱", "📅 週五清倉", "📅 到期清倉", "🚨 停損", "其他"]
+            for label in sorted(groups, key=lambda k: order.index(k) if k in order else 99):
+                lines.append(f"{label} ({len(groups[label])} 檔)")
+                for code, name, st_type, bd, sd, bp, sp_, ret in groups[label]:
+                    shares = int(PER_TRADE_AMOUNT / bp) if bp > 0 else 0
+                    pnl = shares * (sp_ - bp)
+                    sign = "+" if pnl >= 0 else ""
+                    lines.append(f"  {code} {name} ({st_type[:3]}) {bd[5:]}→{sd[5:]} {sign}{ret:.2f}% ({sign}${pnl:,.0f})")
+            week_rets = [r[7] for r in week_closed]
+            lines.append(f"本週勝率 {sum(r > 0 for r in week_rets) / len(week_rets) * 100:.0f}% | 平均 {sum(week_rets) / len(week_rets):+.2f}%")
 
         lines.append("\n====================\n")
 
