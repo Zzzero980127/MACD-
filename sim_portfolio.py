@@ -53,6 +53,7 @@ LOSS_EXIT_MA = 10
 MARKET_MA = None              # 大盤濾網：0050 站上 N 日均線才買 (回測無效，維持關閉)
 MIN_BUY_SCORE = None          # 週一~三買進的最低分數 (回測無差異，維持關閉)
 TOP_N_PER_STRATEGY = 5        # 週一~三每個策略最多買幾檔 (有進場品質過濾後恢復 5)
+DAILY_MAX_BUY = 3             # 每天最多買幾檔 (兩策略合併後依得分由高到低取前 N)；None = 不限，只受每策略檔數限制
 STRATEGY2_TOP_N = None        # 週一~三策略二另外限制檔數；None = 同 TOP_N_PER_STRATEGY
 
 # --- 進場品質過濾 (網路常見指標，None = 不使用) ---
@@ -344,7 +345,10 @@ def pick_buy_targets(st1_targets, st2_targets, weekday, verbose=True):
             st1_targets = [t for t in st1_targets if t[4] >= MIN_BUY_SCORE]
             st2_targets = [t for t in st2_targets if t[4] >= MIN_BUY_SCORE]
         st2_n = TOP_N_PER_STRATEGY if STRATEGY2_TOP_N is None else STRATEGY2_TOP_N
-        return st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:st2_n]
+        picked = st1_targets[:TOP_N_PER_STRATEGY] + st2_targets[:st2_n]
+        if DAILY_MAX_BUY is not None:
+            picked = sorted(picked, key=lambda t: -t[4])[:DAILY_MAX_BUY]  # 同分維持原順序 (策略一在前)
+        return picked
 
     # 週四建倉：精選 1 檔 (優先選擇策略二 >= 100 分最高分，否則買策略一第 1 名)
     if weekday == 3 and THU_BUY:
